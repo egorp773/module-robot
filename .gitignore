@@ -1,0 +1,113 @@
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+coverage/
+*.js_
+*.js.deps
+*.js.map
+*.symbols
+
+# Android / Gradle generated files
+.gradle/
+**/android/.gradle/
+**/android/app/build/
+**/android/build/
+**/android/local.properties
+**/android/key.properties
+**/android/*.jks
+**/android/*.keystore
+
+# iOS / macOS generated files
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Flutter/App.framework/
+**/ios/Flutter/Flutter.framework/
+**/ios/Pods/
+**/ios/.symlinks/
+**/macos/Flutter/GeneratedPluginRegistrant.*
+**/macos/Flutter/ephemeral/
+
+# ESP32 / Arduino / PlatformIO generated files
+.pio/
+.pioenvs/
+.piolibdeps/
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.o
+*.d
+*.a
+*.so
+*.dll
+*.exe
+*.out
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/compile_commands.json
+
+# Arduino local/private configuration
+arduino_secrets.h
+secrets.h
+wifi_secrets.h
+credentials.h
+private_config.h
+
+# Secrets and environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.mobileprovision
+*.token
+*token*
+*secret*
+*password*
+
+# Logs and reports
+*.log
+logs/
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.swp
+*.swo
+
+# Windows / macOS / Linux temporary files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+._*
+*~
+
+# IDEs and editors
+.idea/
+.vscode/
+.claude/
+*.iml
+.fleet/
+.vs/
+
+# Local tool caches
+.cache/
+.codex/
+.tools/
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

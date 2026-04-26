@@ -1,0 +1,66 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'lib/**'
+      - 'ios/**'
+      - 'pubspec.yaml'
+      - '.github/workflows/build_ios.yml'
+
+jobs:
+  build:
+    name: Build iOS IPA
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Setup CocoaPods
+        run: |
+          cd ios
+          sudo gem install cocoapods
+          pod install --repo-update
+          cd ..
+
+      - name: Build iOS IPA (no codesign)
+        run: |
+          flutter build ipa --release --no-codesign
+        continue-on-error: false
+
+      - name: Find IPA file
+        id: find_ipa
+        run: |
+          IPA_FILE=$(find build/ios/ipa -name "*.ipa" 2>/dev/null | head -1)
+          if [ -z "$IPA_FILE" ]; then
+            echo "IPA file not found in build/ios/ipa/"
+            ls -la build/ios/ipa/ || echo "Directory does not exist"
+            exit 1
+          fi
+          echo "ipa_path=$IPA_FILE" >> $GITHUB_OUTPUT
+          echo "Found IPA: $IPA_FILE"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: ${{ steps.find_ipa.outputs.ipa_path }}
+          retention-days: 30

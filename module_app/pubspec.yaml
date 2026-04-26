@@ -1,0 +1,46 @@
+name: hello_flutter
+description: SnowRobot controller app
+publish_to: "none"
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # iOS icons
+  cupertino_icons: ^1.0.8
+  # UI + routing
+  google_fonts: ^6.2.1
+  go_router: ^14.2.0
+  # State management
+  flutter_riverpod: ^2.5.1
+  # WebSocket для Wi-Fi управления
+  web_socket_channel: ^3.0.0
+  # HTTP для ping проверки
+  http: ^1.2.0
+  # Wi-Fi SSID проверка
+  network_info_plus: ^6.0.0
+  # Permissions (Android для доступа к SSID)
+  permission_handler: ^12.0.1
+  # Проверка типа подключения (Wi-Fi/Mobile)
+  connectivity_plus: ^6.0.0
+  device_preview: ^1.3.1
+  # Local storage
+  shared_preferences: ^2.2.2
+  # File system access
+  path_provider: ^2.1.2
+
+  flutter_blue_plus: any
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/
