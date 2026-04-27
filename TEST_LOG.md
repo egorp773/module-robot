@@ -295,6 +295,43 @@ Status update needed: GPS display is code-level partial only.
 
 Next action: physical GPS connection test, then verify real lat/lon telemetry in the app.
 
+### 2026-04-27 - Guarded route upload projection check
+
+Date/time: 2026-04-27, Europe/Moscow timezone
+
+Test: route upload safety code check
+
+Area: app/route/GPS/safety
+
+Code state: after guarding auto route upload.
+
+Hardware: no hardware used.
+
+Conditions: static Dart analysis only. APK build was intentionally not run.
+
+Steps:
+
+- Blocked route upload when the loaded map is not GPS-based or lacks `refLat/refLon`.
+- Converted local-meter route points to GPS lat/lon through `GpsProjection` before sending `ROUTE_WP`.
+- Kept `NAV_START` blocked until the GPS route workflow is confirmed.
+- Ran `dart analyze module_app/lib/features/auto/auto_map_screen.dart`.
+
+Expected result: changed file has no Dart syntax/static errors and app no longer sends local x/y directly as fake lat/lon.
+
+Actual result: analyzer completed with no errors; existing deprecated `withOpacity` info remains.
+
+Result: PARTIAL
+
+Issues found:
+
+- This is not a route upload runtime test.
+- This is not a GPS origin/perimeter test.
+- No APK build was run per user instruction.
+
+Status update needed: route upload is safer at code level, but still unverified on robot.
+
+Next action: real GPS origin workflow and route upload test after hardware GPS works.
+
 ### 2026-04-26 - Documentation initialization
 
 Area: documentation

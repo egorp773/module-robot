@@ -118,7 +118,7 @@ The manual control UI is the most valuable current workflow.
 The auto screen is still unverified, but the basic workflow now exists in code:
 
 - Build route: implemented in `auto_map_screen.dart`.
-- Send route: implemented as draft route upload through current WebSocket text commands.
+- Send route: implemented as guarded draft route upload; it is blocked without GPS coordinate type and `refLat/refLon`.
 - Start: control exists, but `NAV_START` is intentionally blocked until GPS/local-meter route workflow is confirmed.
 - Pause: implemented through `NAV_PAUSE`.
 - Stop: implemented through `NAV_STOP`.
@@ -135,6 +135,7 @@ The auto screen now shows:
 Important limit: this is a UI/code-level workflow only.
 It does not prove route upload, GPS route following, or autonomous driving on hardware.
 The auto route still must not be described as a real GPS route.
+Do not send local x/y as fake lat/lon; use `GpsProjection` with a real origin.
 
 App files known to matter:
 

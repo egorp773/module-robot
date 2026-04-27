@@ -72,7 +72,7 @@ Status: code-level partial done on 2026-04-27; runtime/device verification still
 Work:
 
 - Add or fix Build route. Done in `auto_map_screen.dart`.
-- Add or fix Send route. Done as draft WebSocket route upload.
+- Add or fix Send route. Done as guarded draft WebSocket route upload; blocked without GPS origin.
 - Add or fix Start. Control is present; `NAV_START` is intentionally blocked until GPS/local-meter route workflow is confirmed.
 - Add or fix Pause. Done.
 - Add or fix Stop. Done.
@@ -161,6 +161,8 @@ Exit criteria:
 ## Phase 8 - Local x/y from origin
 
 Goal: convert GPS to local metric coordinates.
+
+Status: helper exists; route upload now uses origin conversion when `refLat/refLon` are present, but real origin workflow is not tested.
 
 Work:
 

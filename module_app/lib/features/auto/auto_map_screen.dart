@@ -8,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import '../../core/wifi_connection.dart';
 import '../../core/map_storage.dart';
 import '../../core/cleaning_route_planner.dart';
+import '../../core/gps_projection.dart';
 import '../manual/manual_control_screen.dart';
 import '../home/home_screen.dart' show batteryPercentProvider;
 
@@ -195,11 +196,29 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       return;
     }
 
+    final map = _mapState;
+    if (map == null ||
+        map.coordinateType != 'gps' ||
+        map.refLat == null ||
+        map.refLon == null) {
+      const msg = 'Route upload blocked: GPS origin/local-meter map is not ready.';
+      setState(() => _routeWorkflowError = msg);
+      _showNotice(
+        ref,
+        title: 'Маршрут не GPS',
+        message: msg,
+        kind: NoticeKind.danger,
+      );
+      return;
+    }
+
+    final projection = GpsProjection(refLat: map.refLat!, refLon: map.refLon!);
     final ctrl = ref.read(wifiConnectionProvider.notifier);
     ctrl.sendRouteBegin(_route.length);
     for (var i = 0; i < _route.length; i++) {
       final p = _route[i];
-      ctrl.sendRouteWaypoint(i, p.dy, p.dx);
+      final gps = projection.toGps(p);
+      ctrl.sendRouteWaypoint(i, gps.$1, gps.$2);
     }
     ctrl.sendRouteEnd();
 
@@ -211,7 +230,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     _showNotice(
       ref,
       title: 'Маршрут отправлен',
-      message: 'Draft route sent: map/local coordinates, not verified GPS.',
+      message: 'Draft route sent as GPS waypoints from local origin.',
       kind: NoticeKind.info,
     );
   }

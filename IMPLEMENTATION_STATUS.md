@@ -186,7 +186,8 @@ Implemented in UI:
 Limits:
 
 - Route sending is still a draft protocol workflow.
-- Current auto map route points are map/local coordinates, not confirmed GPS waypoints.
+- Route upload is blocked unless the map is marked GPS-based and has `refLat/refLon`.
+- When a GPS origin exists, route upload converts local-meter points to lat/lon with `GpsProjection`.
 - Start control is visible, but the UI intentionally blocks `NAV_START` until GPS/local-meter route workflow is confirmed.
 - No real robot autonomous test has been run.
 - Do not mark autonomy or GPS route following as working from this UI change.

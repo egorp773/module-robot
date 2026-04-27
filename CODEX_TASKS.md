@@ -103,6 +103,7 @@ Work:
 
 - Build route. Done in `auto_map_screen.dart`.
 - Send route. Done as draft route upload through existing WebSocket commands.
+- Route upload is blocked unless the map has GPS coordinate type plus `refLat/refLon`; local-meter points are converted to GPS with `GpsProjection`.
 - Start. Control is present, but `NAV_START` is intentionally blocked until GPS/local-meter route workflow is confirmed.
 - Pause. Done through existing `NAV_PAUSE` command.
 - Stop. Done through existing `NAV_STOP` command.
