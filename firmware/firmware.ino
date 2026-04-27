@@ -40,6 +40,7 @@ void loop() {
 
   nav_update();
 
+  motors_check_failsafe();
   motors_update_ramp();
   motors_send();
   motors_receive_feedback();

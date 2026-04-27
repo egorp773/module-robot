@@ -1,241 +1,325 @@
 # Protocol
 
-This file describes the intended WebSocket protocol between `module_app/` and `firmware/`.
+This file describes the WebSocket protocol between `module_app/` and `firmware/`.
 
-Status: draft.
-Exact command names and payloads must be confirmed from code before treating this as final.
+Status: code-confirmed draft as of 2026-04-27.
+The active protocol is line-based text, not JSON.
+Keep this file synchronized with `firmware/websocket.cpp`, `firmware/telemetry.cpp`, and `module_app/lib/core/wifi_connection.dart`.
 
 ## Transport
 
 - Link: Wi-Fi/WebSocket.
-- Direction: Flutter app to ESP32 for commands.
-- Direction: ESP32 to Flutter app for status, telemetry, errors, and acknowledgements.
-- Encoding: expected JSON unless code proves otherwise.
+- ESP32 endpoint: `ws://192.168.4.1:81/ws`.
+- ESP32 also exposes HTTP `GET /ping` returning `OK`.
+- Encoding: UTF-8 text lines.
+- Message separator: one WebSocket text message per command.
+- Maximum inbound message length: `MAX_WS_MSG` from `firmware/config.h`, currently `256`.
 
 ## Protocol rules
 
-- Every command should have a command/type field.
 - Stop must be accepted at any time.
 - Unknown commands must not move motors.
-- Invalid parameter ranges must not move motors.
-- Manual drive commands should be time-limited or refreshed frequently.
-- ESP32 should stop motion on WebSocket disconnect or command timeout.
-- Attachment control must be explicit and should default to off.
+- Manual drive commands are refreshed by the app while the user is driving.
+- ESP32 has a motor command timeout (`CMD_TIMEOUT_MS`, currently `400`) that zeros motor targets if movement commands stop.
+- ESP32 stops motors and calls `nav_stop()` on WebSocket disconnect.
+- Attachment and mount controls are explicit commands.
+- This protocol is still not hardware-verified after the firmware build fix.
 
-## Draft app -> ESP32 commands
+## App -> ESP32 commands
 
-These examples are protocol intent, not confirmed final code.
+### Ping
+
+```text
+PING
+```
+
+Firmware response:
+
+```text
+PONG
+```
+
+Current app behavior: sends `PING` after connection as an optional check. It does not currently run a periodic heartbeat loop.
 
 ### Manual drive
 
-```json
-{
-  "type": "manual_drive",
-  "left": 0.0,
-  "right": 0.0,
-  "duration_ms": 200
-}
+```text
+M,<left>,<right>
 ```
+
+Example:
+
+```text
+M,60,60
+```
+
+Flutter sends `left` and `right` in the range `-100..100`.
+Firmware divides incoming values by `INPUT_DIV` and clamps to `-MAX_SPEED_PERCENT..MAX_SPEED_PERCENT`.
+
+Current config:
+
+- `INPUT_DIV = 2`
+- `MAX_SPEED_PERCENT = 70`
+- `CMD_TIMEOUT_MS = 400`
 
 Meaning:
 
-- `left`: left motor target, likely normalized from `-1.0` to `1.0`.
-- `right`: right motor target, likely normalized from `-1.0` to `1.0`.
-- `duration_ms`: command validity window.
+- positive values drive forward if wiring/motor direction is correct,
+- negative values drive backward,
+- different left/right values turn.
 
-Confirm in code:
-
-- actual command name,
-- actual speed range,
-- whether differential/tank drive or direction commands are used,
-- whether duration is implemented.
+Hardware tests still need to confirm physical motor direction.
 
 ### Stop
 
-```json
-{
-  "type": "stop"
-}
+```text
+STOP
 ```
 
-Meaning: immediately stop drive motors.
+Firmware response:
 
-Required behavior:
+```text
+OK STOP
+```
 
-- Has priority over manual and autonomous movement.
-- Should also put NAV into safe paused/stopped state if autonomy exists.
+Firmware behavior:
+
+- calls `motors_request_smooth_stop("manual stop")`,
+- sets left/right targets to zero.
 
 ### Attachment control
 
-```json
-{
-  "type": "attachment",
-  "enabled": false
-}
+```text
+ATTACHMENT_ON
+ATTACHMENT_OFF
 ```
 
-Meaning: switch cleaning attachment/nozzle/tool relay/output.
+Firmware responses:
 
-Confirm in code:
-
-- actual command name,
-- actual relay/output behavior,
-- whether attachment auto-disables on failsafe.
-
-### Heartbeat
-
-```json
-{
-  "type": "heartbeat",
-  "ts": 0
-}
+```text
+OK ATTACHMENT_ON
+OK ATTACHMENT_OFF
 ```
 
-Meaning: app is alive and connected.
+Firmware behavior:
 
-Confirm in code:
+- calls `setAttachment(true/false)`,
+- uses `PIN_RELAY_ATTACH`.
 
-- whether heartbeat exists,
-- timeout value,
-- whether manual drive commands themselves refresh `g_lastCmdMs`.
+Hardware TODO:
 
-### Build/send route workflow commands
+- confirm relay pin,
+- confirm active level,
+- confirm attachment defaults off on boot and failsafe.
 
-The auto workflow needs commands similar to:
+### Mount control
 
-```json
-{
-  "type": "route_clear"
-}
+```text
+MOUNT_ON
+MOUNT_OFF
 ```
 
-```json
-{
-  "type": "route_point",
-  "index": 0,
-  "x": 0.0,
-  "y": 0.0
-}
+Firmware responses:
+
+```text
+OK MOUNT_ON
+OK MOUNT_OFF
 ```
 
-```json
-{
-  "type": "route_commit",
-  "count": 10
-}
+Firmware behavior:
+
+- calls `setMount(true/false)`,
+- uses `PIN_RELAY_MOUNT`.
+
+### Sound
+
+```text
+SOUND:<id>
+SOUND,<id>
 ```
 
-These are draft shapes only.
-Actual upload protocol must be confirmed or implemented deliberately.
+Valid ids: `1..4`.
+
+Firmware responses:
+
+```text
+OK SOUND
+ERR SOUND_RANGE
+```
+
+### Route upload
+
+Current route commands use GPS latitude/longitude, not local meters.
+This is a known mismatch with the roadmap. Future route planning should move to local x/y meters.
+
+```text
+ROUTE_BEGIN,<count>
+```
+
+```text
+ROUTE_WP,<index>,<lat>,<lon>
+```
+
+```text
+ROUTE_END
+```
+
+Firmware responses:
+
+```text
+OK ROUTE_BEGIN
+OK ROUTE_WP
+ERR ROUTE_WP_FORMAT
+ERR ROUTE_WP_FULL
+OK ROUTE,<count>
+```
+
+Known issue:
+
+- Route protocol currently stores `Waypoint { lat, lon }`.
+- Roadmap requires local-meter route planning in the future.
 
 ### NAV control
 
-Draft commands:
-
-```json
-{ "type": "nav_start" }
+```text
+NAV_START
+NAV_PAUSE
+NAV_RESUME
+NAV_STOP
 ```
 
-```json
-{ "type": "nav_pause" }
+Firmware responses:
+
+```text
+OK NAV_START
+OK NAV_PAUSE
+OK NAV_RESUME
+OK NAV_STOP
 ```
 
-```json
-{ "type": "nav_stop" }
+Safety status:
+
+- Compiles.
+- Not hardware-tested.
+- Do not treat autonomous movement as ready.
+
+## ESP32 -> app messages
+
+### Connection state
+
+On WebSocket connect:
+
+```text
+STATE,CONNECTED
 ```
 
-Required:
+The Flutter app waits for this or another state/connected message before setting `isConnected = true`.
 
-- `nav_stop` must stop motion.
-- `nav_pause` should stop motion but preserve route state if safe.
-- `nav_start` must be blocked if no valid route is loaded.
+### Battery percent
 
-## Draft ESP32 -> app telemetry
-
-### Status
-
-```json
-{
-  "type": "status",
-  "mode": "manual",
-  "connected": true,
-  "motors_enabled": false,
-  "attachment_enabled": false,
-  "failsafe": false
-}
+```text
+BAT_PCT,<percent>
 ```
 
-### NAV status
+Example:
 
-```json
-{
-  "type": "nav_status",
-  "mode": "idle",
-  "route_loaded": false,
-  "route_points": 0,
-  "current_waypoint": null
-}
+```text
+BAT_PCT,75
 ```
 
-Needed by auto UI:
+### Battery verbose
 
-- current NAV mode,
-- current waypoint,
-- route loaded/sent state,
-- errors.
-
-### GPS
-
-```json
-{
-  "type": "gps",
-  "fix": false,
-  "lat": null,
-  "lon": null,
-  "accuracy_m": null,
-  "satellites": null
-}
+```text
+BAT,V=<voltage>V,P=<percent>%,temp=<temp>C
 ```
 
-GPS is not physically tested yet.
-Do not present GPS telemetry as confirmed until real tests exist.
+Example:
 
-### Local position
-
-```json
-{
-  "type": "local_position",
-  "valid": false,
-  "x": null,
-  "y": null,
-  "origin_set": false
-}
+```text
+BAT,V=39.20V,P=75%,temp=31.0C
 ```
 
-Local x/y depends on GPS origin workflow and is not confirmed yet.
+### GPS telemetry
 
-### Error
+```text
+GPS,<lat>,<lon>,<heading>,<fixType>,<hAcc>
+```
 
-```json
-{
-  "type": "error",
-  "code": "unknown_command",
-  "message": "Unknown command"
-}
+Example:
+
+```text
+GPS,55.12345678,37.12345678,90.00,3,450
+```
+
+GPS status:
+
+- Code exists.
+- GPS hardware has not been physically connected and tested.
+- App must not present map position as trustworthy GPS until tests pass.
+
+### IMU telemetry
+
+```text
+IMU,<yaw>
+```
+
+Example:
+
+```text
+IMU,182.50
+```
+
+IMU status:
+
+- Code exists for BNO08x rotation vector.
+- Hardware presence and orientation are not confirmed in `HARDWARE.md`.
+
+### NAV telemetry
+
+```text
+NAV,<state>,<wpIdx>,<wpTotal>,<distToWp>
+```
+
+Example:
+
+```text
+NAV,RUNNING,2,18,0.73
+```
+
+States:
+
+- `IDLE`
+- `RUNNING`
+- `PAUSED`
+- `DONE`
+- `ERROR`
+
+The auto UI should show this state, current waypoint, total waypoints, and errors.
+
+### Generic errors
+
+Known current errors:
+
+```text
+ERR,TOO_LONG
+ERR,UNKNOWN
+ERR SOUND_RANGE
+ERR ROUTE_WP_FORMAT
+ERR ROUTE_WP_FULL
 ```
 
 ## Known protocol risks
 
-- `MAX_WS_MSG` currently conflicts between firmware config and WebSocket code.
-- Auto route upload may exceed message size if sent as one large JSON array.
-- Route upload should probably be chunked or sequenced.
-- App must show route sent/not sent state.
-- ESP32 should acknowledge route count or reject invalid route.
+- Protocol is text-based but older documentation and future designs may mention JSON. Do not mix them accidentally.
+- Route upload is currently lat/lon, while roadmap requires local meters.
+- `PING` is not a full heartbeat/failsafe loop.
+- App must keep sending manual `M,left,right` updates during movement; firmware timeout stops stale movement commands.
+- Hardware behavior still needs real tests.
 
 ## Do not assume
 
-- Do not assume these draft names match code.
-- Do not assume heartbeat exists until verified.
-- Do not assume GPS messages are live.
-- Do not assume waypoint upload is implemented.
+- Do not assume GPS telemetry means GPS hardware works.
+- Do not assume NAV commands are safe to run on the robot.
+- Do not assume route waypoints are local meters yet.
+- Do not assume `PING` is a safety heartbeat.
 

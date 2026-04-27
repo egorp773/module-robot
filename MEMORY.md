@@ -18,7 +18,7 @@ Autonomous navigation, GPS mapping, snake-route generation, and RTK are future w
 - `module_app/` is the Flutter application.
 - `sound/` is a legacy monolithic ESP32 sketch/reference.
 - `docs/ai_skills/` contains short task-specific instructions for future Codex sessions.
-- There is no git repository at `C:\robot\module` right now.
+- Git repository exists at `C:\robot\module` and is connected to GitHub: `https://github.com/egorp773/module-robot`.
 
 ## Source of truth documents
 
@@ -52,10 +52,9 @@ Implemented or started in code but not proven as product-ready:
 
 Known broken or not reliable:
 
-- Firmware build is not currently trusted.
-- `g_targetLeft` and `g_targetRight` are known to be defined twice in `motors.cpp` and `nav.cpp`.
-- `MAX_WS_MSG` conflicts between `config.h` and `websocket.cpp`.
-- `motors_request_smooth_stop`, `motors_check_failsafe`, and `g_lastCmdMs` are declared but not fully implemented or fully moved.
+- Firmware build now passes with PlatformIO (`pio run`) as of 2026-04-27.
+- Previous build blockers were fixed: duplicate `g_targetLeft/g_targetRight`, local `MAX_WS_MSG` conflict, and missing motor failsafe/smooth-stop symbols.
+- Motor command timeout/failsafe is compiled, but not verified on hardware.
 - Current snake route generation is poor.
 - `lineStep 44.0` is an old wrong value.
 - Auto-map robot position must not be treated as reliable GPS position.
@@ -148,6 +147,15 @@ Known firmware issues to fix before feature work:
 
 After it builds, stabilize manual mode before touching autonomy.
 
+Current firmware build command:
+
+- `pio run`
+
+Current firmware build status:
+
+- PASS on 2026-04-27 for `esp32dev` PlatformIO environment.
+- This is a compile/build result only, not a hardware validation.
+
 ## Main development order
 
 1. Fix firmware build.
@@ -171,8 +179,7 @@ After it builds, stabilize manual mode before touching autonomy.
 - Do not assume route following is safe.
 - Do not assume snake route generation is correct.
 - Do not assume map recording is real GPS recording.
-- Do not assume firmware builds until it is actually compiled.
+- Do not assume firmware behavior is safe just because it compiles.
 - Do not assume failsafe works until tested.
 - Do not assume `sound/` is current architecture.
 - Do not assume a PASS result without a real entry in `TEST_LOG.md`.
-

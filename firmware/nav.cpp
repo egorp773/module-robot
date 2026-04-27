@@ -10,9 +10,6 @@ int g_navWpTotal = 0;
 float g_navDistToWp = 0.0f;
 Waypoint g_waypoints[MAX_WAYPOINTS];
 
-volatile int16_t g_targetLeft = 0;
-volatile int16_t g_targetRight = 0;
-
 static uint32_t g_lastNavMs = 0;
 static uint32_t g_lastGoodGpsMs = 0;
 

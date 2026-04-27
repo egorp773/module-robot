@@ -11,6 +11,23 @@ This file is the main truth for what works, what exists only in code, what is br
 
 ## Confirmed working
 
+### Firmware build
+
+Status: confirmed working as a build-only test.
+
+Evidence:
+
+- `pio run` completed successfully on 2026-04-27.
+- Environment: PlatformIO `esp32dev`, Arduino framework.
+- Output firmware artifact was created under `D:/rn-cache/module_robot_pio_build/esp32dev/`.
+
+Limits:
+
+- This does not confirm hardware behavior.
+- This does not confirm GPS, IMU, WebSocket runtime, motor direction, or attachment wiring.
+- `.pio/` is generated and intentionally ignored by git.
+- PlatformIO build output is intentionally outside the repo on `D:` to avoid filling `C:`.
+
 ### Manual app-to-robot control
 
 Status: working MVP behavior.
@@ -103,17 +120,17 @@ Limits:
 
 ## Known broken / must fix
 
-### Firmware build issues
+### Firmware build issues - resolved for compile
 
-- `g_targetLeft` and `g_targetRight` are defined twice in `motors.cpp` and `nav.cpp`.
-- `MAX_WS_MSG` conflicts between `config.h` and `websocket.cpp`.
-- `motors_request_smooth_stop` is declared but not fully implemented or moved.
-- `motors_check_failsafe` is declared but not fully implemented or moved.
-- `g_lastCmdMs` is declared but not fully implemented or moved.
+- `g_targetLeft` and `g_targetRight` ownership is now in `motors.cpp`.
+- `MAX_WS_MSG` is now taken from `config.h`.
+- `motors_request_smooth_stop`, `motors_check_failsafe`, and `g_lastCmdMs` now have compiled definitions.
+- PlatformIO project config exists in `platformio.ini`.
 
 Impact:
 
-- Firmware build and runtime safety cannot be trusted until these are resolved.
+- Compile blocker is resolved.
+- Runtime safety still cannot be trusted until hardware tests are run.
 
 ### Auto UI workflow gaps
 
@@ -156,7 +173,6 @@ Missing required status:
 
 ## Planned
 
-- Fix firmware build.
 - Stabilize manual mode after firmware build.
 - Verify stop/failsafe behavior with real tests.
 - Complete auto UI workflow.
@@ -177,4 +193,3 @@ Missing required status:
 - Do not assume `sound/` is valid current firmware.
 - Do not assume route planner output is physically meaningful until fixed and tested.
 - Do not mark any untested item as PASS.
-

@@ -18,7 +18,7 @@ Before starting any task, read `CODEX_START_HERE.md`, `MEMORY.md`, `IMPLEMENTATI
 
 ### TASK-001 - Fix firmware build
 
-Status: open
+Status: done on 2026-04-27
 
 Scope: `firmware/` only.
 
@@ -30,13 +30,21 @@ Problem:
 
 Done when:
 
-- Firmware compiles.
-- Build command/result is logged in `TEST_LOG.md`.
-- No active architecture is moved back into `sound/`.
+- Firmware compiles. Done with `pio run`.
+- Build command/result is logged in `TEST_LOG.md`. Done.
+- No active architecture is moved back into `sound/`. Done.
+
+Notes:
+
+- Added `platformio.ini`.
+- `platformio.ini` uses `D:/rn-cache/module_robot_pio_build` for PlatformIO build output to avoid filling `C:`.
+- Fixed duplicate motor target definitions by keeping ownership in `motors.cpp`.
+- Removed local `MAX_WS_MSG` shadow definition from `websocket.cpp`.
+- Added compiled definitions for motor smooth stop, command timestamp, and failsafe check.
 
 ### TASK-002 - Stabilize manual mode
 
-Status: open after TASK-001.
+Status: open
 
 Scope: `firmware/` and `module_app/` only if required.
 
@@ -175,4 +183,3 @@ Done when:
 - Do not assume GPS or RTK is ready.
 - Do not assume code in `sound/` should be edited.
 - Do not assume there is git history to inspect.
-

@@ -10,8 +10,6 @@
 static AsyncWebServer server(WS_PORT);
 static AsyncWebSocket ws("/ws");
 
-static constexpr size_t MAX_WS_MSG = 128;
-
 static inline void trimInPlace(char* s) {
   int n = (int)strlen(s);
   while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == '\t')) s[--n] = 0;
@@ -55,8 +53,7 @@ static void onWsEvent(AsyncWebSocket *serverPtr, AsyncWebSocketClient *client,
 
   if (type == WS_EVT_DISCONNECT) {
     Serial.printf("WS: Client %u disconnected\n", client->id());
-    g_targetLeft = 0;
-    g_targetRight = 0;
+    motors_request_smooth_stop("websocket disconnect");
     nav_stop();
     return;
   }
@@ -76,8 +73,7 @@ static void onWsEvent(AsyncWebSocket *serverPtr, AsyncWebSocketClient *client,
     // PING/STOP
     if (streq(msg, "PING")) { client->text("PONG"); return; }
     if (streq(msg, "STOP")) {
-      g_targetLeft = 0;
-      g_targetRight = 0;
+      motors_request_smooth_stop("manual stop");
       client->text("OK STOP");
       return;
     }
@@ -87,6 +83,7 @@ static void onWsEvent(AsyncWebSocket *serverPtr, AsyncWebSocketClient *client,
     if (parseMove(msg, L, R)) {
       g_targetLeft = L;
       g_targetRight = R;
+      g_lastCmdMs = millis();
       client->text("OK M");
       return;
     }

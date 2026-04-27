@@ -29,7 +29,7 @@ extern NavState g_navState;
 extern int g_navWpIndex;
 extern int g_navWpTotal;
 extern float g_navDistToWp;
-extern Waypoint g_waypoints[MAX_WAYPOINTS];
+extern Waypoint g_waypoints[];
 
 // Motor targets set by nav (used by motors.cpp)
 extern volatile int16_t g_targetLeft;

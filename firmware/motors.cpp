@@ -24,6 +24,7 @@ typedef struct __attribute__((packed)) {
 
 volatile int16_t g_targetLeft = 0;
 volatile int16_t g_targetRight = 0;
+volatile uint32_t g_lastCmdMs = 0;
 int16_t g_curLeft = 0;
 int16_t g_curRight = 0;
 
@@ -74,6 +75,27 @@ void motors_init() {
 
   g_lastRampMs = millis();
   g_lastSendMs = millis();
+  g_lastCmdMs = millis();
+}
+
+void motors_request_smooth_stop(const char* reason) {
+  g_targetLeft = 0;
+  g_targetRight = 0;
+  g_lastCmdMs = millis();
+  if (reason && reason[0]) {
+    Serial.printf("MOTORS: smooth stop requested: %s\n", reason);
+  }
+}
+
+void motors_check_failsafe() {
+  uint32_t now = millis();
+  if (now - g_lastCmdMs <= CMD_TIMEOUT_MS) return;
+
+  if (g_targetLeft != 0 || g_targetRight != 0) {
+    g_targetLeft = 0;
+    g_targetRight = 0;
+    Serial.println("MOTORS: command timeout, stopping");
+  }
 }
 
 void motors_update_ramp() {
