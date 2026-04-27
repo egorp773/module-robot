@@ -20,10 +20,14 @@ class AutoMapScreen extends ConsumerStatefulWidget {
 }
 
 class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
+  static const double _draftLineStepMeters = 0.42;
+
   ManualMapState? _mapState;
   bool _isLoading = true;
   String? _error;
   List<Offset> _route = []; // Построенный маршрут
+  bool _routeSent = false;
+  String? _routeWorkflowError;
 
   // Состояние для управления картой
   double _zoom = 1.0;
@@ -122,7 +126,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       final greenStart = allRoutePoints.isNotEmpty ? allRoutePoints.last : startPoint;
       final cleaningRoute = CleaningRoutePlanner.planRoute(
         _mapState!,
-        lineStep: 44.0,
+        lineStep: _draftLineStepMeters,
         borderPasses: 2,
         startOverride: greenStart,
         debugPrint: true,
@@ -155,6 +159,8 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     // Сохраняем объединенный маршрут в состояние
     setState(() {
       _route = allRoutePoints;
+      _routeSent = false;
+      _routeWorkflowError = null;
     });
 
     ref.read(noticeProvider.notifier).show(
@@ -164,6 +170,98 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                 'Зеленые зоны: ${_mapState!.zones.length}',
             kind: NoticeKind.success,
           ),
+        );
+  }
+
+  void _sendRoute(BuildContext context, WidgetRef ref) {
+    if (_route.isEmpty) {
+      _showNotice(
+        ref,
+        title: 'Нет маршрута',
+        message: 'Сначала постройте маршрут.',
+        kind: NoticeKind.warning,
+      );
+      return;
+    }
+
+    final wifi = ref.read(wifiConnectionProvider);
+    if (!wifi.isConnected) {
+      _showNotice(
+        ref,
+        title: 'Не подключено',
+        message: 'Подключитесь к роботу перед отправкой маршрута.',
+        kind: NoticeKind.warning,
+      );
+      return;
+    }
+
+    final ctrl = ref.read(wifiConnectionProvider.notifier);
+    ctrl.sendRouteBegin(_route.length);
+    for (var i = 0; i < _route.length; i++) {
+      final p = _route[i];
+      ctrl.sendRouteWaypoint(i, p.dy, p.dx);
+    }
+    ctrl.sendRouteEnd();
+
+    setState(() {
+      _routeSent = true;
+      _routeWorkflowError = null;
+    });
+
+    _showNotice(
+      ref,
+      title: 'Маршрут отправлен',
+      message: 'Draft route sent: map/local coordinates, not verified GPS.',
+      kind: NoticeKind.info,
+    );
+  }
+
+  void _startNavigation(BuildContext context, WidgetRef ref) {
+    final wifi = ref.read(wifiConnectionProvider);
+    if (!wifi.isConnected) {
+      _showNotice(
+        ref,
+        title: 'Не подключено',
+        message: 'Подключитесь к роботу перед стартом.',
+        kind: NoticeKind.warning,
+      );
+      return;
+    }
+    if (!_routeSent) {
+      _showNotice(
+        ref,
+        title: 'Маршрут не отправлен',
+        message: 'Сначала отправьте построенный маршрут.',
+        kind: NoticeKind.warning,
+      );
+      return;
+    }
+    const msg = 'NAV_START blocked until GPS route workflow is confirmed.';
+    setState(() => _routeWorkflowError = msg);
+    _showNotice(
+      ref,
+      title: 'Автономка заблокирована',
+      message: msg,
+      kind: NoticeKind.danger,
+    );
+  }
+
+  void _pauseNavigation(WidgetRef ref) {
+    ref.read(wifiConnectionProvider.notifier).sendNavPause();
+  }
+
+  void _stopNavigation(WidgetRef ref) {
+    ref.read(wifiConnectionProvider.notifier).sendNavStop();
+  }
+
+  void _showNotice(
+    WidgetRef ref, {
+    required String title,
+    required String message,
+    required NoticeKind kind,
+  }) {
+    ref.read(noticeProvider.notifier).show(
+          NoticeState(title: title, message: message, kind: kind),
         );
   }
 
@@ -345,13 +443,25 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                         children: [
                           _ActionButton(
                             icon: Icons.route_rounded,
-                            label: 'Построить маршрут',
+                            label: 'Build route',
                             onTap: () {
                               if (_mapState != null) {
                                 _buildRoute(context, ref);
                               }
                             },
                             isPrimary: true,
+                          ),
+                          SizedBox(height: gap),
+                          _AutoWorkflowPanel(
+                            uiScale: uiScale,
+                            wifi: wifi,
+                            routePoints: _route.length,
+                            routeSent: _routeSent,
+                            error: _routeWorkflowError,
+                            onSendRoute: () => _sendRoute(context, ref),
+                            onStart: () => _startNavigation(context, ref),
+                            onPause: () => _pauseNavigation(ref),
+                            onStop: () => _stopNavigation(ref),
                           ),
                         ],
                       ),
@@ -518,6 +628,195 @@ class _IconBtn extends StatelessWidget {
               border: Border.all(color: Colors.white.withOpacity(0.10)),
             ),
             child: Icon(icon, color: accentWhite),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _AutoWorkflowPanel extends StatelessWidget {
+  final double uiScale;
+  final WifiConnectionState wifi;
+  final int routePoints;
+  final bool routeSent;
+  final String? error;
+  final VoidCallback onSendRoute;
+  final VoidCallback onStart;
+  final VoidCallback onPause;
+  final VoidCallback onStop;
+
+  const _AutoWorkflowPanel({
+    required this.uiScale,
+    required this.wifi,
+    required this.routePoints,
+    required this.routeSent,
+    required this.error,
+    required this.onSendRoute,
+    required this.onStart,
+    required this.onPause,
+    required this.onStop,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    double u(double v) => v * uiScale;
+    final gpsStatus = wifi.gpsFixType == null
+        ? 'GPS: no data'
+        : 'GPS: fix ${wifi.gpsFixType}, ${wifi.gpsAccuracy ?? 0} mm';
+    final navMode = wifi.navState ?? 'IDLE';
+    final waypoint = wifi.navWpTotal == null
+        ? 'WP: -'
+        : 'WP: ${wifi.navWpIndex ?? 0}/${wifi.navWpTotal}';
+    final routeStatus = routeSent ? 'sent' : 'not sent';
+
+    return _GlassCard(
+      borderColor: Colors.white.withOpacity(0.14),
+      child: Padding(
+        padding: EdgeInsets.all(u(10).clamp(8.0, 10.0)),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Wrap(
+              spacing: u(8).clamp(6.0, 8.0),
+              runSpacing: u(6).clamp(5.0, 6.0),
+              children: [
+                _StatusPill(label: 'Route: $routePoints pts, $routeStatus'),
+                _StatusPill(label: 'NAV: $navMode'),
+                _StatusPill(label: waypoint),
+                _StatusPill(label: gpsStatus),
+              ],
+            ),
+            if (error != null) ...[
+              SizedBox(height: u(6).clamp(5.0, 6.0)),
+              Text(
+                error!,
+                style: TextStyle(
+                  color: const Color(0xFFFF6B7A),
+                  fontSize: u(10.5).clamp(9.5, 10.5),
+                  fontWeight: FontWeight.w800,
+                ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+              ),
+            ],
+            SizedBox(height: u(10).clamp(8.0, 10.0)),
+            Row(
+              children: [
+                Expanded(
+                  child: _WorkflowButton(
+                    icon: Icons.upload_rounded,
+                    label: 'Send',
+                    enabled: routePoints > 0 && wifi.isConnected,
+                    onTap: onSendRoute,
+                  ),
+                ),
+                SizedBox(width: u(8).clamp(6.0, 8.0)),
+                Expanded(
+                  child: _WorkflowButton(
+                    icon: Icons.play_arrow_rounded,
+                    label: 'Start',
+                    enabled: routeSent && wifi.isConnected,
+                    onTap: onStart,
+                  ),
+                ),
+                SizedBox(width: u(8).clamp(6.0, 8.0)),
+                Expanded(
+                  child: _WorkflowButton(
+                    icon: Icons.pause_rounded,
+                    label: 'Pause',
+                    enabled: wifi.isConnected,
+                    onTap: onPause,
+                  ),
+                ),
+                SizedBox(width: u(8).clamp(6.0, 8.0)),
+                Expanded(
+                  child: _WorkflowButton(
+                    icon: Icons.stop_rounded,
+                    label: 'Stop',
+                    enabled: wifi.isConnected,
+                    onTap: onStop,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StatusPill extends StatelessWidget {
+  final String label;
+
+  const _StatusPill({required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white.withOpacity(0.12)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: Colors.white.withOpacity(0.82),
+          fontSize: 10,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+    );
+  }
+}
+
+class _WorkflowButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  const _WorkflowButton({
+    required this.icon,
+    required this.label,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = enabled ? Colors.white : Colors.white.withOpacity(0.34);
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(14),
+      onTap: enabled ? onTap : null,
+      child: Opacity(
+        opacity: enabled ? 1.0 : 0.55,
+        child: Container(
+          height: 42,
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(enabled ? 0.08 : 0.04),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: color.withOpacity(0.20)),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 17, color: color),
+              const SizedBox(height: 2),
+              Text(
+                label,
+                style: TextStyle(
+                  color: color,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ],
           ),
         ),
       ),

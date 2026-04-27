@@ -111,23 +111,26 @@ Do not introduce RTK assumptions into the main workflow before normal GPS has pa
 ## Flutter truth
 
 The manual control UI is the most valuable current workflow.
-The auto screen is incomplete.
-The auto screen needs a complete workflow:
+The auto screen is still unverified, but the basic workflow now exists in code:
 
-- Build route.
-- Send route.
-- Start.
-- Pause.
-- Stop.
+- Build route: implemented in `auto_map_screen.dart`.
+- Send route: implemented as draft route upload through current WebSocket text commands.
+- Start: control exists, but `NAV_START` is intentionally blocked until GPS/local-meter route workflow is confirmed.
+- Pause: implemented through `NAV_PAUSE`.
+- Stop: implemented through `NAV_STOP`.
 
-The auto screen must show:
+The auto screen now shows:
 
 - route point count,
 - whether the route was sent,
 - current NAV mode,
 - current waypoint index/point,
 - GPS status,
-- errors.
+- workflow errors.
+
+Important limit: this is a UI/code-level workflow only.
+It does not prove route upload, GPS route following, or autonomous driving on hardware.
+The auto route still must not be described as a real GPS route.
 
 App files known to matter:
 

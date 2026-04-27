@@ -67,27 +67,31 @@ Exit criteria:
 
 Goal: make the auto screen honest and operational without pretending GPS autonomy is ready.
 
+Status: code-level partial done on 2026-04-27; runtime/device verification still needed.
+
 Work:
 
-- Add or fix Build route.
-- Add or fix Send route.
-- Add or fix Start.
-- Add or fix Pause.
-- Add or fix Stop.
-- Show route point count.
-- Show whether route was sent.
-- Show current NAV mode.
-- Show current waypoint index/point.
-- Show GPS status.
-- Show errors.
-- Clearly separate simulated/conditional map state from confirmed GPS state.
+- Add or fix Build route. Done in `auto_map_screen.dart`.
+- Add or fix Send route. Done as draft WebSocket route upload.
+- Add or fix Start. Control is present; `NAV_START` is intentionally blocked until GPS/local-meter route workflow is confirmed.
+- Add or fix Pause. Done.
+- Add or fix Stop. Done.
+- Show route point count. Done.
+- Show whether route was sent. Done.
+- Show current NAV mode. Done.
+- Show current waypoint index/point. Done.
+- Show GPS status. Done.
+- Show errors. Done.
+- Clearly separate simulated/conditional map state from confirmed GPS state. Partially done through draft status/errors; still needs runtime review.
 
 Exit criteria:
 
 - User can build a route and see point count.
 - User can see whether route was sent.
-- User can start, pause, and stop through explicit UI controls.
+- User can see start, pause, and stop controls; actual `NAV_START` remains blocked until later safety phases.
 - UI does not label simulated map position as real GPS.
+- `TEST_LOG.md` contains at least a static check entry. Done.
+- Device/runtime layout check is still required before calling this phase complete.
 
 ## Phase 5 - Fix route planner in local meters
 
@@ -255,4 +259,3 @@ Exit criteria:
 - Do not test autonomy with attachment before dry autonomy.
 - Do not work on RTK before ordinary GPS.
 - Do not treat old route spacing as valid.
-

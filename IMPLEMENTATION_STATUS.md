@@ -108,6 +108,10 @@ Recent code-level hardening:
 - Disabled the unsafe simulated connected state in `wifi_connection.dart`.
 - Turning off Wi-Fi preflight now only skips the preliminary check; the app must still create a real WebSocket channel and receive connection state.
 - Verified changed file with `dart analyze lib/core/wifi_connection.dart`; no errors, existing `avoid_print` info remains.
+- Auto map screen now exposes a draft workflow: Build route, Send route, Start, Pause, Stop.
+- Auto map screen shows route point count, sent state, NAV mode, waypoint index/total, GPS status, and workflow errors.
+- `NAV_START` from the auto map screen is blocked in the UI until the GPS route workflow is confirmed.
+- Verified changed auto map file with `dart analyze module_app/lib/features/auto/auto_map_screen.dart`; no errors, existing/deprecated style info remains.
 
 ### Route generation
 
@@ -151,22 +155,29 @@ Impact:
 
 ### Auto UI workflow gaps
 
-Missing required workflow:
+Status: code-level partial, not hardware-tested.
+
+Implemented in UI:
 
 - Build route.
 - Send route.
 - Start.
 - Pause.
 - Stop.
+- Route point count.
+- Route sent/not sent.
+- Current NAV mode.
+- Current waypoint.
+- GPS status.
+- Workflow errors.
 
-Missing required status:
+Limits:
 
-- route point count,
-- route sent/not sent,
-- current NAV mode,
-- current waypoint,
-- GPS status,
-- errors.
+- Route sending is still a draft protocol workflow.
+- Current auto map route points are map/local coordinates, not confirmed GPS waypoints.
+- Start control is visible, but the UI intentionally blocks `NAV_START` until GPS/local-meter route workflow is confirmed.
+- No real robot autonomous test has been run.
+- Do not mark autonomy or GPS route following as working from this UI change.
 
 ### Mapping/route issues
 

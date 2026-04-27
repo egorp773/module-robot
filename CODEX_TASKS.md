@@ -95,28 +95,35 @@ Progress:
 
 ### TASK-004 - Fix auto screen workflow
 
-Status: open after manual/failsafe work.
+Status: code-level partial done on 2026-04-27; runtime/hardware unverified.
 
 Scope: `module_app/`.
 
 Work:
 
-- Build route.
-- Send route.
-- Start.
-- Pause.
-- Stop.
-- Show route point count.
-- Show route sent state.
-- Show NAV mode.
-- Show current waypoint.
-- Show GPS status.
-- Show errors.
+- Build route. Done in `auto_map_screen.dart`.
+- Send route. Done as draft route upload through existing WebSocket commands.
+- Start. Control is present, but `NAV_START` is intentionally blocked until GPS/local-meter route workflow is confirmed.
+- Pause. Done through existing `NAV_PAUSE` command.
+- Stop. Done through existing `NAV_STOP` command.
+- Show route point count. Done.
+- Show route sent state. Done.
+- Show NAV mode. Done.
+- Show current waypoint. Done.
+- Show GPS status. Done.
+- Show errors. Done.
 
 Done when:
 
 - The UI workflow is visible and usable.
 - The UI does not claim simulated map state is real GPS.
+
+Remaining:
+
+- Run on a device/emulator for visual layout verification.
+- Test with a real WebSocket robot session.
+- Confirm route upload behavior against firmware logs.
+- Keep autonomy marked unverified until GPS/local-meter routing is complete.
 
 ### TASK-005 - Convert route planner to local meters
 

@@ -180,6 +180,45 @@ Status update needed: mark disconnect attachment-off behavior as implemented in 
 
 Next action: continue manual/failsafe hardware test preparation; do not mark failsafe PASS until robot test.
 
+### 2026-04-27 - Auto UI workflow static check
+
+Date/time: 2026-04-27, Europe/Moscow timezone
+
+Test: auto map screen workflow code check
+
+Area: app/route
+
+Code state: after updating `module_app/lib/features/auto/auto_map_screen.dart`.
+
+Hardware: no hardware used.
+
+Conditions: static Dart analysis of changed file only. APK build was intentionally not run.
+
+Steps:
+
+- Added Build route, Send route, Start, Pause, and Stop controls to the auto map screen.
+- Added visible route point count, sent state, NAV mode, waypoint index/total, GPS status, and workflow error state.
+- Changed the auto screen route build call away from the old `lineStep 44.0` value to a draft `0.42` meter spacing constant.
+- Kept `NAV_START` blocked in the UI until GPS/local-meter route workflow is confirmed.
+- Ran `dart analyze module_app/lib/features/auto/auto_map_screen.dart`.
+
+Expected result: changed file has no Dart syntax/static errors and the UI no longer lacks the basic autonomous workflow controls.
+
+Actual result: analyzer completed with no errors; existing/deprecated style info remains, mostly `withOpacity`.
+
+Result: PARTIAL
+
+Issues found:
+
+- This is not a device UI test.
+- This is not a robot/WebSocket runtime test.
+- Route upload is still draft and uses map/local route points, not confirmed GPS waypoints.
+- No APK build was run per user instruction.
+
+Status update needed: mark auto UI workflow as code-level partial, not confirmed autonomous operation.
+
+Next action: verify UI layout/runtime without APK build, then continue route planner conversion to local meters.
+
 ### 2026-04-26 - Documentation initialization
 
 Area: documentation
