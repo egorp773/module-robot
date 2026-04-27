@@ -115,14 +115,23 @@ Recent code-level hardening:
 
 ### Route generation
 
-Status: partially implemented, not reliable.
+Status: partially implemented, not reliable, but old `44.0` default has been removed from the active cleaning planner.
 
 Known issues:
 
 - Snake route generation is poor.
-- `lineStep 44.0` is an old wrong value.
-- Future route generation must use local meters.
+- `lineStep 44.0` is an old wrong value and must not be reintroduced.
+- `CleaningRoutePlanner` now defaults to `0.42` local meters and validates positive finite spacing.
+- Border-pass offset now uses the local-meter step approximately instead of the old `step / 100` behavior.
+- Future route generation still must be tied to real GPS-derived local x/y maps.
 - Target cleaning line spacing is approximately `0.40` to `0.45` m.
+- Route diagnostics are logged when debug mode is enabled: line step, zone bounding box, forbidden count, segment count, route point count, distance, and cleaning segment count.
+
+Limits:
+
+- This is a code-level planner cleanup only.
+- Existing saved manual maps may still be conceptual/cell maps, not measured local-meter maps.
+- No real polygon/GPS perimeter test has confirmed physical route quality.
 
 ### GPS projection and map storage
 
@@ -182,7 +191,7 @@ Limits:
 ### Mapping/route issues
 
 - Current snake route is not good enough.
-- Current line step is wrong if using `44.0`.
+- Current line step is wrong if using `44.0`; active cleaning planner default is now `0.42`.
 - Route generation must be converted to local metric x/y coordinates.
 - Robot marker on auto map must not be presented as reliable GPS position yet.
 

@@ -87,6 +87,8 @@ If a useful low-level behavior exists in `sound/`, port the idea into the modula
 Future route planning must use local meters, not fake scaled GPS degrees.
 The likely future cleaning line spacing is around `0.40` to `0.45` meters.
 The old `lineStep 44.0` value is considered wrong and must not be preserved as a real-world spacing.
+As of 2026-04-27, the active `CleaningRoutePlanner` default is `0.42` local meters and the auto screen passes that value explicitly.
+This does not prove route quality on real ground.
 
 Manual map recording is currently conditional/simulated.
 It is not yet a full GPS perimeter recording workflow.

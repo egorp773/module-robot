@@ -42,9 +42,11 @@ class CleaningRoute {
 }
 
 class CleaningRoutePlanner {
+  static const double defaultLineStepMeters = 0.42;
+
   static CleaningRoute? planRoute(
     ManualMapState mapState, {
-    double lineStep = 44.0,
+    double lineStep = defaultLineStepMeters,
     int borderPasses = 1,
     Offset? startOverride,
     bool debugPrint = false,
@@ -53,6 +55,11 @@ class CleaningRoutePlanner {
     logger.log('=== CLEAN ROUTE ===');
 
     if (mapState.zones.isEmpty) return null;
+    if (!lineStep.isFinite || lineStep <= 0) {
+      logger.log('ОШИБКА: lineStep должен быть положительным числом в локальных метрах');
+      return null;
+    }
+    logger.log('lineStep meters: ${lineStep.toStringAsFixed(2)}');
 
     final start = startOverride ?? mapState.startPoint;
     if (start == null) {
@@ -83,6 +90,11 @@ class CleaningRoutePlanner {
       final zone = mapState.zones[zi];
       final forbiddens = _findInternalForbiddens(zone, mapState.forbiddens);
       if (zone.points.length < 3) continue;
+      final bbox = _bbox(zone.points);
+      logger.log(
+        'zone $zi bbox: ${bbox.width.toStringAsFixed(2)}m x '
+        '${bbox.height.toStringAsFixed(2)}m, forbiddens: ${forbiddens.length}',
+      );
 
       current ??= (zi == 0 ? start : zone.points.first);
 
@@ -119,6 +131,7 @@ class CleaningRoutePlanner {
 
       // 3) Основная змейка внутри зоны
       final snakeSegments = _buildSnakeSegments(zone.points, forbiddens, lineStep);
+      logger.log('zone $zi snake segments: ${snakeSegments.length}');
       for (final seg in snakeSegments) {
         moveTo(seg.start);
         commands.add(const RobotCommand(RobotCommandType.cleanOn));
@@ -131,6 +144,10 @@ class CleaningRoutePlanner {
     }
 
     if (commands.isEmpty) return null;
+    logger.log(
+      'route points: ${path.length}, distance: ${totalDistance.toStringAsFixed(2)}m, '
+      'cleaning segments: $cleaningSegments',
+    );
 
     return CleaningRoute(
       commands: commands,
@@ -145,6 +162,7 @@ class CleaningRoutePlanner {
     List<PolyShape> forbiddens,
     double step,
   ) {
+    if (!step.isFinite || step <= 0) return const [];
     final bbox = _bbox(zone);
     final horizontal = bbox.width >= bbox.height;
     final segments = <_Segment>[];
@@ -276,13 +294,16 @@ class CleaningRoutePlanner {
     passes.add(poly);
     if (count <= 1) return passes;
 
-    // Грубый внутренний проход: сдвигаем к центроиду
+    // Approximate inward pass in local meters by moving each vertex toward the centroid.
     final c = _centroid(poly);
     final inner = poly
-        .map((p) => Offset(
-              p.dx + (c.dx - p.dx) * (step / 100).clamp(0.02, 0.15),
-              p.dy + (c.dy - p.dy) * (step / 100).clamp(0.02, 0.15),
-            ))
+        .map((p) {
+          final toCenter = c - p;
+          final distance = toCenter.distance;
+          if (distance <= 0.001) return p;
+          final inward = math.min(step, distance * 0.45);
+          return p + toCenter * (inward / distance);
+        })
         .toList();
     passes.add(inner);
     return passes;

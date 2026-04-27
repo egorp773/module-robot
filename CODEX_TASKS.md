@@ -127,21 +127,28 @@ Remaining:
 
 ### TASK-005 - Convert route planner to local meters
 
-Status: open after auto UI basics.
+Status: code-level partial done on 2026-04-27; GPS/local-map workflow still open.
 
 Scope: likely `cleaning_route_planner.dart` and related tests/helpers.
 
 Work:
 
-- Use local x/y meters.
-- Remove wrong `lineStep 44.0` semantics.
-- Use starting line spacing around `0.40` to `0.45` m.
-- Add route diagnostics.
+- Use local x/y meters. Partially done by treating `CleaningRoutePlanner` spacing as local meters.
+- Remove wrong `lineStep 44.0` semantics. Done in active cleaning planner default and auto map call.
+- Use starting line spacing around `0.40` to `0.45` m. Done with `0.42`.
+- Add route diagnostics. Done for debug logging.
 
 Done when:
 
 - Route planner output is local-meter waypoints.
 - A simple polygon produces a reasonable snake route.
+
+Remaining:
+
+- Confirm all map inputs are true local-meter coordinates, not old conceptual cells.
+- Add a repeatable route planner test fixture.
+- Verify route visually on device/emulator.
+- Feed planner from a real GPS perimeter after GPS phases are complete.
 
 ### TASK-006 - Connect and display GPS
 

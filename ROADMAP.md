@@ -97,13 +97,15 @@ Exit criteria:
 
 Goal: route generation uses physical local coordinates.
 
+Status: code-level partial done on 2026-04-27; measured GPS/local-map input is still missing.
+
 Work:
 
-- Update `cleaning_route_planner.dart` to operate in local x/y meters.
-- Remove dependency on the old wrong `lineStep 44.0` idea.
-- Use approximate line spacing around `0.40` to `0.45` m as the starting range.
-- Keep route generation deterministic and inspectable.
-- Add route diagnostics: point count, line count, bounding box, spacing.
+- Update `cleaning_route_planner.dart` to operate in local x/y meters. Partially done for spacing semantics.
+- Remove dependency on the old wrong `lineStep 44.0` idea. Done in active cleaning planner and auto screen call.
+- Use approximate line spacing around `0.40` to `0.45` m as the starting range. Done with `0.42`.
+- Keep route generation deterministic and inspectable. Partially done.
+- Add route diagnostics: point count, line count, bounding box, spacing. Done through debug logs.
 
 Exit criteria:
 
@@ -111,6 +113,8 @@ Exit criteria:
 - Generated snake route is visually and numerically reasonable for a test polygon.
 - Point count is shown in UI or logs.
 - Old `44.0` spacing is not used as a real route spacing.
+- A repeatable route-planner fixture exists.
+- Real GPS-derived local x/y input remains a later phase.
 
 ## Phase 6 - Connect ordinary GPS
 

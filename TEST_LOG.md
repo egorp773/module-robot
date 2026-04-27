@@ -219,6 +219,45 @@ Status update needed: mark auto UI workflow as code-level partial, not confirmed
 
 Next action: verify UI layout/runtime without APK build, then continue route planner conversion to local meters.
 
+### 2026-04-27 - Cleaning route planner local-meter cleanup
+
+Date/time: 2026-04-27, Europe/Moscow timezone
+
+Test: route planner static code check
+
+Area: app/route
+
+Code state: after updating `module_app/lib/core/cleaning_route_planner.dart`.
+
+Hardware: no hardware used.
+
+Conditions: static Dart analysis only. APK build was intentionally not run.
+
+Steps:
+
+- Changed `CleaningRoutePlanner` default line spacing from old `44.0` to `0.42` local meters.
+- Added validation for positive finite `lineStep`.
+- Changed approximate inner border pass from the old `step / 100` behavior to a local-meter offset toward the centroid.
+- Added debug diagnostics for line step, zone bbox, forbidden count, snake segment count, route point count, distance, and cleaning segment count.
+- Ran `dart analyze module_app/lib/core/cleaning_route_planner.dart module_app/lib/features/auto/auto_map_screen.dart`.
+
+Expected result: changed files have no Dart syntax/static errors and active planner no longer uses `44.0` as route spacing.
+
+Actual result: analyzer completed with no errors; existing info findings remain (`avoid_print`, deprecated `withOpacity`).
+
+Result: PARTIAL
+
+Issues found:
+
+- This is not a route quality test.
+- This is not a GPS/local-map test.
+- Existing saved maps may still be conceptual/cell maps rather than measured local-meter maps.
+- No APK build was run per user instruction.
+
+Status update needed: mark route planner local-meter conversion as code-level partial only.
+
+Next action: add a repeatable route planner fixture and then continue GPS connection/display phases.
+
 ### 2026-04-26 - Documentation initialization
 
 Area: documentation
