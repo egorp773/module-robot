@@ -120,6 +120,8 @@ Exit criteria:
 
 Goal: receive real GPS data from hardware.
 
+Status: blocked on physical hardware; code paths exist.
+
 Work:
 
 - Fill GPS module model in `HARDWARE.md`.
@@ -140,12 +142,14 @@ Exit criteria:
 
 Goal: operator can see real geographic position.
 
+Status: code-level partial done on 2026-04-27; not verified with real GPS telemetry.
+
 Work:
 
-- Add or finish telemetry parsing in Flutter.
-- Display lat/lon only when fix is valid.
-- Display no-fix clearly.
-- Display accuracy if available.
+- Add or finish telemetry parsing in Flutter. Already present in `wifi_connection.dart`.
+- Display lat/lon only when fix is valid. Partially done: auto map panel shows lat/lon when telemetry fields exist.
+- Display no-fix clearly. Partially done through GPS status/no-data.
+- Display accuracy if available. Done in auto map panel GPS status.
 - Log protocol examples in `PROTOCOL.md`.
 
 Exit criteria:

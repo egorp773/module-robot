@@ -664,6 +664,10 @@ class _AutoWorkflowPanel extends StatelessWidget {
     final gpsStatus = wifi.gpsFixType == null
         ? 'GPS: no data'
         : 'GPS: fix ${wifi.gpsFixType}, ${wifi.gpsAccuracy ?? 0} mm';
+    final gpsCoords = (wifi.gpsLat == null || wifi.gpsLon == null)
+        ? 'LL: -'
+        : 'LL: ${wifi.gpsLat!.toStringAsFixed(7)}, '
+            '${wifi.gpsLon!.toStringAsFixed(7)}';
     final navMode = wifi.navState ?? 'IDLE';
     final waypoint = wifi.navWpTotal == null
         ? 'WP: -'
@@ -685,6 +689,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 _StatusPill(label: 'NAV: $navMode'),
                 _StatusPill(label: waypoint),
                 _StatusPill(label: gpsStatus),
+                _StatusPill(label: gpsCoords),
               ],
             ),
             if (error != null) ...[

@@ -159,12 +159,19 @@ Work:
 - Document GPS model, UART pins, and baud.
 - Confirm raw GPS data.
 - Parse fix, lat, lon, accuracy if available.
-- Display lat/lon and GPS status in app.
+- Display lat/lon and GPS status in app. Code-level display is present on auto map screen when telemetry arrives.
 
 Done when:
 
 - GPS hardware test is recorded.
 - App shows lat/lon only with valid fix.
+
+Progress:
+
+- Firmware has GPS UART and telemetry code.
+- Flutter parses GPS telemetry in `wifi_connection.dart`.
+- Auto map workflow panel now shows GPS status and lat/lon when telemetry is present.
+- Hardware connection and real fix test are still required.
 
 ### TASK-007 - Build local x/y and perimeter recording
 

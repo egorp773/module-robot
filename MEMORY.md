@@ -98,6 +98,8 @@ Until GPS is physically connected and verified, any map screen robot marker is U
 
 GPS has not been physically connected and tested.
 GPS code and projection helpers do not prove that the robot can localize.
+Flutter parses GPS telemetry and the auto map panel can show lat/lon when telemetry exists.
+This is not a hardware GPS confirmation.
 The next GPS milestone is ordinary GPS first:
 
 - wire GPS,

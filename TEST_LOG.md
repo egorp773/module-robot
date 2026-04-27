@@ -258,6 +258,43 @@ Status update needed: mark route planner local-meter conversion as code-level pa
 
 Next action: add a repeatable route planner fixture and then continue GPS connection/display phases.
 
+### 2026-04-27 - GPS lat/lon display static check
+
+Date/time: 2026-04-27, Europe/Moscow timezone
+
+Test: app GPS display code check
+
+Area: app/GPS
+
+Code state: after updating auto map workflow panel lat/lon display.
+
+Hardware: no hardware used.
+
+Conditions: static Dart analysis only. APK build was intentionally not run.
+
+Steps:
+
+- Confirmed `wifi_connection.dart` already parses `GPS,<lat>,<lon>,<heading>,<fixType>,<hAcc>` telemetry.
+- Added lat/lon display to the auto map workflow panel when telemetry values exist.
+- Kept no-data state as `LL: -`.
+- Ran `dart analyze module_app/lib/features/auto/auto_map_screen.dart`.
+
+Expected result: changed file has no Dart syntax/static errors and app UI has a place to show GPS lat/lon.
+
+Actual result: analyzer completed with no errors; existing deprecated `withOpacity` info remains.
+
+Result: PARTIAL
+
+Issues found:
+
+- This is not a GPS hardware test.
+- This does not confirm GPS UART wiring, fix quality, or field localization.
+- No APK build was run per user instruction.
+
+Status update needed: GPS display is code-level partial only.
+
+Next action: physical GPS connection test, then verify real lat/lon telemetry in the app.
+
 ### 2026-04-26 - Documentation initialization
 
 Area: documentation

@@ -109,7 +109,7 @@ Recent code-level hardening:
 - Turning off Wi-Fi preflight now only skips the preliminary check; the app must still create a real WebSocket channel and receive connection state.
 - Verified changed file with `dart analyze lib/core/wifi_connection.dart`; no errors, existing `avoid_print` info remains.
 - Auto map screen now exposes a draft workflow: Build route, Send route, Start, Pause, Stop.
-- Auto map screen shows route point count, sent state, NAV mode, waypoint index/total, GPS status, and workflow errors.
+- Auto map screen shows route point count, sent state, NAV mode, waypoint index/total, GPS status, lat/lon if telemetry is present, and workflow errors.
 - `NAV_START` from the auto map screen is blocked in the UI until the GPS route workflow is confirmed.
 - Verified changed auto map file with `dart analyze module_app/lib/features/auto/auto_map_screen.dart`; no errors, existing/deprecated style info remains.
 
@@ -141,12 +141,15 @@ Known files:
 
 - `gps_projection.dart` exists.
 - `map_storage.dart` exists.
+- `wifi_connection.dart` parses `GPS,<lat>,<lon>,<heading>,<fixType>,<hAcc>` telemetry.
+- Auto map workflow panel displays lat/lon only when telemetry fields are present.
 
 Limits:
 
 - GPS has not been physically connected.
 - Manual map recording is mostly conditional/simulated.
 - It is not a confirmed GPS perimeter recording workflow.
+- Displaying lat/lon in the app does not prove GPS wiring, fix quality, or field localization.
 
 ## Known broken / must fix
 
