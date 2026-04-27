@@ -55,6 +55,8 @@ static void onWsEvent(AsyncWebSocket *serverPtr, AsyncWebSocketClient *client,
     Serial.printf("WS: Client %u disconnected\n", client->id());
     motors_request_smooth_stop("websocket disconnect");
     nav_stop();
+    setAttachment(false);
+    setMount(false);
     return;
   }
 

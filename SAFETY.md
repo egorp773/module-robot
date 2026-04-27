@@ -35,6 +35,12 @@ Not confirmed:
 - Attachment off on failsafe.
 - Autonomous stop/pause behavior.
 
+Implemented in code but not hardware-tested:
+
+- On WebSocket disconnect, firmware stops motor targets, calls `nav_stop()`, and switches attachment/mount outputs off.
+- Manual command timeout is compiled through `motors_check_failsafe()`.
+- Startup initializes attachment and mount outputs off.
+
 ## Hard restrictions
 
 - Do not test autonomous movement with the attachment enabled until dry autonomy passes.
@@ -82,6 +88,9 @@ Known issue:
 When app connection is lost:
 
 - stop motors,
+- stop NAV,
+- switch attachment off,
+- switch mount off,
 - prevent new movement until a valid connection/command returns,
 - report status after reconnect if possible.
 
@@ -109,7 +118,7 @@ Attachment/nozzle/tool output should:
 - default off,
 - be controlled explicitly,
 - turn off on startup,
-- turn off or remain safely controlled on failsafe,
+- turn off on WebSocket disconnect failsafe,
 - never be enabled automatically during first autonomous tests.
 
 ## Required Flutter safety behavior
@@ -172,4 +181,3 @@ Minimum safety tests:
 - Do not assume manual control implies failsafe works.
 - Do not assume GPS no-fix is harmless in auto mode.
 - Do not assume operator can recover if stop is not visible.
-

@@ -71,9 +71,20 @@ Known areas:
 - Failsafe/smooth stop declarations.
 - Configuration constants.
 
+Current build status:
+
+- Builds with `pio run`.
+- Build output is configured on `D:/rn-cache/module_robot_pio_build`.
+
+Implemented but unverified safety behavior:
+
+- Manual command timeout zeros motor targets after `CMD_TIMEOUT_MS`.
+- WebSocket disconnect stops motors, stops NAV, and switches attachment/mount outputs off.
+
 Risk:
 
-- The firmware has known symbol/config conflicts and incomplete moved functions.
+- Runtime behavior is not hardware-tested yet.
+- Relay active levels and motor directions are not confirmed.
 
 ### Flutter app
 

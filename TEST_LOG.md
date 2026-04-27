@@ -146,6 +146,40 @@ Status update needed: manual mode is safer at code level, but still needs real r
 
 Next action: continue Phase 2/3 with firmware failsafe and manual tests when hardware is available.
 
+### 2026-04-27 - Firmware disconnect failsafe build check
+
+Date/time: 2026-04-27, Europe/Moscow timezone
+
+Test: firmware disconnect failsafe compile check
+
+Area: firmware/safety
+
+Code state: after updating WebSocket disconnect handling.
+
+Hardware: no hardware used.
+
+Conditions: PlatformIO `esp32dev`, build output on `D:/rn-cache/module_robot_pio_build`.
+
+Steps:
+
+- Added attachment and mount off commands to WebSocket disconnect handling.
+- Ran `pio run`.
+
+Expected result: firmware compiles after disconnect failsafe hardening.
+
+Actual result: build succeeded and `firmware.bin` was created.
+
+Result: PASS
+
+Issues found:
+
+- This is not a hardware failsafe test.
+- Need real tests for moving disconnect, attachment-on disconnect, and relay active level.
+
+Status update needed: mark disconnect attachment-off behavior as implemented in code but unverified on hardware.
+
+Next action: continue manual/failsafe hardware test preparation; do not mark failsafe PASS until robot test.
+
 ### 2026-04-26 - Documentation initialization
 
 Area: documentation

@@ -70,7 +70,7 @@ Progress:
 
 ### TASK-003 - Implement and test failsafe
 
-Status: open after manual mode is stable.
+Status: in progress
 
 Work:
 
@@ -85,6 +85,13 @@ Done when:
 
 - Each safety behavior has a real test log entry.
 - `SAFETY.md` contains actual timeout values.
+
+Progress:
+
+- Command timeout compiles.
+- WebSocket disconnect now stops motors/NAV and switches attachment/mount outputs off.
+- Firmware builds after the change.
+- Real hardware tests are still required.
 
 ### TASK-004 - Fix auto screen workflow
 
