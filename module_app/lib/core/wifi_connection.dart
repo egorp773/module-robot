@@ -305,32 +305,24 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     final pingCheckEnabled = _ref.read(wifiPingCheckProvider);
     _log("→ Wi-Fi check setting: $pingCheckEnabled");
 
-    if (!pingCheckEnabled) {
-      // Проверка отключена - просто устанавливаем статус "Подключено" без реального подключения
-      _log("→ Wi-Fi check disabled, simulating connection...");
-      state = state.copyWith(
-        isConnecting: false,
-        isConnected: true,
-        error: null,
-      );
-      _log("=== CONNECT OK (simulated) ===");
-      return;
+    if (pingCheckEnabled) {
+      // Проверка включена - выполняем минимальную проверку WebSocket
+      _log("→ Wi-Fi check enabled, testing WebSocket connection...");
+      final wsTestOk = await _testWebSocketConnection();
+      if (!wsTestOk) {
+        state = state.copyWith(
+          isConnecting: false,
+          isConnected: false,
+          error:
+              "Не вижу робота по Wi-Fi. Проверь что iPhone/Android подключён к сети Robot.",
+        );
+        _log("=== CONNECT FAIL: WebSocket test failed ===");
+        return;
+      }
+      _log("✓ WebSocket test passed, Wi-Fi is available");
+    } else {
+      _log("→ Wi-Fi preflight disabled, connecting WebSocket directly...");
     }
-
-    // Проверка включена - выполняем минимальную проверку WebSocket
-    _log("→ Wi-Fi check enabled, testing WebSocket connection...");
-    final wsTestOk = await _testWebSocketConnection();
-    if (!wsTestOk) {
-      state = state.copyWith(
-        isConnecting: false,
-        isConnected: false,
-        error:
-            "Не вижу робота по Wi-Fi. Проверь что iPhone/Android подключён к сети Robot.",
-      );
-      _log("=== CONNECT FAIL: WebSocket test failed ===");
-      return;
-    }
-    _log("✓ WebSocket test passed, Wi-Fi is available");
 
     try {
       _log("→ WS connect $_wsUri");

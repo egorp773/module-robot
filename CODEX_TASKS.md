@@ -62,6 +62,12 @@ Done when:
 - `PROTOCOL.md` reflects actual commands.
 - `IMPLEMENTATION_STATUS.md` has exact confirmed details.
 
+Progress:
+
+- Manual command names were verified by source review and documented in `PROTOCOL.md`.
+- App no longer reports `isConnected=true` from the disabled Wi-Fi preflight branch without a real WebSocket channel.
+- Hardware tests are still required before marking this task done.
+
 ### TASK-003 - Implement and test failsafe
 
 Status: open after manual mode is stable.

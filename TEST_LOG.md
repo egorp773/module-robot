@@ -110,6 +110,42 @@ Status update needed: keep manual mode as current MVP, but do not mark detailed 
 
 Next action: commit firmware build fix, then continue with manual/failsafe hardening without APK build.
 
+### 2026-04-27 - Flutter manual connection safety check
+
+Date/time: 2026-04-27, Europe/Moscow timezone
+
+Test: manual connection state code check
+
+Area: app/manual/safety
+
+Code state: after removing simulated connected state from `wifi_connection.dart`.
+
+Hardware: no hardware used.
+
+Conditions: static Dart analysis of changed file only. APK build was intentionally not run.
+
+Steps:
+
+- Removed behavior where disabled Wi-Fi preflight set `isConnected=true` without a real WebSocket channel.
+- Kept the setting as "skip preflight", but still require the normal WebSocket connection and `STATE,CONNECTED` flow.
+- Ran `dart analyze lib/core/wifi_connection.dart`.
+
+Expected result: changed file has no Dart syntax/static errors and app cannot report connected without a real WebSocket channel through this branch.
+
+Actual result: `dart analyze lib/core/wifi_connection.dart` completed with 9 existing `avoid_print` info findings and no errors.
+
+Result: PARTIAL
+
+Issues found:
+
+- This is not a hardware/app runtime test.
+- Existing `avoid_print` analyzer info remains.
+- No APK build was run per user instruction.
+
+Status update needed: manual mode is safer at code level, but still needs real robot tests for connection, movement, stop, attachment, and disconnect.
+
+Next action: continue Phase 2/3 with firmware failsafe and manual tests when hardware is available.
+
 ### 2026-04-26 - Documentation initialization
 
 Area: documentation

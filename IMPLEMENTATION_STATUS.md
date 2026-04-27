@@ -92,6 +92,12 @@ Risk:
 - The auto workflow is incomplete.
 - The UI does not yet expose all required autonomous state.
 
+Recent code-level hardening:
+
+- Disabled the unsafe simulated connected state in `wifi_connection.dart`.
+- Turning off Wi-Fi preflight now only skips the preliminary check; the app must still create a real WebSocket channel and receive connection state.
+- Verified changed file with `dart analyze lib/core/wifi_connection.dart`; no errors, existing `avoid_print` info remains.
+
 ### Route generation
 
 Status: partially implemented, not reliable.
