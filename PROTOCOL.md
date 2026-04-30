@@ -257,6 +257,25 @@ GPS status:
 - GPS hardware has not been physically connected and tested.
 - App must not present map position as trustworthy GPS until tests pass.
 
+### GPS debug telemetry
+
+The separate `gps_test_firmware/` test firmware also sends an extended GPS
+message for field debugging:
+
+```text
+GPSDBG,<lat>,<lon>,<heightM>,<heading>,<fixType>,<carrier>,<diff>,<numSV>,<hAccMm>,<vAccMm>,<speedMps>,<pDop>,<ageMs>
+```
+
+Example:
+
+```text
+GPSDBG,55.12345678,37.12345678,184.250,90.00,3,fixed,1,22,14,22,0.020,0.85,41
+```
+
+`carrier` is `none`, `float`, or `fixed`. The Flutter GPS debug screen can use
+both `GPS` and `GPSDBG`; the main robot firmware remains compatible with the
+short `GPS` message.
+
 ### IMU telemetry
 
 ```text
@@ -322,4 +341,3 @@ ERR ROUTE_WP_FULL
 - Do not assume NAV commands are safe to run on the robot.
 - Do not assume route waypoints are local meters yet.
 - Do not assume `PING` is a safety heartbeat.
-

@@ -1,0 +1,54 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios-ipa:
+    name: Build module.ipa
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: module_app
+        run: flutter pub get
+
+      - name: Build iOS app without code signing
+        working-directory: module_app
+        run: flutter build ios --release --no-codesign
+
+      - name: Package module.ipa
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IPA_DIR="$GITHUB_WORKSPACE/ipa apps"
+          PAYLOAD_DIR="$IPA_DIR/Payload"
+
+          rm -rf "$PAYLOAD_DIR" "$IPA_DIR/module.ipa"
+          mkdir -p "$PAYLOAD_DIR"
+
+          cp -R "$GITHUB_WORKSPACE/module_app/build/ios/iphoneos/Runner.app" "$PAYLOAD_DIR/Runner.app"
+
+          cd "$IPA_DIR"
+          /usr/bin/zip -qry module.ipa Payload
+          rm -rf Payload
+
+          ls -lh module.ipa
+
+      - name: Upload module.ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: module.ipa
+          path: ipa apps/module.ipa
+          if-no-files-found: error
+          retention-days: 14

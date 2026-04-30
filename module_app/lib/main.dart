@@ -9,6 +9,7 @@ import 'features/manual/manual_control_screen.dart';
 import 'features/maps/maps_screen.dart';
 import 'features/auto/auto_screen.dart';
 import 'features/auto/auto_map_screen.dart';
+import 'features/gps/gps_debug_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -44,6 +45,10 @@ class _RootApp extends ConsumerWidget {
         GoRoute(
           path: '/maps',
           builder: (_, __) => const MapsScreen(),
+        ),
+        GoRoute(
+          path: '/gps',
+          builder: (_, __) => const GpsDebugScreen(),
         ),
         GoRoute(
           path: '/auto',

@@ -18,6 +18,17 @@ class WifiConnectionState {
   final double? gpsHeading;
   final int? gpsFixType;
   final int? gpsAccuracy; // mm
+  final double? gpsHeightM;
+  final String? gpsCarrier;
+  final bool? gpsDiff;
+  final int? gpsSatellites;
+  final int? gpsVAccuracy; // mm
+  final double? gpsSpeedMps;
+  final double? gpsPDop;
+  final int? gpsAgeMs;
+  final DateTime? gpsReceivedAt;
+  final int? rtcmBytes;
+  final int? rtcmAgeMs;
 
   // IMU data
   final double? imuYaw;
@@ -39,6 +50,17 @@ class WifiConnectionState {
     this.gpsHeading,
     this.gpsFixType,
     this.gpsAccuracy,
+    this.gpsHeightM,
+    this.gpsCarrier,
+    this.gpsDiff,
+    this.gpsSatellites,
+    this.gpsVAccuracy,
+    this.gpsSpeedMps,
+    this.gpsPDop,
+    this.gpsAgeMs,
+    this.gpsReceivedAt,
+    this.rtcmBytes,
+    this.rtcmAgeMs,
     this.imuYaw,
     this.navState,
     this.navWpIndex,
@@ -57,6 +79,17 @@ class WifiConnectionState {
         gpsHeading: null,
         gpsFixType: null,
         gpsAccuracy: null,
+        gpsHeightM: null,
+        gpsCarrier: null,
+        gpsDiff: null,
+        gpsSatellites: null,
+        gpsVAccuracy: null,
+        gpsSpeedMps: null,
+        gpsPDop: null,
+        gpsAgeMs: null,
+        gpsReceivedAt: null,
+        rtcmBytes: null,
+        rtcmAgeMs: null,
         imuYaw: null,
         navState: null,
         navWpIndex: null,
@@ -75,6 +108,17 @@ class WifiConnectionState {
     double? gpsHeading,
     int? gpsFixType,
     int? gpsAccuracy,
+    double? gpsHeightM,
+    String? gpsCarrier,
+    bool? gpsDiff,
+    int? gpsSatellites,
+    int? gpsVAccuracy,
+    double? gpsSpeedMps,
+    double? gpsPDop,
+    int? gpsAgeMs,
+    DateTime? gpsReceivedAt,
+    int? rtcmBytes,
+    int? rtcmAgeMs,
     double? imuYaw,
     String? navState,
     int? navWpIndex,
@@ -92,6 +136,17 @@ class WifiConnectionState {
       gpsHeading: gpsHeading ?? this.gpsHeading,
       gpsFixType: gpsFixType ?? this.gpsFixType,
       gpsAccuracy: gpsAccuracy ?? this.gpsAccuracy,
+      gpsHeightM: gpsHeightM ?? this.gpsHeightM,
+      gpsCarrier: gpsCarrier ?? this.gpsCarrier,
+      gpsDiff: gpsDiff ?? this.gpsDiff,
+      gpsSatellites: gpsSatellites ?? this.gpsSatellites,
+      gpsVAccuracy: gpsVAccuracy ?? this.gpsVAccuracy,
+      gpsSpeedMps: gpsSpeedMps ?? this.gpsSpeedMps,
+      gpsPDop: gpsPDop ?? this.gpsPDop,
+      gpsAgeMs: gpsAgeMs ?? this.gpsAgeMs,
+      gpsReceivedAt: gpsReceivedAt ?? this.gpsReceivedAt,
+      rtcmBytes: rtcmBytes ?? this.rtcmBytes,
+      rtcmAgeMs: rtcmAgeMs ?? this.rtcmAgeMs,
       imuYaw: imuYaw ?? this.imuYaw,
       navState: navState ?? this.navState,
       navWpIndex: navWpIndex ?? this.navWpIndex,
@@ -203,9 +258,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   /// Обработка изменений состояния сети
   void _handleConnectivityChange(List<ConnectivityResult> results) {
     final hasWifi = results.contains(ConnectivityResult.wifi);
-    
+
     _log("→ Connectivity changed: $results (Wi-Fi: $hasWifi)");
-    
+
     // Если Wi-Fi отключился и приложение было подключено, отключаемся
     if (!hasWifi && state.isConnected) {
       _log("× Wi-Fi disconnected, disconnecting...");
@@ -290,20 +345,26 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     }
   }
 
-  Future<void> connect() async {
+  Future<void> connect({bool skipPreflight = false}) async {
     if (state.isConnecting || state.isConnected) return;
 
     state = state.copyWith(isConnecting: true, error: null);
     _log("=== CONNECT START ===");
 
-    // Проверяем настройку проверки Wi-Fi
-    // Убеждаемся, что настройка загружена
-    final notifier = _ref.read(wifiPingCheckProvider.notifier);
-    await notifier.ensureInitialized();
+    final bool pingCheckEnabled;
+    if (skipPreflight) {
+      pingCheckEnabled = false;
+      _log("→ Fast connect: Wi-Fi preflight skipped");
+    } else {
+      // Проверяем настройку проверки Wi-Fi
+      // Убеждаемся, что настройка загружена
+      final notifier = _ref.read(wifiPingCheckProvider.notifier);
+      await notifier.ensureInitialized();
 
-    // Читаем актуальное значение после инициализации
-    final pingCheckEnabled = _ref.read(wifiPingCheckProvider);
-    _log("→ Wi-Fi check setting: $pingCheckEnabled");
+      // Читаем актуальное значение после инициализации
+      pingCheckEnabled = _ref.read(wifiPingCheckProvider);
+      _log("→ Wi-Fi check setting: $pingCheckEnabled");
+    }
 
     if (pingCheckEnabled) {
       // Проверка включена - выполняем минимальную проверку WebSocket
@@ -358,7 +419,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
               final parts = msgStr.split(",");
               if (parts.length >= 2) {
                 final batteryValue = int.tryParse(parts[1]);
-                if (batteryValue != null && batteryValue >= 0 && batteryValue <= 100) {
+                if (batteryValue != null &&
+                    batteryValue >= 0 &&
+                    batteryValue <= 100) {
                   state = state.copyWith(batteryPercent: batteryValue);
                   _log("✓ Battery percent updated: $batteryValue%");
                 }
@@ -386,11 +449,74 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                     gpsHeading: heading,
                     gpsFixType: fixType,
                     gpsAccuracy: hAcc,
+                    gpsReceivedAt: DateTime.now(),
                   );
                 }
               }
             } catch (e) {
               _log("× Failed to parse GPS: $e");
+            }
+          }
+
+          // Extended GPS debug:
+          // GPSDBG,<lat>,<lon>,<heightM>,<heading>,<fixType>,<carrier>,<diff>,<numSV>,<hAccMm>,<vAccMm>,<speedMps>,<pDop>,<ageMs>
+          if (msgStr.startsWith("GPSDBG,")) {
+            try {
+              final parts = msgStr.split(",");
+              if (parts.length >= 14) {
+                final lat = double.tryParse(parts[1]);
+                final lon = double.tryParse(parts[2]);
+                final heightM = double.tryParse(parts[3]);
+                final heading = double.tryParse(parts[4]);
+                final fixType = int.tryParse(parts[5]);
+                final carrier =
+                    parts[6].trim().isEmpty ? null : parts[6].trim();
+                final diff = parts[7].trim() == '1';
+                final satellites = int.tryParse(parts[8]);
+                final hAcc = int.tryParse(parts[9]);
+                final vAcc = int.tryParse(parts[10]);
+                final speedMps = double.tryParse(parts[11]);
+                final pDop = double.tryParse(parts[12]);
+                final ageMs = int.tryParse(parts[13]);
+
+                if (lat != null && lon != null) {
+                  state = state.copyWith(
+                    gpsLat: lat,
+                    gpsLon: lon,
+                    gpsHeightM: heightM,
+                    gpsHeading: heading,
+                    gpsFixType: fixType,
+                    gpsCarrier: carrier,
+                    gpsDiff: diff,
+                    gpsSatellites: satellites,
+                    gpsAccuracy: hAcc,
+                    gpsVAccuracy: vAcc,
+                    gpsSpeedMps: speedMps,
+                    gpsPDop: pDop,
+                    gpsAgeMs: ageMs,
+                    gpsReceivedAt: DateTime.now(),
+                  );
+                }
+              }
+            } catch (e) {
+              _log("× Failed to parse GPSDBG: $e");
+            }
+          }
+
+          // RTCM,<bytesTotal>,<ageMs>
+          if (msgStr.startsWith("RTCM,")) {
+            try {
+              final parts = msgStr.split(",");
+              if (parts.length >= 3) {
+                final bytes = int.tryParse(parts[1]);
+                final ageMs = int.tryParse(parts[2]);
+                state = state.copyWith(
+                  rtcmBytes: bytes,
+                  rtcmAgeMs: ageMs,
+                );
+              }
+            } catch (e) {
+              _log("× Failed to parse RTCM: $e");
             }
           }
 
@@ -484,7 +610,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       try {
         _log("→ Waiting for STATE,CONNECTED message...");
         final connected = await connectionCompleter.future.timeout(
-          const Duration(seconds: 10),
+          Duration(seconds: skipPreflight ? 4 : 10),
           onTimeout: () {
             _log("× Connection timeout waiting for first message");
             return false;
@@ -596,7 +722,8 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
   void sendRouteWaypoint(int index, double lat, double lon) {
     if (!state.isConnected) return;
-    sendRaw("ROUTE_WP,$index,${lat.toStringAsFixed(8)},${lon.toStringAsFixed(8)}");
+    sendRaw(
+        "ROUTE_WP,$index,${lat.toStringAsFixed(8)},${lon.toStringAsFixed(8)}");
   }
 
   void sendRouteEnd() {

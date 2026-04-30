@@ -96,7 +96,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     final pingCheckEnabled = ref.watch(wifiPingCheckProvider);
     final batteryFromSettings = ref.watch(batteryPercentProvider);
     final battery = pingCheckEnabled
-        ? (wifi.batteryPercent ?? batteryFromSettings) // При включенной проверке приоритет WebSocket, fallback на настройки
+        ? (wifi.batteryPercent ??
+            batteryFromSettings) // При включенной проверке приоритет WebSocket, fallback на настройки
         : batteryFromSettings; // При выключенной проверке только настройки
 
     ref.listen<WifiConnectionState>(wifiConnectionProvider, (prev, next) {
@@ -217,6 +218,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                             tooltip: 'Карты',
                             iconColor: accentWhite,
                             onTap: () => context.go('/maps'),
+                          ),
+                          SizedBox(width: s(10)),
+                          _IconGlassButton(
+                            size: topIconSize,
+                            glyphSize: topIconGlyph,
+                            icon: Icons.gps_fixed_rounded,
+                            tooltip: 'GPS Отладка',
+                            iconColor: accentWhite,
+                            onTap: () => context.go('/gps'),
                           ),
                           SizedBox(width: s(10)),
                           _IconGlassButton(
@@ -365,7 +375,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     // Настройки не учитываются когда подключено по Wi-Fi
     final pingCheckEnabled = ref.read(wifiPingCheckProvider);
     final batteryFromSettings = ref.read(batteryPercentProvider);
-    
+
     int? battery;
     if (wifi.isConnected && pingCheckEnabled && wifi.batteryPercent != null) {
       // Подключено по Wi-Fi - используем ТОЛЬКО реальное значение из WebSocket
@@ -374,7 +384,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       // Не подключено или проверка выключена - используем настройки
       battery = batteryFromSettings;
     }
-    
+
     // Показываем предупреждение только если робот подключен и заряд <= 40%
     // Используем то же значение, что и для отображения
     if (wifi.isConnected && battery != null && battery <= 40) {
@@ -396,7 +406,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     // Настройки не учитываются когда подключено по Wi-Fi
     final pingCheckEnabled = ref.read(wifiPingCheckProvider);
     final batteryFromSettings = ref.read(batteryPercentProvider);
-    
+
     int? battery;
     if (wifi.isConnected && pingCheckEnabled && wifi.batteryPercent != null) {
       // Подключено по Wi-Fi - используем ТОЛЬКО реальное значение из WebSocket
@@ -405,7 +415,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       // Не подключено или проверка выключена - используем настройки
       battery = batteryFromSettings;
     }
-    
+
     // Показываем предупреждение только если робот подключен и заряд <= 40%
     // Используем то же значение, что и для отображения
     if (wifi.isConnected && battery != null && battery <= 40) {
@@ -421,7 +431,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     }
   }
 
-  void _showLowBatteryWarning(BuildContext context, {required VoidCallback onContinue}) {
+  void _showLowBatteryWarning(BuildContext context,
+      {required VoidCallback onContinue}) {
     showDialog(
       context: context,
       barrierColor: Colors.black.withOpacity(0.7),
@@ -1698,76 +1709,79 @@ class _StatusPanel extends StatelessWidget {
       ),
       child: _GlassCard(
         borderColor: statusColor.withOpacity(0.15),
-      child: Padding(
-        padding: EdgeInsets.symmetric(
-          horizontal: u(12).clamp(10.0, 12.0),
-          vertical: u(10).clamp(8.0, 10.0),
-        ),
-        child: Row(
-          children: [
-            _BatteryChip(uiScale: uiScale, percent: batteryPercent, isConnected: wifi.isConnected),
-            SizedBox(width: u(10)),
-            Expanded(
-              child: Row(
-                children: [
-                  Container(
-                    decoration: BoxDecoration(
-                      boxShadow: [
-                        BoxShadow(
-                          color: statusColor.withOpacity(0.06),
-                          blurRadius: 4.0,
-                          spreadRadius: 0.2,
-                        ),
-                      ],
-                    ),
-                    child: Icon(
-                    wifi.isConnected
-                        ? Icons.wifi_rounded
-                        : Icons.wifi_off_rounded,
-                    color: statusColor,
-                    size: u(18).clamp(16.0, 18.0),
-                    ),
-                  ),
-                  SizedBox(width: u(8)),
-                  Expanded(
-                    child: Text(
-                      statusText,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w900,
-                        fontSize: u(11.5).clamp(10.5, 11.5),
-                        color: statusColor,
-                        shadows: [
-                          // Едва заметное неоновое свечение
-                          Shadow(
-                            color: statusColor.withOpacity(0.1),
-                            blurRadius: 4.0,
-                            offset: const Offset(0, 0),
-                          ),
-                          Shadow(
+        child: Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: u(12).clamp(10.0, 12.0),
+            vertical: u(10).clamp(8.0, 10.0),
+          ),
+          child: Row(
+            children: [
+              _BatteryChip(
+                  uiScale: uiScale,
+                  percent: batteryPercent,
+                  isConnected: wifi.isConnected),
+              SizedBox(width: u(10)),
+              Expanded(
+                child: Row(
+                  children: [
+                    Container(
+                      decoration: BoxDecoration(
+                        boxShadow: [
+                          BoxShadow(
                             color: statusColor.withOpacity(0.06),
-                            blurRadius: 6.0,
-                            offset: const Offset(0, 0),
+                            blurRadius: 4.0,
+                            spreadRadius: 0.2,
                           ),
                         ],
                       ),
-                      maxLines: 2,
-                      softWrap: true,
-                      overflow: TextOverflow.visible,
+                      child: Icon(
+                        wifi.isConnected
+                            ? Icons.wifi_rounded
+                            : Icons.wifi_off_rounded,
+                        color: statusColor,
+                        size: u(18).clamp(16.0, 18.0),
+                      ),
                     ),
-                  ),
-                ],
+                    SizedBox(width: u(8)),
+                    Expanded(
+                      child: Text(
+                        statusText,
+                        style: TextStyle(
+                          fontWeight: FontWeight.w900,
+                          fontSize: u(11.5).clamp(10.5, 11.5),
+                          color: statusColor,
+                          shadows: [
+                            // Едва заметное неоновое свечение
+                            Shadow(
+                              color: statusColor.withOpacity(0.1),
+                              blurRadius: 4.0,
+                              offset: const Offset(0, 0),
+                            ),
+                            Shadow(
+                              color: statusColor.withOpacity(0.06),
+                              blurRadius: 6.0,
+                              offset: const Offset(0, 0),
+                            ),
+                          ],
+                        ),
+                        maxLines: 2,
+                        softWrap: true,
+                        overflow: TextOverflow.visible,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            ),
-            SizedBox(width: u(10)),
-            _ConnectBtn(
-              uiScale: uiScale,
-              accent: accent,
-              busy: wifi.isConnecting,
-              isConnected: wifi.isConnected,
-              onTap: onToggle,
-            ),
-          ],
-        ),
+              SizedBox(width: u(10)),
+              _ConnectBtn(
+                uiScale: uiScale,
+                accent: accent,
+                busy: wifi.isConnecting,
+                isConnected: wifi.isConnected,
+                onTap: onToggle,
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -1818,13 +1832,12 @@ class _BatteryChip extends StatelessWidget {
       child: Row(
         children: [
           Icon(Icons.battery_full_rounded,
-              size: u(18).clamp(16.0, 18.0),
-              color: batteryColor),
+              size: u(18).clamp(16.0, 18.0), color: batteryColor),
           if (isConnected) ...[
-          SizedBox(width: u(6)),
-          Text('$p%',
-              style: TextStyle(
-                  fontWeight: FontWeight.w900,
+            SizedBox(width: u(6)),
+            Text('$p%',
+                style: TextStyle(
+                    fontWeight: FontWeight.w900,
                     fontSize: u(12.5).clamp(11.0, 12.5),
                     color: batteryColor)),
           ],
