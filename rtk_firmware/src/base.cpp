@@ -21,10 +21,11 @@ static constexpr uint16_t ROVER_RTCM_PORT = 2101;
 
 static constexpr uint32_t SURVEY_IN_SECONDS = 60;
 static constexpr uint32_t SURVEY_IN_ACC_LIMIT_0_1MM = 50000; // 5.0 m, fast field test
-static constexpr uint32_t WIFI_RETRY_MS = 3000;
+static constexpr uint32_t WIFI_RETRY_MS = 5000;
 static constexpr uint32_t STATUS_MS = 1000;
 static constexpr uint32_t SVIN_POLL_MS = 1000;
 static constexpr uint32_t BASE_RECONFIG_MS = 15000;
+static constexpr uint8_t UDP_FAIL_RECONNECT_LIMIT = 3;
 
 // u-blox configuration keys for VALSET.
 static constexpr uint32_t CFG_UART1INPROT_UBX = 0x10730001;
@@ -58,6 +59,10 @@ static uint32_t lastSvinPollMs = 0;
 static uint32_t lastReconfigMs = 0;
 static uint32_t rtcmBytesSent = 0;
 static uint32_t rtcmPacketsSent = 0;
+static uint32_t udpSendOk = 0;
+static uint32_t udpSendFail = 0;
+static uint8_t udpSendFailStreak = 0;
+static uint32_t wifiReconnectCount = 0;
 static uint32_t gnssRawBytes = 0;
 static uint32_t gnssParsedMessages = 0;
 static uint32_t ubxMessages = 0;
@@ -482,13 +487,35 @@ static uint8_t rtcmBuf[1100];
 static uint16_t rtcmLen = 0;
 static uint16_t rtcmTarget = 0;
 
+static void connectWiFi(bool force = false);
+
 static void sendRtcmFrame() {
   if (WiFi.status() != WL_CONNECTED || rtcmLen == 0) return;
-  rtcmUdp.beginPacket(ROVER_IP, ROVER_RTCM_PORT);
-  rtcmUdp.write(rtcmBuf, rtcmLen);
-  rtcmUdp.endPacket();
-  rtcmBytesSent += rtcmLen;
-  rtcmPacketsSent++;
+
+  const int beginOk = rtcmUdp.beginPacket(ROVER_IP, ROVER_RTCM_PORT);
+  if (beginOk == 1) {
+    rtcmUdp.write(rtcmBuf, rtcmLen);
+  }
+  const int endOk = beginOk == 1 ? rtcmUdp.endPacket() : 0;
+
+  if (endOk == 1) {
+    rtcmBytesSent += rtcmLen;
+    rtcmPacketsSent++;
+    udpSendOk++;
+    udpSendFailStreak = 0;
+  } else {
+    udpSendFail++;
+    if (udpSendFailStreak < 255) udpSendFailStreak++;
+    Serial.printf("WARN base UDP RTCM send failed begin=%d end=%d fail=%lu streak=%u target=%s:%u\n",
+                  beginOk, endOk, (unsigned long)udpSendFail,
+                  udpSendFailStreak, ROVER_IP.toString().c_str(),
+                  ROVER_RTCM_PORT);
+    if (udpSendFailStreak >= UDP_FAIL_RECONNECT_LIMIT) {
+      Serial.println("WARN base UDP fail streak: forcing WiFi reconnect");
+      udpSendFailStreak = 0;
+      connectWiFi(true);
+    }
+  }
   rtcmFramesSeen++;
 }
 
@@ -525,15 +552,25 @@ static void feedRtcm(uint8_t b) {
   }
 }
 
-static void connectWiFi() {
+static void connectWiFi(bool force) {
   const uint32_t now = millis();
-  if (WiFi.status() == WL_CONNECTED) return;
-  if (lastWiFiAttemptMs != 0 && now - lastWiFiAttemptMs < WIFI_RETRY_MS) return;
+  if (!force && WiFi.status() == WL_CONNECTED) return;
+  if (!force && lastWiFiAttemptMs != 0 &&
+      now - lastWiFiAttemptMs < WIFI_RETRY_MS) {
+    return;
+  }
   lastWiFiAttemptMs = now;
+  wifiReconnectCount++;
   WiFi.mode(WIFI_STA);
+  if (force) {
+    rtcmUdp.stop();
+    WiFi.disconnect(false);
+    delay(50);
+  }
   WiFi.begin(ROUTER_WIFI_SSID, ROUTER_WIFI_PASS);
-  Serial.printf("WiFi STA connecting to %s, rover RTCM target %s:%u\n",
-                ROUTER_WIFI_SSID, ROVER_IP.toString().c_str(),
+  Serial.printf("WiFi STA reconnect #%lu to %s, rover RTCM target %s:%u\n",
+                (unsigned long)wifiReconnectCount, ROUTER_WIFI_SSID,
+                ROVER_IP.toString().c_str(),
                 ROVER_RTCM_PORT);
 }
 
@@ -571,11 +608,12 @@ static void printStatus() {
   lastStatusMs = now;
   const uint32_t gnssAgeMs = gnss.lastMs == 0 ? 0 : now - gnss.lastMs;
   const uint32_t svinAgeMs = svin.lastMs == 0 ? 0 : now - svin.lastMs;
-  Serial.printf("BASE wifi=%s ip=%s rover=%s:%u port=%s baud=%lu src=%s raw=%lu parsed=%lu ubx=%lu ack=%lu nak=%lu fix=%u sv=%u gnssAge=%lums svin_active=%u svin_valid=%u dur=%lus meanAcc=%.3fm svinAge=%lums rtcm=%lubytes/%lupkts frames=%lu last=%s\n",
+  Serial.printf("BASE wifi=%s ip=%s rover=%s:%u wifiReconnect=%lu port=%s baud=%lu src=%s raw=%lu parsed=%lu ubx=%lu ack=%lu nak=%lu fix=%u sv=%u gnssAge=%lums svin_active=%u svin_valid=%u dur=%lus meanAcc=%.3fm svinAge=%lums rtcm=%lubytes/%lupkts frames=%lu udpOk=%lu udpFail=%lu udpFailStreak=%u last=%s\n",
                 WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
                 WiFi.localIP().toString().c_str(),
                 ROVER_IP.toString().c_str(),
                 ROVER_RTCM_PORT,
+                (unsigned long)wifiReconnectCount,
                 GPS_PORT_NAME,
                 (unsigned long)GPS_BAUD,
                 gnssSource,
@@ -595,6 +633,9 @@ static void printStatus() {
                 (unsigned long)rtcmBytesSent,
                 (unsigned long)rtcmPacketsSent,
                 (unsigned long)rtcmFramesSeen,
+                (unsigned long)udpSendOk,
+                (unsigned long)udpSendFail,
+                udpSendFailStreak,
                 lastConfigResult);
   if (!svin.active && !svin.valid) {
     Serial.printf("BASE reason=%s\n", baseInactiveReason(now));

@@ -79,7 +79,9 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     final robotHost = ref.watch(wifiRobotHostProvider);
     final ctrl = ref.read(wifiConnectionProvider.notifier);
     final fixOk = _fixOk(wifi);
-    final ageText = _ageText(wifi);
+    final rtkOk = _rtkOk(wifi);
+    final rtcmText = _rtcmStatusText(wifi.rtcmAgeMs);
+    final rtcmFresh = _rtcmFresh(wifi.rtcmAgeMs);
     final accM = wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0;
     final currentPoint = _currentPoint(wifi);
     final openedPoints = _activeSaved?.points ?? const <GpsPerimeterPoint>[];
@@ -150,8 +152,9 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                     connected: wifi.isConnected,
                     connecting: wifi.isConnecting,
                     fixOk: fixOk,
+                    rtkOk: rtkOk,
                     carrier: wifi.gpsCarrier,
-                    ageText: ageText,
+                    rtcmText: rtcmText,
                   ),
                   const SizedBox(height: 10),
                   _Panel(
@@ -198,7 +201,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                               child: _Metric(
                                 label: 'RTK',
                                 value: _carrierLabel(wifi.gpsCarrier),
-                                good: wifi.gpsCarrier == 'fixed',
+                                good: rtkOk,
                               ),
                             ),
                             Expanded(
@@ -249,18 +252,16 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                                 value: wifi.rtcmBytes == null
                                     ? '-'
                                     : '${wifi.rtcmBytes} B',
-                                good: (wifi.rtcmBytes ?? 0) > 0 &&
-                                    (wifi.rtcmAgeMs ?? 999999) < 3000,
+                                good: (wifi.rtcmBytes ?? 0) > 0 && rtcmFresh,
                               ),
                             ),
                             Expanded(
                               child: _Metric(
                                 label: 'RTCM возраст',
                                 value: wifi.rtcmAgeMs == null
-                                    ? '-'
-                                    : '${wifi.rtcmAgeMs} ms',
-                                good: wifi.rtcmAgeMs != null &&
-                                    wifi.rtcmAgeMs! < 3000,
+                                    ? rtcmText
+                                    : '${wifi.rtcmAgeMs} ms / $rtcmText',
+                                good: rtcmFresh,
                               ),
                             ),
                             const Expanded(child: SizedBox.shrink()),
@@ -790,6 +791,21 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
         wifi.gpsLon != null;
   }
 
+  static bool _rtkOk(WifiConnectionState wifi) {
+    return wifi.gpsCarrier == 'fixed' && _rtcmFresh(wifi.rtcmAgeMs);
+  }
+
+  static bool _rtcmFresh(int? ageMs) {
+    return ageMs != null && ageMs <= 3000;
+  }
+
+  static String _rtcmStatusText(int? ageMs) {
+    if (ageMs == null) return 'RTCM нет';
+    if (ageMs > 10000) return 'RTCM потерян';
+    if (ageMs > 3000) return 'RTCM старый';
+    return 'RTCM свежий';
+  }
+
   static bool _hasUsableGps(WifiConnectionState wifi) {
     final lat = wifi.gpsLat;
     final lon = wifi.gpsLon;
@@ -844,15 +860,6 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     }
   }
 
-  static String _ageText(WifiConnectionState wifi) {
-    if (wifi.gpsAgeMs != null) return '${wifi.gpsAgeMs} ms';
-    final receivedAt = wifi.gpsReceivedAt;
-    if (receivedAt == null) return '-';
-    final age = DateTime.now().difference(receivedAt);
-    if (age.inSeconds < 2) return '${age.inMilliseconds} ms';
-    return '${age.inSeconds} s';
-  }
-
   static double _distanceM(
     double lat1,
     double lon1,
@@ -895,15 +902,17 @@ class _StatusStrip extends StatelessWidget {
   final bool connected;
   final bool connecting;
   final bool fixOk;
+  final bool rtkOk;
   final String? carrier;
-  final String ageText;
+  final String rtcmText;
 
   const _StatusStrip({
     required this.connected,
     required this.connecting,
     required this.fixOk,
+    required this.rtkOk,
     required this.carrier,
-    required this.ageText,
+    required this.rtcmText,
   });
 
   @override
@@ -932,10 +941,11 @@ class _StatusStrip extends StatelessWidget {
         Expanded(
           child: _Pill(
             icon: Icons.satellite_alt_rounded,
-            text: '${_GpsDebugScreenState._carrierLabel(carrier)} / $ageText',
-            color: carrier == 'fixed'
+            text:
+                '${_GpsDebugScreenState._carrierLabel(carrier)} / $rtcmText',
+            color: rtkOk
                 ? const Color(0xFF38F6A7)
-                : const Color(0xFF7AA2FF),
+                : const Color(0xFFFFD166),
           ),
         ),
       ],

@@ -40,7 +40,9 @@ static constexpr uint16_t WS_PORT = 81;
 static constexpr uint16_t RTCM_UDP_PORT = 2101;
 static constexpr uint32_t GPS_BROADCAST_MS = 200;
 static constexpr uint32_t STATUS_MS = 1000;
-static constexpr uint32_t WIFI_RETRY_MS = 3000;
+static constexpr uint32_t WIFI_RETRY_MS = 5000;
+static constexpr uint32_t RTCM_WARN_AGE_MS = 5000;
+static constexpr uint32_t RTCM_RESTART_AGE_MS = 15000;
 
 static constexpr uint32_t CFG_UART1INPROT_UBX = 0x11731001;
 static constexpr uint32_t CFG_UART1INPROT_NMEA = 0x11731002;
@@ -81,6 +83,12 @@ static uint32_t lastRtcmMs = 0;
 static uint32_t lastGpsBroadcastMs = 0;
 static uint32_t lastStatusMs = 0;
 static uint32_t lastWiFiAttemptMs = 0;
+static uint32_t wifiDisconnectedSinceMs = 0;
+static bool wasWiFiConnected = false;
+static uint32_t wifiReconnectCount = 0;
+static uint32_t udpRestartCount = 0;
+static uint32_t lastRtcmWarnMs = 0;
+static uint32_t lastRtcmUdpRestartMs = 0;
 static uint32_t activeGpsBaud = 0;
 static const char* activeGpsPort = GPS_PORTS[0].name;
 static uint32_t gpsRawBytes = 0;
@@ -485,6 +493,33 @@ static void relayRtcmToF9p() {
   lastRtcmMs = millis();
 }
 
+static void restartRtcmUdp(const char* reason) {
+  rtcmUdp.stop();
+  delay(20);
+  const uint8_t ok = rtcmUdp.begin(RTCM_UDP_PORT);
+  udpRestartCount++;
+  lastRtcmUdpRestartMs = millis();
+  Serial.printf("RTCM UDP restart #%lu port=%u ok=%u reason=%s\n",
+                (unsigned long)udpRestartCount, RTCM_UDP_PORT, ok, reason);
+}
+
+static void checkRtcmWatchdog() {
+  if (lastRtcmMs == 0) return;
+
+  const uint32_t now = millis();
+  const uint32_t age = now - lastRtcmMs;
+  if (age > RTCM_WARN_AGE_MS && now - lastRtcmWarnMs > 1000) {
+    lastRtcmWarnMs = now;
+    Serial.printf("WARN rover RTCM age=%lums packets=%lu udpRestart=%lu\n",
+                  (unsigned long)age, (unsigned long)rtcmPacketsRx,
+                  (unsigned long)udpRestartCount);
+  }
+  if (age > RTCM_RESTART_AGE_MS &&
+      now - lastRtcmUdpRestartMs > WIFI_RETRY_MS) {
+    restartRtcmUdp("rtcm-age");
+  }
+}
+
 static void broadcastGps() {
   const uint32_t now = millis();
   if (now - lastGpsBroadcastMs < GPS_BROADCAST_MS) return;
@@ -512,19 +547,57 @@ static void broadcastGps() {
   ws.textAll(msg);
 }
 
-static void connectWiFi() {
+static void connectWiFi(bool force = false) {
   if (!ROUTER_MODE) return;
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (!force && WiFi.status() == WL_CONNECTED) return;
 
   const uint32_t now = millis();
-  if (lastWiFiAttemptMs != 0 && now - lastWiFiAttemptMs < WIFI_RETRY_MS) return;
+  if (!force && lastWiFiAttemptMs != 0 &&
+      now - lastWiFiAttemptMs < WIFI_RETRY_MS) {
+    return;
+  }
   lastWiFiAttemptMs = now;
+  wifiReconnectCount++;
 
   WiFi.mode(WIFI_STA);
   WiFi.config(ROVER_STA_IP, ROUTER_GATEWAY, ROUTER_SUBNET);
+  if (force) {
+    WiFi.disconnect(false);
+    delay(50);
+  }
   WiFi.begin(ROUTER_WIFI_SSID, ROUTER_WIFI_PASS);
-  Serial.printf("WiFi STA connecting to %s, static IP %s\n",
-                ROUTER_WIFI_SSID, ROVER_STA_IP.toString().c_str());
+  Serial.printf("WiFi STA reconnect #%lu to %s, static IP %s\n",
+                (unsigned long)wifiReconnectCount, ROUTER_WIFI_SSID,
+                ROVER_STA_IP.toString().c_str());
+}
+
+static void checkWiFiWatchdog() {
+  if (!ROUTER_MODE) return;
+
+  const uint32_t now = millis();
+  const bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected) {
+    if (!wasWiFiConnected) {
+      Serial.printf("WiFi STA connected ip=%s, reopening UDP/WebSocket\n",
+                    WiFi.localIP().toString().c_str());
+      restartRtcmUdp("wifi-connected");
+      ws.closeAll();
+    }
+    wifiDisconnectedSinceMs = 0;
+    wasWiFiConnected = true;
+    return;
+  }
+
+  if (wifiDisconnectedSinceMs == 0) wifiDisconnectedSinceMs = now;
+  wasWiFiConnected = false;
+
+  if (now - wifiDisconnectedSinceMs >= WIFI_RETRY_MS &&
+      (lastWiFiAttemptMs == 0 || now - lastWiFiAttemptMs >= WIFI_RETRY_MS)) {
+    connectWiFi(true);
+  } else {
+    connectWiFi(false);
+  }
 }
 
 static void setupWeb() {
@@ -572,9 +645,11 @@ static void printStatus() {
 
   const uint32_t gpsAgeMs = gps.lastMs == 0 ? 0 : now - gps.lastMs;
   const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
-  Serial.printf("ROVER wifi=%s ip=%s port=%s baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu rtcm=%lubytes/%lupkts age=%lums\n",
+  Serial.printf("ROVER wifi=%s ip=%s wifiReconnect=%lu udpRestart=%lu port=%s baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu rtcm=%lubytes/%lupkts age=%lums\n",
                 WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
                 WiFi.localIP().toString().c_str(),
+                (unsigned long)wifiReconnectCount,
+                (unsigned long)udpRestartCount,
                 activeGpsPort,
                 (unsigned long)activeGpsBaud,
                 gpsSource,
@@ -599,14 +674,13 @@ void setup() {
   Serial.println("ESP32 ZED-F9P RTK ROVER");
 
   setupWeb();
-  rtcmUdp.begin(RTCM_UDP_PORT);
-  Serial.printf("RTCM UDP input port %u\n", RTCM_UDP_PORT);
+  restartRtcmUdp("setup");
 
   autoDetectGpsBaud();
 }
 
 void loop() {
-  connectWiFi();
+  checkWiFiWatchdog();
   relayRtcmToF9p();
   while (GpsSerial.available()) {
     gpsRawBytes++;
@@ -616,6 +690,7 @@ void loop() {
   }
 
   broadcastGps();
+  checkRtcmWatchdog();
   printStatus();
   ws.cleanupClients();
 }
