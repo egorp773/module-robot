@@ -29,7 +29,7 @@ void main() {
       ),
     ];
 
-    await GpsPerimeterStorage.save('field test', points);
+    final savedPerimeter = await GpsPerimeterStorage.save('field test', points);
     final saved = await GpsPerimeterStorage.list();
 
     expect(saved, hasLength(1));
@@ -37,9 +37,23 @@ void main() {
     expect(saved.first.points, hasLength(3));
     expect(saved.first.points.first.lat, 55.12345678);
 
+    final loaded = await GpsPerimeterStorage.load(savedPerimeter.id);
+    expect(loaded, isNotNull);
+    expect(loaded!.points, hasLength(3));
+    expect(
+      loaded.points.map((p) => [p.lat, p.lon]).toList(),
+      points.map((p) => [p.lat, p.lon]).toList(),
+    );
+
     final exported = jsonDecode(GpsPerimeterStorage.toExportJson(points))
         as Map<String, dynamic>;
     expect(exported['type'], 'gps_perimeter');
     expect(exported['points'], hasLength(3));
+
+    final savedExported = jsonDecode(
+      GpsPerimeterStorage.perimeterToExportJson(loaded),
+    ) as Map<String, dynamic>;
+    expect(savedExported['id'], savedPerimeter.id);
+    expect(savedExported['points'], hasLength(3));
   });
 }

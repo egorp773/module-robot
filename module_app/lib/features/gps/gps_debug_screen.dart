@@ -23,6 +23,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
 
   final List<GpsPerimeterPoint> _points = [];
   final List<GpsPerimeterPoint> _trail = [];
+  GpsPerimeter? _activeSaved;
   final TextEditingController _nameCtrl = TextEditingController();
   final TextEditingController _hostCtrl = TextEditingController();
   final FocusNode _hostFocus = FocusNode();
@@ -296,6 +297,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                               painter: _SiteMapPainter(
                                 trail: _trail,
                                 perimeter: _points,
+                                savedPerimeter:
+                                    _activeSaved?.points ?? const [],
                                 current: currentPoint,
                                 heading: wifi.gpsHeading,
                                 fresh: _hasUsableGps(wifi),
@@ -420,7 +423,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                             _Action(
                               icon: Icons.save_rounded,
                               label: 'Сохранить',
-                              onTap: _points.length < 3 ? null : _save,
+                              onTap: _save,
                             ),
                             _Action(
                               icon: Icons.copy_rounded,
@@ -472,38 +475,15 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                                 ),
                               )
                             else
-                              ...saved.take(5).map(
-                                    (p) => Padding(
-                                      padding: const EdgeInsets.only(bottom: 8),
-                                      child: Row(
-                                        children: [
-                                          const Icon(
-                                            Icons.route_rounded,
-                                            size: 18,
-                                          ),
-                                          const SizedBox(width: 8),
-                                          Expanded(
-                                            child: Text(
-                                              p.name,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: const TextStyle(
-                                                fontWeight: FontWeight.w800,
-                                              ),
-                                            ),
-                                          ),
-                                          Text(
-                                            '${p.points.length} точек',
-                                            style: TextStyle(
-                                              color: Colors.white
-                                                  .withValues(alpha: 0.62),
-                                              fontWeight: FontWeight.w800,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
+                              ...saved.map(
+                                (p) => _SavedPerimeterCard(
+                                  perimeter: p,
+                                  selected: _activeSaved?.id == p.id,
+                                  onOpen: _openSaved,
+                                  onCopyJson: _copySavedJson,
+                                  onDelete: _deleteSaved,
+                                ),
+                              ),
                           ],
                         );
                       },
@@ -664,16 +644,34 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
 
     setState(() {
       _points.add(point);
+      _activeSaved = null;
       _notice = 'Точка добавлена: ${_points.length}.';
     });
   }
 
   Future<void> _save() async {
-    await GpsPerimeterStorage.save(_nameCtrl.text, _points);
-    setState(() {
-      _savedFuture = GpsPerimeterStorage.list();
-      _notice = 'Сохранено точек периметра: ${_points.length}.';
-    });
+    if (_points.length < 3) {
+      const message = 'Нужно минимум 3 точки, чтобы сохранить периметр.';
+      setState(() => _notice = message);
+      _showSnack(message);
+      return;
+    }
+
+    try {
+      final saved = await GpsPerimeterStorage.save(_nameCtrl.text, _points);
+      if (!mounted) return;
+      setState(() {
+        _activeSaved = saved;
+        _savedFuture = GpsPerimeterStorage.list();
+        _notice = 'Периметр сохранён: ${saved.points.length} точек';
+      });
+      _showSnack('Периметр сохранён: ${saved.points.length} точек');
+    } catch (error) {
+      if (!mounted) return;
+      final message = 'Ошибка сохранения периметра: $error';
+      setState(() => _notice = message);
+      _showSnack(message);
+    }
   }
 
   Future<void> _copyJson() async {
@@ -689,8 +687,77 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     setState(() {
       _recording = false;
       _points.clear();
+      _activeSaved = null;
       _notice = 'Текущий периметр очищен.';
     });
+  }
+
+  Future<void> _openSaved(GpsPerimeter perimeter) async {
+    try {
+      final loaded = await GpsPerimeterStorage.load(perimeter.id);
+      if (!mounted) return;
+      final selected = loaded ?? perimeter;
+      setState(() {
+        _points
+          ..clear()
+          ..addAll(selected.points);
+        _activeSaved = selected;
+        _nameCtrl.text = selected.name;
+        _notice = 'Открыт периметр: ${selected.points.length} точек.';
+      });
+      _showSnack('Открыт периметр: ${selected.points.length} точек');
+    } catch (error) {
+      if (!mounted) return;
+      final message = 'Ошибка открытия периметра: $error';
+      setState(() => _notice = message);
+      _showSnack(message);
+    }
+  }
+
+  Future<void> _copySavedJson(GpsPerimeter perimeter) async {
+    try {
+      final loaded = await GpsPerimeterStorage.load(perimeter.id);
+      final selected = loaded ?? perimeter;
+      await Clipboard.setData(
+        ClipboardData(
+            text: GpsPerimeterStorage.perimeterToExportJson(selected)),
+      );
+      if (!mounted) return;
+      setState(() => _notice = 'JSON сохраненного периметра скопирован.');
+      _showSnack('JSON сохраненного периметра скопирован');
+    } catch (error) {
+      if (!mounted) return;
+      final message = 'Ошибка экспорта JSON: $error';
+      setState(() => _notice = message);
+      _showSnack(message);
+    }
+  }
+
+  Future<void> _deleteSaved(GpsPerimeter perimeter) async {
+    try {
+      await GpsPerimeterStorage.delete(perimeter.id);
+      if (!mounted) return;
+      setState(() {
+        if (_activeSaved?.id == perimeter.id) {
+          _activeSaved = null;
+        }
+        _savedFuture = GpsPerimeterStorage.list();
+        _notice = 'Периметр удален: ${perimeter.name}.';
+      });
+      _showSnack('Периметр удален');
+    } catch (error) {
+      if (!mounted) return;
+      final message = 'Ошибка удаления периметра: $error';
+      setState(() => _notice = message);
+      _showSnack(message);
+    }
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   static bool _fixOk(WifiConnectionState wifi) {
@@ -975,6 +1042,96 @@ class _CoordLine extends StatelessWidget {
   }
 }
 
+class _SavedPerimeterCard extends StatelessWidget {
+  final GpsPerimeter perimeter;
+  final bool selected;
+  final Future<void> Function(GpsPerimeter perimeter) onOpen;
+  final Future<void> Function(GpsPerimeter perimeter) onCopyJson;
+  final Future<void> Function(GpsPerimeter perimeter) onDelete;
+
+  const _SavedPerimeterCard({
+    required this.perimeter,
+    required this.selected,
+    required this.onOpen,
+    required this.onCopyJson,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = selected ? const Color(0xFFFFD166) : Colors.white;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: selected ? 0.10 : 0.045),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: accent.withValues(alpha: selected ? 0.35 : 0.10),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.route_rounded, size: 18, color: accent),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  perimeter.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w900),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '${perimeter.points.length} точек',
+                style: TextStyle(
+                  color: Colors.white.withValues(alpha: 0.66),
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _Action(
+                icon: Icons.folder_open_rounded,
+                label: 'Открыть',
+                color: const Color(0xFF38F6A7),
+                onTap: () {
+                  unawaited(onOpen(perimeter));
+                },
+              ),
+              _Action(
+                icon: Icons.copy_rounded,
+                label: 'JSON',
+                color: const Color(0xFF7AA2FF),
+                onTap: () {
+                  unawaited(onCopyJson(perimeter));
+                },
+              ),
+              _Action(
+                icon: Icons.delete_outline_rounded,
+                label: 'Удалить',
+                color: const Color(0xFFFF4D6D),
+                onTap: () {
+                  unawaited(onDelete(perimeter));
+                },
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _Action extends StatelessWidget {
   final IconData icon;
   final String label;
@@ -1084,6 +1241,7 @@ class _Notice extends StatelessWidget {
 class _SiteMapPainter extends CustomPainter {
   final List<GpsPerimeterPoint> trail;
   final List<GpsPerimeterPoint> perimeter;
+  final List<GpsPerimeterPoint> savedPerimeter;
   final GpsPerimeterPoint? current;
   final double? heading;
   final bool fresh;
@@ -1091,6 +1249,7 @@ class _SiteMapPainter extends CustomPainter {
   const _SiteMapPainter({
     required this.trail,
     required this.perimeter,
+    required this.savedPerimeter,
     required this.current,
     required this.heading,
     required this.fresh,
@@ -1098,7 +1257,11 @@ class _SiteMapPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final all = <GpsPerimeterPoint>[...trail, ...perimeter];
+    final all = <GpsPerimeterPoint>[
+      ...trail,
+      ...savedPerimeter,
+      ...perimeter,
+    ];
     final currentPoint = current;
     if (currentPoint != null) all.add(currentPoint);
 
@@ -1110,6 +1273,16 @@ class _SiteMapPainter extends CustomPainter {
 
     final projection = _MapProjection(all, size);
     _drawMeterGrid(canvas, size, projection);
+
+    if (savedPerimeter.length >= 2) {
+      _drawPath(
+        canvas,
+        savedPerimeter.map(projection.project).toList(),
+        const Color(0xFFFFD166),
+        close: savedPerimeter.length >= 3,
+        width: 2.0,
+      );
+    }
 
     if (perimeter.length >= 2) {
       _drawPath(
@@ -1131,6 +1304,10 @@ class _SiteMapPainter extends CustomPainter {
     }
 
     final pointPaint = Paint()..color = Colors.white;
+    final savedPointPaint = Paint()..color = const Color(0xFFFFD166);
+    for (final p in savedPerimeter.map(projection.project)) {
+      canvas.drawCircle(p, 3.2, savedPointPaint);
+    }
     for (final p in perimeter.map(projection.project)) {
       canvas.drawCircle(p, 3.8, pointPaint);
     }
@@ -1156,7 +1333,7 @@ class _SiteMapPainter extends CustomPainter {
     _drawLabel(
       canvas,
       Offset(10, size.height - 26),
-      'след ${trail.length}  |  периметр ${perimeter.length}',
+      'след ${trail.length}  |  периметр ${perimeter.length}  |  открыт ${savedPerimeter.length}',
       Colors.white.withValues(alpha: 0.72),
       12,
     );

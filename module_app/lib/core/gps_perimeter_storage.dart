@@ -85,7 +85,10 @@ class GpsPerimeterStorage {
     return result;
   }
 
-  static Future<void> save(String name, List<GpsPerimeterPoint> points) async {
+  static Future<GpsPerimeter> save(
+    String name,
+    List<GpsPerimeterPoint> points,
+  ) async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList(_key) ?? <String>[];
     final now = DateTime.now();
@@ -98,6 +101,32 @@ class GpsPerimeterStorage {
 
     raw.add(jsonEncode(perimeter.toJson()));
     await prefs.setStringList(_key, raw);
+    return perimeter;
+  }
+
+  static Future<GpsPerimeter?> load(String id) async {
+    final items = await list();
+    for (final item in items) {
+      if (item.id == id) return item;
+    }
+    return null;
+  }
+
+  static Future<void> delete(String id) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getStringList(_key) ?? <String>[];
+    final next = <String>[];
+
+    for (final item in raw) {
+      try {
+        final decoded = jsonDecode(item) as Map<String, dynamic>;
+        if (decoded['id'] != id) next.add(item);
+      } catch (_) {
+        // Drop corrupted entries while touching the list.
+      }
+    }
+
+    await prefs.setStringList(_key, next);
   }
 
   static String toExportJson(List<GpsPerimeterPoint> points) {
@@ -105,6 +134,16 @@ class GpsPerimeterStorage {
       'type': 'gps_perimeter',
       'savedAt': DateTime.now().toIso8601String(),
       'points': points.map((p) => p.toJson()).toList(),
+    });
+  }
+
+  static String perimeterToExportJson(GpsPerimeter perimeter) {
+    return const JsonEncoder.withIndent('  ').convert({
+      'type': 'gps_perimeter',
+      'id': perimeter.id,
+      'name': perimeter.name,
+      'savedAt': perimeter.savedAt.toIso8601String(),
+      'points': perimeter.points.map((p) => p.toJson()).toList(),
     });
   }
 }
