@@ -44,16 +44,17 @@ static constexpr uint32_t WIFI_RETRY_MS = 5000;
 static constexpr uint32_t RTCM_WARN_AGE_MS = 5000;
 static constexpr uint32_t RTCM_RESTART_AGE_MS = 15000;
 
-static constexpr uint32_t CFG_UART1INPROT_UBX = 0x11731001;
-static constexpr uint32_t CFG_UART1INPROT_NMEA = 0x11731002;
-static constexpr uint32_t CFG_UART1INPROT_RTCM3 = 0x11731004;
-static constexpr uint32_t CFG_UART1OUTPROT_UBX = 0x11741001;
-static constexpr uint32_t CFG_UART1OUTPROT_NMEA = 0x11741002;
-static constexpr uint32_t CFG_UART1OUTPROT_RTCM3 = 0x11741004;
-static constexpr uint32_t CFG_MSGOUT_UBX_NAV_PVT_UART1 = 0x21912007;
-static constexpr uint32_t CFG_RATE_MEAS = 0x31213001;
-static constexpr uint32_t CFG_RATE_NAV = 0x31213002;
-static constexpr uint32_t CFG_RATE_TIMEREF = 0x2121C003;
+static constexpr uint32_t CFG_UART1INPROT_UBX = 0x10730001;
+static constexpr uint32_t CFG_UART1INPROT_NMEA = 0x10730002;
+static constexpr uint32_t CFG_UART1INPROT_RTCM3 = 0x10730004;
+static constexpr uint32_t CFG_UART1OUTPROT_UBX = 0x10740001;
+static constexpr uint32_t CFG_UART1OUTPROT_NMEA = 0x10740002;
+static constexpr uint32_t CFG_UART1OUTPROT_RTCM3 = 0x10740004;
+static constexpr uint32_t CFG_MSGOUT_UBX_NAV_PVT_UART1 = 0x20910007;
+static constexpr uint32_t CFG_MSGOUT_UBX_RXM_RTCM_UART1 = 0x20910269;
+static constexpr uint32_t CFG_RATE_MEAS = 0x30210001;
+static constexpr uint32_t CFG_RATE_NAV = 0x30210002;
+static constexpr uint32_t CFG_RATE_TIMEREF = 0x20210003;
 
 struct GpsFix {
   double lat = 0.0;
@@ -93,6 +94,10 @@ static uint32_t activeGpsBaud = 0;
 static const char* activeGpsPort = GPS_PORTS[0].name;
 static uint32_t gpsRawBytes = 0;
 static uint32_t gpsParsedMessages = 0;
+static uint32_t f9pRtcmMessages = 0;
+static uint32_t f9pRtcmCrcFail = 0;
+static uint16_t f9pLastRtcmType = 0;
+static uint32_t f9pLastRtcmMs = 0;
 static const char* gpsSource = "none";
 
 static void putU32(uint8_t* p, uint32_t v) {
@@ -178,6 +183,7 @@ static void configureRover() {
       {CFG_UART1OUTPROT_NMEA, 0, 1},
       {CFG_UART1OUTPROT_RTCM3, 0, 1},
       {CFG_MSGOUT_UBX_NAV_PVT_UART1, 1, 1},
+      {CFG_MSGOUT_UBX_RXM_RTCM_UART1, 1, 1},
       {CFG_RATE_MEAS, 200, 2},
       {CFG_RATE_NAV, 1, 2},
       {CFG_RATE_TIMEREF, 1, 1},
@@ -337,6 +343,14 @@ static void feedNmea(uint8_t b) {
 static void processUbx() {
   if (ubxClass == 0x01 && ubxId == 0x07) {
     parseNavPvt(ubxPayload, ubxLen);
+    return;
+  }
+
+  if (ubxClass == 0x02 && ubxId == 0x32 && ubxLen >= 8) {
+    f9pRtcmMessages++;
+    if ((ubxPayload[1] & 0x01) != 0) f9pRtcmCrcFail++;
+    f9pLastRtcmType = getU16(ubxPayload + 6);
+    f9pLastRtcmMs = millis();
   }
 }
 
@@ -645,7 +659,9 @@ static void printStatus() {
 
   const uint32_t gpsAgeMs = gps.lastMs == 0 ? 0 : now - gps.lastMs;
   const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
-  Serial.printf("ROVER wifi=%s ip=%s wifiReconnect=%lu udpRestart=%lu port=%s baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu rtcm=%lubytes/%lupkts age=%lums\n",
+  const uint32_t f9pRtcmAgeMs =
+      f9pLastRtcmMs == 0 ? 0 : now - f9pLastRtcmMs;
+  Serial.printf("ROVER wifi=%s ip=%s wifiReconnect=%lu udpRestart=%lu port=%s baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu udpRtcm=%lubytes/%lupkts age=%lums f9pRtcm=%lu crcFail=%lu lastType=%u age=%lums\n",
                 WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
                 WiFi.localIP().toString().c_str(),
                 (unsigned long)wifiReconnectCount,
@@ -664,7 +680,11 @@ static void printStatus() {
                 (unsigned long)gpsRawBytes,
                 (unsigned long)rtcmBytesRx,
                 (unsigned long)rtcmPacketsRx,
-                (unsigned long)rtcmAgeMs);
+                (unsigned long)rtcmAgeMs,
+                (unsigned long)f9pRtcmMessages,
+                (unsigned long)f9pRtcmCrcFail,
+                f9pLastRtcmType,
+                (unsigned long)f9pRtcmAgeMs);
 }
 
 void setup() {
