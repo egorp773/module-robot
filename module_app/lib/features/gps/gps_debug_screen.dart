@@ -17,10 +17,15 @@ class GpsDebugScreen extends ConsumerStatefulWidget {
 }
 
 class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
-  static const double _autoPointMinDistanceM = 0.50;
+  static const double _autoPointMinDistanceM = 0.20;
+  static const double _trailMinDistanceM = 0.10;
+  static const int _trailMaxPoints = 900;
 
   final List<GpsPerimeterPoint> _points = [];
+  final List<GpsPerimeterPoint> _trail = [];
   final TextEditingController _nameCtrl = TextEditingController();
+  final TextEditingController _hostCtrl = TextEditingController();
+  final FocusNode _hostFocus = FocusNode();
   Timer? _recordTimer;
   bool _recording = false;
   String? _notice;
@@ -30,6 +35,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   void initState() {
     super.initState();
     _savedFuture = GpsPerimeterStorage.list();
+    _hostCtrl.text = WifiRobotHostNotifier.defaultHost;
     final stamp = DateTime.now();
     _nameCtrl.text =
         'GPS ${stamp.year}-${_two(stamp.month)}-${_two(stamp.day)} ${_two(stamp.hour)}-${_two(stamp.minute)}';
@@ -39,16 +45,27 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   void dispose() {
     _recordTimer?.cancel();
     _nameCtrl.dispose();
+    _hostCtrl.dispose();
+    _hostFocus.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final wifi = ref.watch(wifiConnectionProvider);
+    final robotHost = ref.watch(wifiRobotHostProvider);
     final ctrl = ref.read(wifiConnectionProvider.notifier);
     final fixOk = _fixOk(wifi);
     final ageText = _ageText(wifi);
     final accM = wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0;
+    final currentPoint = _currentPoint(wifi);
+    final mapSpanM = _mapSpanM(currentPoint);
+    ref.listen<WifiConnectionState>(wifiConnectionProvider, (_, next) {
+      _appendTrail(next);
+    });
+    if (!_hostFocus.hasFocus && _hostCtrl.text != robotHost) {
+      _hostCtrl.text = robotHost;
+    }
 
     return Scaffold(
       backgroundColor: const Color(0xFF050608),
@@ -105,6 +122,34 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                     fixOk: fixOk,
                     carrier: wifi.gpsCarrier,
                     ageText: ageText,
+                  ),
+                  const SizedBox(height: 10),
+                  _Panel(
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _hostCtrl,
+                            focusNode: _hostFocus,
+                            keyboardType: TextInputType.url,
+                            decoration: InputDecoration(
+                              labelText: 'IP ровера',
+                              hintText: WifiRobotHostNotifier.defaultHost,
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              isDense: true,
+                            ),
+                            onSubmitted: _saveRobotHost,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        _IconButton(
+                          icon: Icons.save_rounded,
+                          onTap: () => _saveRobotHost(_hostCtrl.text),
+                        ),
+                      ],
+                    ),
                   ),
                   const SizedBox(height: 10),
                   _Panel(
@@ -224,6 +269,82 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                           children: [
                             const Expanded(
                               child: Text(
+                                'Карта участка',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                            ),
+                            Text(
+                              mapSpanM == null
+                                  ? 'нет позиции'
+                                  : '~${mapSpanM.toStringAsFixed(0)} м',
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.68),
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          height: 300,
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: CustomPaint(
+                              painter: _SiteMapPainter(
+                                trail: _trail,
+                                perimeter: _points,
+                                current: currentPoint,
+                                heading: wifi.gpsHeading,
+                                fresh: _hasUsableGps(wifi),
+                              ),
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF0C1014),
+                                  border: Border.all(
+                                    color: Colors.white.withValues(alpha: 0.10),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            _Action(
+                              icon: Icons.my_location_rounded,
+                              label: 'Я',
+                              color: const Color(0xFF7AA2FF),
+                              onTap: currentPoint == null
+                                  ? null
+                                  : () => _appendTrail(wifi, force: true),
+                            ),
+                            _Action(
+                              icon: Icons.delete_sweep_rounded,
+                              label: 'Стереть след',
+                              onTap: _trail.isEmpty
+                                  ? null
+                                  : () => setState(() => _trail.clear()),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  _Panel(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            const Expanded(
+                              child: Text(
                                 'Запись периметра',
                                 style: TextStyle(
                                   fontSize: 16,
@@ -315,7 +436,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Автозапись добавляет точку каждые ${_autoPointMinDistanceM.toStringAsFixed(1)} м при валидном фиксе.',
+                          'Кнопка "Точка" добавляет вручную. Автозапись добавляет точку каждые ${_autoPointMinDistanceM.toStringAsFixed(1)} м, когда координаты идут с ровера.',
                           style: TextStyle(
                             color: Colors.white.withValues(alpha: 0.58),
                             fontSize: 12,
@@ -431,6 +552,65 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     );
   }
 
+  GpsPerimeterPoint? _currentPoint(WifiConnectionState wifi) {
+    final lat = wifi.gpsLat;
+    final lon = wifi.gpsLon;
+    if (lat == null || lon == null) return null;
+    if (lat.abs() < 0.000001 && lon.abs() < 0.000001) return null;
+    return GpsPerimeterPoint(
+      lat: lat,
+      lon: lon,
+      hAccM: wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0,
+      at: DateTime.now(),
+    );
+  }
+
+  void _appendTrail(WifiConnectionState wifi, {bool force = false}) {
+    if (!_hasUsableGps(wifi)) return;
+    final point = _currentPoint(wifi);
+    if (point == null) return;
+
+    if (!force && _trail.isNotEmpty) {
+      final last = _trail.last;
+      final dist = _distanceM(last.lat, last.lon, point.lat, point.lon);
+      if (dist < _trailMinDistanceM) return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _trail.add(point);
+      if (_trail.length > _trailMaxPoints) {
+        _trail.removeRange(0, _trail.length - _trailMaxPoints);
+      }
+    });
+  }
+
+  double? _mapSpanM(GpsPerimeterPoint? current) {
+    final all = <GpsPerimeterPoint>[..._trail, ..._points];
+    if (current != null) all.add(current);
+    if (all.isEmpty) return null;
+    if (all.length == 1) return 10.0;
+
+    final lat0 = all.map((p) => p.lat).reduce((a, b) => a + b) / all.length;
+    final lon0 = all.map((p) => p.lon).reduce((a, b) => a + b) / all.length;
+    const latScale = 111320.0;
+    final lonScale = 111320.0 * math.cos(lat0 * math.pi / 180.0);
+
+    double minX = double.infinity;
+    double maxX = -double.infinity;
+    double minY = double.infinity;
+    double maxY = -double.infinity;
+    for (final p in all) {
+      final x = (p.lon - lon0) * lonScale;
+      final y = (p.lat - lat0) * latScale;
+      minX = math.min(minX, x);
+      maxX = math.max(maxX, x);
+      minY = math.min(minY, y);
+      maxY = math.max(maxY, y);
+    }
+    return math.max(10.0, math.max(maxX - minX, maxY - minY));
+  }
+
   void _toggleRecording(WifiConnectionState wifi) {
     if (_recording) {
       _recordTimer?.cancel();
@@ -439,8 +619,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       return;
     }
 
-    if (!_fixOk(wifi)) {
-      setState(() => _notice = 'Нет валидного GPS-фикса.');
+    if (!_hasUsableGps(wifi)) {
+      setState(() => _notice = _gpsBlockedReason(wifi));
       return;
     }
 
@@ -451,11 +631,21 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     setState(() => _recording = true);
   }
 
+  Future<void> _saveRobotHost(String value) async {
+    await ref.read(wifiRobotHostProvider.notifier).setHost(value);
+    if (mounted) {
+      final saved = ref.read(wifiRobotHostProvider);
+      _hostCtrl.text = saved;
+      FocusScope.of(context).unfocus();
+      setState(() => _notice = 'IP ровера сохранен: $saved');
+    }
+  }
+
   void _addCurrentPoint(WifiConnectionState wifi, {bool force = false}) {
     final lat = wifi.gpsLat;
     final lon = wifi.gpsLon;
-    if (!_fixOk(wifi) || lat == null || lon == null) {
-      setState(() => _notice = 'Точка пропущена: GPS-фикс невалидный.');
+    if (!_hasUsableGps(wifi) || lat == null || lon == null) {
+      setState(() => _notice = _gpsBlockedReason(wifi));
       return;
     }
 
@@ -474,7 +664,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
 
     setState(() {
       _points.add(point);
-      _notice = null;
+      _notice = 'Точка добавлена: ${_points.length}.';
     });
   }
 
@@ -507,6 +697,30 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     return (wifi.gpsFixType ?? 0) >= 3 &&
         wifi.gpsLat != null &&
         wifi.gpsLon != null;
+  }
+
+  static bool _hasUsableGps(WifiConnectionState wifi) {
+    final lat = wifi.gpsLat;
+    final lon = wifi.gpsLon;
+    if (lat == null || lon == null) return false;
+    if (lat.abs() < 0.000001 && lon.abs() < 0.000001) return false;
+
+    final receivedAt = wifi.gpsReceivedAt;
+    if (receivedAt == null) return true;
+    return DateTime.now().difference(receivedAt).inSeconds < 5;
+  }
+
+  static String _gpsBlockedReason(WifiConnectionState wifi) {
+    if (!wifi.isConnected) return 'Нет связи с ровером.';
+    if (wifi.gpsLat == null || wifi.gpsLon == null) {
+      return 'Нет координат от ровера.';
+    }
+    final receivedAt = wifi.gpsReceivedAt;
+    if (receivedAt != null &&
+        DateTime.now().difference(receivedAt).inSeconds >= 5) {
+      return 'GPS-данные устарели, подожди новое сообщение от ровера.';
+    }
+    return 'Координаты пока не готовы.';
   }
 
   static String _fixLabel(int? fixType) {
@@ -864,6 +1078,297 @@ class _Notice extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+class _SiteMapPainter extends CustomPainter {
+  final List<GpsPerimeterPoint> trail;
+  final List<GpsPerimeterPoint> perimeter;
+  final GpsPerimeterPoint? current;
+  final double? heading;
+  final bool fresh;
+
+  const _SiteMapPainter({
+    required this.trail,
+    required this.perimeter,
+    required this.current,
+    required this.heading,
+    required this.fresh,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final all = <GpsPerimeterPoint>[...trail, ...perimeter];
+    final currentPoint = current;
+    if (currentPoint != null) all.add(currentPoint);
+
+    if (all.isEmpty) {
+      _drawGrid(canvas, size);
+      _drawCenterText(canvas, size, 'Нет координат');
+      return;
+    }
+
+    final projection = _MapProjection(all, size);
+    _drawMeterGrid(canvas, size, projection);
+
+    if (perimeter.length >= 2) {
+      _drawPath(
+        canvas,
+        perimeter.map(projection.project).toList(),
+        const Color(0xFF38F6A7),
+        close: perimeter.length >= 3,
+        width: 2.4,
+      );
+    }
+
+    if (trail.length >= 2) {
+      _drawPath(
+        canvas,
+        trail.map(projection.project).toList(),
+        const Color(0xFF7AA2FF),
+        width: 2.0,
+      );
+    }
+
+    final pointPaint = Paint()..color = Colors.white;
+    for (final p in perimeter.map(projection.project)) {
+      canvas.drawCircle(p, 3.8, pointPaint);
+    }
+
+    if (trail.isNotEmpty) {
+      canvas.drawCircle(
+        projection.project(trail.first),
+        4.5,
+        Paint()..color = const Color(0xFFFFD166),
+      );
+    }
+
+    if (currentPoint != null) {
+      _drawCurrentMarker(
+        canvas,
+        projection.project(currentPoint),
+        heading ?? 0,
+        fresh ? const Color(0xFFFF4D6D) : Colors.white54,
+      );
+    }
+
+    _drawScale(canvas, size, projection);
+    _drawLabel(
+      canvas,
+      Offset(10, size.height - 26),
+      'след ${trail.length}  |  периметр ${perimeter.length}',
+      Colors.white.withValues(alpha: 0.72),
+      12,
+    );
+  }
+
+  void _drawGrid(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.055)
+      ..strokeWidth = 1;
+    for (double x = 0; x <= size.width; x += 32) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+    }
+    for (double y = 0; y <= size.height; y += 32) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
+    }
+  }
+
+  void _drawMeterGrid(Canvas canvas, Size size, _MapProjection projection) {
+    final gridM = _niceGrid(projection.visibleSpanM / 5.0);
+    final paint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.065)
+      ..strokeWidth = 1;
+    final axisPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.12)
+      ..strokeWidth = 1.2;
+
+    final minX = projection.centerWorld.dx - projection.visibleWorldW / 2;
+    final maxX = projection.centerWorld.dx + projection.visibleWorldW / 2;
+    final minY = projection.centerWorld.dy - projection.visibleWorldH / 2;
+    final maxY = projection.centerWorld.dy + projection.visibleWorldH / 2;
+
+    for (double x = (minX / gridM).floor() * gridM; x <= maxX; x += gridM) {
+      final a = projection.worldToScreen(Offset(x, minY));
+      final b = projection.worldToScreen(Offset(x, maxY));
+      canvas.drawLine(a, b, x.abs() < 0.001 ? axisPaint : paint);
+    }
+    for (double y = (minY / gridM).floor() * gridM; y <= maxY; y += gridM) {
+      final a = projection.worldToScreen(Offset(minX, y));
+      final b = projection.worldToScreen(Offset(maxX, y));
+      canvas.drawLine(a, b, y.abs() < 0.001 ? axisPaint : paint);
+    }
+  }
+
+  double _niceGrid(double raw) {
+    if (raw <= 0.5) return 0.5;
+    if (raw <= 1) return 1;
+    if (raw <= 2) return 2;
+    if (raw <= 5) return 5;
+    if (raw <= 10) return 10;
+    if (raw <= 20) return 20;
+    if (raw <= 50) return 50;
+    return 100;
+  }
+
+  void _drawPath(
+    Canvas canvas,
+    List<Offset> pts,
+    Color color, {
+    bool close = false,
+    double width = 2,
+  }) {
+    if (pts.length < 2) return;
+    final path = Path()..moveTo(pts.first.dx, pts.first.dy);
+    for (final p in pts.skip(1)) {
+      path.lineTo(p.dx, p.dy);
+    }
+    if (close) path.close();
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color
+        ..strokeWidth = width
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round,
+    );
+  }
+
+  void _drawCurrentMarker(
+      Canvas canvas, Offset center, double heading, Color c) {
+    canvas.drawCircle(center, 10, Paint()..color = c.withValues(alpha: 0.20));
+    canvas.drawCircle(center, 5.5, Paint()..color = c);
+
+    final angle = (heading - 90) * math.pi / 180.0;
+    final tip = center + Offset(math.cos(angle), math.sin(angle)) * 17;
+    final left =
+        center + Offset(math.cos(angle + 2.45), math.sin(angle + 2.45)) * 9;
+    final right =
+        center + Offset(math.cos(angle - 2.45), math.sin(angle - 2.45)) * 9;
+    final path = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(left.dx, left.dy)
+      ..lineTo(right.dx, right.dy)
+      ..close();
+    canvas.drawPath(path, Paint()..color = c);
+  }
+
+  void _drawScale(Canvas canvas, Size size, _MapProjection projection) {
+    final barM = _niceGrid(projection.visibleSpanM / 4.0);
+    final barPx = barM * projection.scale;
+    final start = Offset(size.width - barPx - 14, size.height - 18);
+    final end = Offset(size.width - 14, size.height - 18);
+    final paint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.82)
+      ..strokeWidth = 2;
+    canvas.drawLine(start, end, paint);
+    canvas.drawLine(
+        start + const Offset(0, -5), start + const Offset(0, 5), paint);
+    canvas.drawLine(end + const Offset(0, -5), end + const Offset(0, 5), paint);
+    _drawLabel(
+      canvas,
+      Offset(start.dx, start.dy - 22),
+      '${barM.toStringAsFixed(barM < 1 ? 1 : 0)} м',
+      Colors.white.withValues(alpha: 0.82),
+      11,
+    );
+  }
+
+  void _drawCenterText(Canvas canvas, Size size, String text) {
+    _drawLabel(
+      canvas,
+      size.center(Offset.zero),
+      text,
+      Colors.white.withValues(alpha: 0.45),
+      14,
+      centered: true,
+    );
+  }
+
+  void _drawLabel(
+    Canvas canvas,
+    Offset offset,
+    String text,
+    Color color,
+    double size, {
+    bool centered = false,
+  }) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: TextStyle(
+          color: color,
+          fontSize: size,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final pos = centered
+        ? offset - Offset(painter.width / 2, painter.height / 2)
+        : offset;
+    painter.paint(canvas, pos);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SiteMapPainter oldDelegate) => true;
+}
+
+class _MapProjection {
+  final List<GpsPerimeterPoint> points;
+  final Size size;
+  late final double lat0;
+  late final double lon0;
+  late final List<Offset> world;
+  late final Offset centerWorld;
+  late final double scale;
+  late final double visibleWorldW;
+  late final double visibleWorldH;
+
+  _MapProjection(this.points, this.size) {
+    lat0 = points.map((p) => p.lat).reduce((a, b) => a + b) / points.length;
+    lon0 = points.map((p) => p.lon).reduce((a, b) => a + b) / points.length;
+    const latScale = 111320.0;
+    final lonScale = 111320.0 * math.cos(lat0 * math.pi / 180.0);
+    world = points
+        .map(
+            (p) => Offset((p.lon - lon0) * lonScale, (p.lat - lat0) * latScale))
+        .toList();
+
+    double minX = world.first.dx;
+    double maxX = world.first.dx;
+    double minY = world.first.dy;
+    double maxY = world.first.dy;
+    for (final p in world) {
+      minX = math.min(minX, p.dx);
+      maxX = math.max(maxX, p.dx);
+      minY = math.min(minY, p.dy);
+      maxY = math.max(maxY, p.dy);
+    }
+
+    final worldW = math.max(8.0, maxX - minX);
+    final worldH = math.max(8.0, maxY - minY);
+    scale = math.min((size.width - 40) / worldW, (size.height - 46) / worldH);
+    centerWorld = Offset((minX + maxX) / 2, (minY + maxY) / 2);
+    visibleWorldW = size.width / scale;
+    visibleWorldH = size.height / scale;
+  }
+
+  double get visibleSpanM => math.max(visibleWorldW, visibleWorldH);
+
+  Offset project(GpsPerimeterPoint p) {
+    const latScale = 111320.0;
+    final lonScale = 111320.0 * math.cos(lat0 * math.pi / 180.0);
+    return worldToScreen(
+      Offset((p.lon - lon0) * lonScale, (p.lat - lat0) * latScale),
+    );
+  }
+
+  Offset worldToScreen(Offset p) {
+    final center = size.center(Offset.zero);
+    final local = (p - centerWorld) * scale;
+    return Offset(center.dx + local.dx, center.dy - local.dy);
   }
 }
 

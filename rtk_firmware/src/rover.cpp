@@ -4,16 +4,43 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 
-static constexpr int PIN_GPS_RX = 4; // ESP32 RX <- F9P TX
-static constexpr int PIN_GPS_TX = 5; // ESP32 TX -> F9P RX
-static constexpr uint32_t GPS_BAUD = 38400;
+#if __has_include("rtk_config_private.h")
+#include "rtk_config_private.h"
+#else
+#include "rtk_config.example.h"
+#endif
 
-static constexpr char WIFI_SSID[] = "RTK-Rover";
-static constexpr char WIFI_PASS[] = "rtk-rover-123";
+static constexpr uint32_t GPS_BAUDS[] = {38400, 9600, 115200};
+
+struct GpsPortConfig {
+  const char* name;
+  int rx; // ESP32 RX <- F9P TX
+  int tx; // ESP32 TX -> F9P RX
+};
+
+static constexpr GpsPortConfig GPS_PORTS[] = {
+    {"GPIO4/GPIO5", 4, 5},
+    {"GPIO16/GPIO17", 16, 17},
+};
+
+static constexpr bool ROUTER_MODE = true;
+static constexpr char ROUTER_WIFI_SSID[] = RTK_ROUTER_WIFI_SSID;
+static constexpr char ROUTER_WIFI_PASS[] = RTK_ROUTER_WIFI_PASS;
+static const IPAddress ROVER_STA_IP(RTK_ROVER_IP_A, RTK_ROVER_IP_B,
+                                    RTK_ROVER_IP_C, RTK_ROVER_IP_D);
+static const IPAddress ROUTER_GATEWAY(RTK_ROUTER_GATEWAY_A,
+                                      RTK_ROUTER_GATEWAY_B,
+                                      RTK_ROUTER_GATEWAY_C,
+                                      RTK_ROUTER_GATEWAY_D);
+static const IPAddress ROUTER_SUBNET(255, 255, 255, 0);
+
+static constexpr char AP_WIFI_SSID[] = "RTK-Rover";
+static constexpr char AP_WIFI_PASS[] = "rtk-rover-123";
 static constexpr uint16_t WS_PORT = 81;
 static constexpr uint16_t RTCM_UDP_PORT = 2101;
 static constexpr uint32_t GPS_BROADCAST_MS = 200;
 static constexpr uint32_t STATUS_MS = 1000;
+static constexpr uint32_t WIFI_RETRY_MS = 3000;
 
 static constexpr uint32_t CFG_UART1INPROT_UBX = 0x11731001;
 static constexpr uint32_t CFG_UART1INPROT_NMEA = 0x11731002;
@@ -53,6 +80,12 @@ static uint32_t rtcmPacketsRx = 0;
 static uint32_t lastRtcmMs = 0;
 static uint32_t lastGpsBroadcastMs = 0;
 static uint32_t lastStatusMs = 0;
+static uint32_t lastWiFiAttemptMs = 0;
+static uint32_t activeGpsBaud = 0;
+static const char* activeGpsPort = GPS_PORTS[0].name;
+static uint32_t gpsRawBytes = 0;
+static uint32_t gpsParsedMessages = 0;
+static const char* gpsSource = "none";
 
 static void putU32(uint8_t* p, uint32_t v) {
   p[0] = (uint8_t)v;
@@ -177,12 +210,209 @@ static void parseNavPvt(const uint8_t* p, uint16_t len) {
   gps.numSv = p[23];
   gps.valid = (p[21] & 0x01) != 0;
   gps.lastMs = millis();
+  gpsParsedMessages++;
+  gpsSource = "UBX";
+}
+
+static double parseNmeaCoord(const char* value, const char* hemi) {
+  if (value == nullptr || hemi == nullptr || value[0] == '\0') return 0.0;
+
+  const double raw = atof(value);
+  const int degrees = (int)(raw / 100.0);
+  const double minutes = raw - (double)degrees * 100.0;
+  double coord = (double)degrees + minutes / 60.0;
+  if (hemi[0] == 'S' || hemi[0] == 'W') coord = -coord;
+  return coord;
+}
+
+static int nmeaHex(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return -1;
+}
+
+static bool nmeaChecksumOk(const char* s) {
+  if (s == nullptr || s[0] != '$') return false;
+  const char* star = strchr(s, '*');
+  if (star == nullptr || star[1] == '\0' || star[2] == '\0') return false;
+
+  uint8_t ck = 0;
+  for (const char* p = s + 1; p < star; p++) ck ^= (uint8_t)*p;
+
+  const int hi = nmeaHex(star[1]);
+  const int lo = nmeaHex(star[2]);
+  if (hi < 0 || lo < 0) return false;
+  return ck == (uint8_t)((hi << 4) | lo);
+}
+
+static void parseNmeaSentence(char* sentence) {
+  if (!nmeaChecksumOk(sentence)) return;
+
+  char* star = strchr(sentence, '*');
+  if (star != nullptr) *star = '\0';
+
+  char* fields[24] = {};
+  size_t count = 0;
+  char* p = sentence + 1;
+  while (count < sizeof(fields) / sizeof(fields[0])) {
+    fields[count++] = p;
+    char* comma = strchr(p, ',');
+    if (comma == nullptr) break;
+    *comma = '\0';
+    p = comma + 1;
+  }
+  if (count == 0 || fields[0] == nullptr) return;
+
+  if (strlen(fields[0]) < 3) return;
+  const char* type = fields[0] + strlen(fields[0]) - 3;
+  if (strcmp(type, "GGA") == 0 && count > 9) {
+    const int quality = atoi(fields[6]);
+    gps.lat = parseNmeaCoord(fields[2], fields[3]);
+    gps.lon = parseNmeaCoord(fields[4], fields[5]);
+    gps.fixType = quality > 0 ? 3 : 0;
+    gps.diff = quality == 2 || quality == 4 || quality == 5;
+    gps.carrier = quality == 4 ? 2 : (quality == 5 ? 1 : 0);
+    gps.numSv = (uint8_t)atoi(fields[7]);
+    gps.pDop = (float)atof(fields[8]);
+    gps.heightM = (float)atof(fields[9]);
+    gps.valid = quality > 0;
+    gps.lastMs = millis();
+    gpsParsedMessages++;
+    gpsSource = "NMEA";
+    return;
+  }
+
+  if (strcmp(type, "RMC") == 0 && count > 8) {
+    gps.valid = fields[2][0] == 'A';
+    gps.lat = parseNmeaCoord(fields[3], fields[4]);
+    gps.lon = parseNmeaCoord(fields[5], fields[6]);
+    gps.speedMps = (float)(atof(fields[7]) * 0.514444);
+    gps.heading = (float)atof(fields[8]);
+    if (!gps.valid) gps.fixType = 0;
+    gps.lastMs = millis();
+    gpsParsedMessages++;
+    gpsSource = "NMEA";
+  }
+}
+
+static void feedNmea(uint8_t b) {
+  static char nmea[128];
+  static uint8_t n = 0;
+  static bool collecting = false;
+
+  if (b == '$') {
+    collecting = true;
+    n = 0;
+    nmea[n++] = (char)b;
+    return;
+  }
+
+  if (!collecting) return;
+
+  if (b == '\r') return;
+  if (b == '\n') {
+    nmea[n] = '\0';
+    collecting = false;
+    parseNmeaSentence(nmea);
+    return;
+  }
+
+  if (n < sizeof(nmea) - 1) {
+    nmea[n++] = (char)b;
+  } else {
+    collecting = false;
+    n = 0;
+  }
 }
 
 static void processUbx() {
   if (ubxClass == 0x01 && ubxId == 0x07) {
     parseNavPvt(ubxPayload, ubxLen);
   }
+}
+
+static void feedUbx(uint8_t b);
+
+static bool waitForPvt(uint32_t timeoutMs, uint32_t* bytesSeen) {
+  const uint32_t started = millis();
+  const uint32_t previousGpsMs = gps.lastMs;
+  uint32_t bytes = 0;
+
+  while (millis() - started < timeoutMs) {
+    while (GpsSerial.available()) {
+      bytes++;
+      gpsRawBytes++;
+      const uint8_t b = (uint8_t)GpsSerial.read();
+      feedUbx(b);
+      feedNmea(b);
+    }
+    if (gps.lastMs != 0 && gps.lastMs != previousGpsMs) {
+      if (bytesSeen != nullptr) *bytesSeen = bytes;
+      return true;
+    }
+    delay(2);
+  }
+
+  if (bytesSeen != nullptr) *bytesSeen = bytes;
+  return false;
+}
+
+static bool startGpsAtConfig(const GpsPortConfig& port, uint32_t baud) {
+  Serial.printf("GNSS: trying UART1 %s baud %lu\n", port.name,
+                (unsigned long)baud);
+  GpsSerial.end();
+  delay(80);
+  GpsSerial.begin(baud, SERIAL_8N1, port.rx, port.tx);
+  delay(300);
+  configureRover();
+
+  uint32_t bytesSeen = 0;
+  if (waitForPvt(2200, &bytesSeen)) {
+    activeGpsBaud = baud;
+    activeGpsPort = port.name;
+    Serial.printf("GNSS: %s detected on %s at %lu baud, raw=%lu parsed=%lu\n",
+                  gpsSource, port.name, (unsigned long)baud,
+                  (unsigned long)bytesSeen, (unsigned long)gpsParsedMessages);
+    return true;
+  }
+
+  Serial.printf("GNSS: no GPS parse on %s at %lu baud, raw=%lu\n", port.name,
+                (unsigned long)baud, (unsigned long)bytesSeen);
+  return false;
+}
+
+static void autoDetectGpsBaud() {
+  const GpsPortConfig* bestPort = &GPS_PORTS[0];
+  uint32_t bestBaud = GPS_BAUDS[0];
+  uint32_t bestRaw = 0;
+  const uint32_t rawBefore = gpsRawBytes;
+
+  for (const GpsPortConfig& port : GPS_PORTS) {
+    for (uint32_t baud : GPS_BAUDS) {
+      const uint32_t before = gpsRawBytes;
+      if (startGpsAtConfig(port, baud)) {
+        return;
+      }
+      const uint32_t rawDelta = gpsRawBytes - before;
+      if (rawDelta > bestRaw) {
+        bestRaw = rawDelta;
+        bestPort = &port;
+        bestBaud = baud;
+      }
+    }
+  }
+
+  activeGpsBaud = bestBaud;
+  activeGpsPort = bestPort->name;
+  GpsSerial.end();
+  delay(80);
+  GpsSerial.begin(activeGpsBaud, SERIAL_8N1, bestPort->rx, bestPort->tx);
+  delay(300);
+  configureRover();
+  Serial.printf("GNSS: GPS messages not detected, staying on %s at %lu baud, total raw=%lu\n",
+                activeGpsPort, (unsigned long)activeGpsBaud,
+                (unsigned long)(gpsRawBytes - rawBefore));
 }
 
 static void feedUbx(uint8_t b) {
@@ -282,10 +512,32 @@ static void broadcastGps() {
   ws.textAll(msg);
 }
 
+static void connectWiFi() {
+  if (!ROUTER_MODE) return;
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  const uint32_t now = millis();
+  if (lastWiFiAttemptMs != 0 && now - lastWiFiAttemptMs < WIFI_RETRY_MS) return;
+  lastWiFiAttemptMs = now;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.config(ROVER_STA_IP, ROUTER_GATEWAY, ROUTER_SUBNET);
+  WiFi.begin(ROUTER_WIFI_SSID, ROUTER_WIFI_PASS);
+  Serial.printf("WiFi STA connecting to %s, static IP %s\n",
+                ROUTER_WIFI_SSID, ROVER_STA_IP.toString().c_str());
+}
+
 static void setupWeb() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(WIFI_SSID, WIFI_PASS);
-  Serial.printf("AP %s IP %s\n", WIFI_SSID, WiFi.softAPIP().toString().c_str());
+  if (ROUTER_MODE) {
+    connectWiFi();
+    Serial.printf("Router mode: WebSocket will be ws://%s:%u/ws\n",
+                  ROVER_STA_IP.toString().c_str(), WS_PORT);
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_WIFI_SSID, AP_WIFI_PASS);
+    Serial.printf("AP %s IP %s\n", AP_WIFI_SSID,
+                  WiFi.softAPIP().toString().c_str());
+  }
 
   ws.onEvent([](AsyncWebSocket*, AsyncWebSocketClient* client, AwsEventType type,
                 void*, uint8_t* data, size_t len) {
@@ -320,7 +572,13 @@ static void printStatus() {
 
   const uint32_t gpsAgeMs = gps.lastMs == 0 ? 0 : now - gps.lastMs;
   const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
-  Serial.printf("ROVER clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums rtcm=%lubytes/%lupkts age=%lums\n",
+  Serial.printf("ROVER wifi=%s ip=%s port=%s baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu rtcm=%lubytes/%lupkts age=%lums\n",
+                WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
+                WiFi.localIP().toString().c_str(),
+                activeGpsPort,
+                (unsigned long)activeGpsBaud,
+                gpsSource,
+                (unsigned long)gpsParsedMessages,
                 ws.count(),
                 gps.fixType,
                 carrierName(gps.carrier),
@@ -328,6 +586,7 @@ static void printStatus() {
                 gps.numSv,
                 (unsigned long)gps.hAccMm,
                 (unsigned long)gpsAgeMs,
+                (unsigned long)gpsRawBytes,
                 (unsigned long)rtcmBytesRx,
                 (unsigned long)rtcmPacketsRx,
                 (unsigned long)rtcmAgeMs);
@@ -343,15 +602,17 @@ void setup() {
   rtcmUdp.begin(RTCM_UDP_PORT);
   Serial.printf("RTCM UDP input port %u\n", RTCM_UDP_PORT);
 
-  GpsSerial.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
-  delay(500);
-  configureRover();
+  autoDetectGpsBaud();
 }
 
 void loop() {
+  connectWiFi();
   relayRtcmToF9p();
   while (GpsSerial.available()) {
-    feedUbx((uint8_t)GpsSerial.read());
+    gpsRawBytes++;
+    const uint8_t b = (uint8_t)GpsSerial.read();
+    feedUbx(b);
+    feedNmea(b);
   }
 
   broadcastGps();

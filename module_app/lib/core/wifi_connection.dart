@@ -228,6 +228,44 @@ final wifiConnectionProvider =
   (ref) => WifiConnectionNotifier(ref),
 );
 
+final wifiRobotHostProvider =
+    StateNotifierProvider<WifiRobotHostNotifier, String>(
+  (ref) => WifiRobotHostNotifier(),
+);
+
+class WifiRobotHostNotifier extends StateNotifier<String> {
+  static const String defaultHost = '192.168.31.222';
+  static const String _key = 'wifi_robot_host';
+  bool _initialized = false;
+
+  WifiRobotHostNotifier() : super(defaultHost) {
+    _init();
+  }
+
+  Future<void> _init() async {
+    if (_initialized) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(_key);
+      if (saved != null && saved.trim().isNotEmpty) {
+        state = saved.trim();
+      }
+    } catch (_) {
+      // Keep default host.
+    }
+    _initialized = true;
+  }
+
+  Future<void> ensureInitialized() => _init();
+
+  Future<void> setHost(String host) async {
+    final clean = host.trim().isEmpty ? defaultHost : host.trim();
+    state = clean;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_key, clean);
+  }
+}
+
 class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   final Ref _ref;
 
@@ -235,7 +273,11 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     _initConnectivityListener();
   }
 
-  static const String _host = "192.168.4.1";
+  String get _host {
+    final host = _ref.read(wifiRobotHostProvider).trim();
+    return host.isEmpty ? WifiRobotHostNotifier.defaultHost : host;
+  }
+
   static const int _port = 81;
 
   WebSocketChannel? _channel;
@@ -350,6 +392,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
     state = state.copyWith(isConnecting: true, error: null);
     _log("=== CONNECT START ===");
+    await _ref.read(wifiRobotHostProvider.notifier).ensureInitialized();
 
     final bool pingCheckEnabled;
     if (skipPreflight) {

@@ -59,6 +59,7 @@ secrets.h
 wifi_secrets.h
 credentials.h
 private_config.h
+rtk_config_private.h
 
 # Secrets and environment
 .env

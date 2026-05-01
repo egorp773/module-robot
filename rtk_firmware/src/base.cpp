@@ -2,13 +2,20 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
+#if __has_include("rtk_config_private.h")
+#include "rtk_config_private.h"
+#else
+#include "rtk_config.example.h"
+#endif
+
 static constexpr int PIN_GPS_RX = 4; // ESP32 RX <- F9P TX
 static constexpr int PIN_GPS_TX = 5; // ESP32 TX -> F9P RX
 static constexpr uint32_t GPS_BAUD = 38400;
 
-static constexpr char ROVER_WIFI_SSID[] = "RTK-Rover";
-static constexpr char ROVER_WIFI_PASS[] = "rtk-rover-123";
-static const IPAddress ROVER_IP(192, 168, 4, 1);
+static constexpr char ROUTER_WIFI_SSID[] = RTK_ROUTER_WIFI_SSID;
+static constexpr char ROUTER_WIFI_PASS[] = RTK_ROUTER_WIFI_PASS;
+static const IPAddress ROVER_IP(RTK_ROVER_IP_A, RTK_ROVER_IP_B,
+                                RTK_ROVER_IP_C, RTK_ROVER_IP_D);
 static constexpr uint16_t ROVER_RTCM_PORT = 2101;
 
 static constexpr uint32_t SURVEY_IN_SECONDS = 60;
@@ -289,10 +296,13 @@ static void feedRtcm(uint8_t b) {
 static void connectWiFi() {
   const uint32_t now = millis();
   if (WiFi.status() == WL_CONNECTED) return;
-  if (now - lastWiFiAttemptMs < WIFI_RETRY_MS) return;
+  if (lastWiFiAttemptMs != 0 && now - lastWiFiAttemptMs < WIFI_RETRY_MS) return;
   lastWiFiAttemptMs = now;
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ROVER_WIFI_SSID, ROVER_WIFI_PASS);
+  WiFi.begin(ROUTER_WIFI_SSID, ROUTER_WIFI_PASS);
+  Serial.printf("WiFi STA connecting to %s, rover RTCM target %s:%u\n",
+                ROUTER_WIFI_SSID, ROVER_IP.toString().c_str(),
+                ROVER_RTCM_PORT);
 }
 
 static void pollSvin() {
@@ -306,8 +316,11 @@ static void printStatus() {
   const uint32_t now = millis();
   if (now - lastStatusMs < STATUS_MS) return;
   lastStatusMs = now;
-  Serial.printf("BASE wifi=%s svin_active=%u svin_valid=%u dur=%lus meanAcc=%.3fm rtcm=%lubytes/%lupkts\n",
+  Serial.printf("BASE wifi=%s ip=%s rover=%s:%u svin_active=%u svin_valid=%u dur=%lus meanAcc=%.3fm rtcm=%lubytes/%lupkts\n",
                 WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
+                WiFi.localIP().toString().c_str(),
+                ROVER_IP.toString().c_str(),
+                ROVER_RTCM_PORT,
                 svin.active ? 1 : 0,
                 svin.valid ? 1 : 0,
                 (unsigned long)svin.dur,

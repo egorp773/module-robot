@@ -1,93 +1,136 @@
-# ESP32 ZED-F9P RTK Pair
+# ESP32 ZED-F9P RTK
 
-Two separate Arduino/PlatformIO firmwares for two ESP32 + ZED-F9P modules:
+В этой папке две прошивки PlatformIO/Arduino для двух ESP32 + ZED-F9P:
 
-- `base`: stationary RTK base. It runs survey-in on its F9P, enables RTCM3,
-  connects to the rover Wi-Fi, and sends RTCM corrections to the rover via UDP.
-- `rover`: moving RTK rover. It creates the Wi-Fi AP for the iPhone/app, receives
-  RTCM from the base via UDP, forwards RTCM to its F9P, and exposes GPS/RTK
-  telemetry over WebSocket for the Flutter app.
+- `base` - стационарная база. Делает Survey-In, включает RTCM3 и отправляет
+  поправки роверу по Wi-Fi/UDP.
+- `rover` - подвижный модуль. Принимает RTCM от базы, прокидывает поправки в
+  свой F9P и отдает GPS/RTK-данные приложению по WebSocket.
 
-## Wiring
+## Wi-Fi Режим
 
-For both ESP32 boards:
+Сейчас включен вариант через внешний роутер `Xiaomi_6A92` 2.4 GHz.
 
-- F9P TX -> ESP32 GPIO 4
-- F9P RX -> ESP32 GPIO 5
-- GND common
-- Stable 3.3 V power for the F9P
-- Outdoor antenna placement is required for real RTK tests
+ESP32 не работает с обычным 5 GHz Wi-Fi, поэтому сеть должна быть именно
+2.4 GHz. Телефон может быть в этой же 2.4 GHz сети. Если роутер сам объединяет
+2.4/5 GHz под одним именем, важно, чтобы ESP32 видел именно 2.4 GHz.
 
-## Network
+Параметры текущей схемы:
 
-Rover:
+- Wi-Fi SSID: `Xiaomi_6A92`
+- пароль хранится локально в `src/rtk_config_private.h` и не коммитится
+- ровер: статический IP `192.168.31.222`
+- WebSocket приложения: `ws://192.168.31.222:81/ws`
+- RTCM вход ровера: UDP `192.168.31.222:2101`
+- база отправляет RTCM на `192.168.31.222:2101`
+- шлюз роутера: `192.168.31.1`
 
-- Wi-Fi AP SSID: `RTK-Rover`
-- Password: `rtk-rover-123`
-- WebSocket for app: `ws://192.168.4.1:81/ws`
-- RTCM UDP input: `192.168.4.1:2101`
+В приложении на экране GPS есть поле `IP ровера`. По умолчанию там
+`192.168.31.222`.
 
-Base:
+Для другого роутера скопируй `src/rtk_config.example.h` в
+`src/rtk_config_private.h` и поменяй SSID, пароль и IP. Private-файл добавлен в
+`.gitignore`, чтобы пароль не ушел на GitHub.
 
-- Connects to `RTK-Rover`
-- Sends RTCM UDP packets to `192.168.4.1:2101`
+## Подключение F9P
 
-Connect the iPhone to `RTK-Rover`, open the app, and use `GPS Отладка`.
+Основной вариант, который уже проверился на ровере:
 
-## Build And Upload
+- F9P TX -> ESP32 GPIO4
+- F9P RX -> ESP32 GPIO5
+- GND -> GND
+- питание F9P стабильное 3.3 V
+- антенна F9P подключена
 
-On Windows PowerShell:
+Ровер при старте также пробует запасной вариант `GPIO16/GPIO17`.
+
+## Сборка и прошивка
+
+Windows PowerShell:
 
 ```powershell
 cd C:\robot\module\rtk_firmware
-$env:PYTHONIOENCODING='utf-8'
-$env:PYTHONUTF8='1'
 
-# Upload the stationary base ESP32
+# Стационарная база
 pio run -e base -j 1 -t upload
 
-# Upload the moving rover ESP32
+# Ровер
 pio run -e rover -j 1 -t upload
 ```
 
-`-j 1` is intentional on this Windows setup. Parallel PlatformIO builds were
-seen hanging on the ESP32 toolchain cache.
-
-Serial monitor:
+Если порт надо указать явно:
 
 ```powershell
-pio device monitor -b 115200
+pio run -e rover -j 1 -t upload --upload-port COM4
 ```
 
-## Base Behavior
+Монитор:
 
-The base starts survey-in automatically:
+```powershell
+pio device monitor -p COM4 -b 115200
+```
 
-- minimum time: `60 s`
-- required mean accuracy: `5.0 m`
+`-j 1` оставлен специально: на этом Windows-окружении параллельная сборка
+PlatformIO может подвисать.
 
-When survey-in becomes valid, the F9P enters TIME mode and starts emitting RTCM.
-The firmware forwards RTCM messages over UDP. You can tune survey-in constants at
-the top of `src/base.cpp`.
+## Как работает база
 
-These defaults are intentionally fast for field testing. For better absolute
-base accuracy later, change them back to something like `300 s / 2.0 m`.
+База запускает Survey-In автоматически:
 
-## Rover Behavior
+- минимум: `60 s`
+- требуемая точность: `5.0 m`
 
-The rover forwards all received RTCM UDP payloads to its F9P. The app sees:
+Это быстрый тестовый режим. Для нормальной постоянной базы позже лучше поставить
+примерно `300 s / 2.0 m` или точнее.
+
+Когда Survey-In готов, F9P переходит в TIME mode и начинает отдавать RTCM.
+ESP32 пересылает эти RTCM-пакеты роверу по UDP.
+
+В serial-логе базы:
 
 ```text
-GPS,<lat>,<lon>,<heading>,<fixType>,<hAccMm>
-GPSDBG,<lat>,<lon>,<heightM>,<heading>,<fixType>,<carrier>,<diff>,<numSV>,<hAccMm>,<vAccMm>,<speedMps>,<pDop>,<ageMs>
-RTCM,<bytesTotal>,<ageMs>
+BASE wifi=connected ip=192.168.31.xxx rover=192.168.31.222:2101 svin_active=1 svin_valid=0 dur=35s meanAcc=3.500m rtcm=0bytes/0pkts
 ```
 
-`carrier` is `none`, `float`, or `fixed`.
+Когда `svin_valid=1`, база должна начать слать RTCM, и счетчик `rtcm` будет
+расти.
 
-## Field Notes
+## Как работает ровер
 
-- Start the base first and let survey-in finish.
-- Keep the base antenna fixed. If you move it, restart survey-in.
-- Then start the rover and app.
-- RTK fixed requires open sky, good antennas, and continuous RTCM reception.
+При старте ровер:
+
+1. Подключается к `Xiaomi_6A92`.
+2. Берет статический IP `192.168.31.222`.
+3. Запускает WebSocket `ws://192.168.31.222:81/ws`.
+4. Слушает RTCM от базы на UDP-порту `2101`.
+5. Автоматически ищет F9P на `GPIO4/GPIO5` и `GPIO16/GPIO17`.
+6. Пробует скорости `38400`, `9600`, `115200`.
+7. Если UBX не включился, но F9P отдает NMEA, использует `src=NMEA`.
+
+В serial-логе ровера:
+
+```text
+ROVER wifi=connected ip=192.168.31.222 port=GPIO4/GPIO5 baud=38400 src=NMEA parsed=42 clients=1 fix=3 carrier=none diff=0 sv=12 hAcc=0mm gpsAge=972ms raw=30324 rtcm=0bytes/0pkts age=0ms
+```
+
+Главные поля:
+
+- `wifi` и `ip` - подключился ли ровер к роутеру.
+- `src` - источник GPS: `UBX`, `NMEA` или `none`.
+- `parsed` - сколько GPS-сообщений разобрано.
+- `fix` - тип фикса. `3` значит 3D fix.
+- `carrier` - RTK: `none`, `float`, `fixed`.
+- `sv` - спутники.
+- `rtcm` - принятые от базы RTCM-поправки.
+
+## Полевой порядок
+
+1. Включить роутер/точку доступа `Xiaomi_6A92`.
+2. Включить базу, дождаться `wifi=connected`.
+3. Дождаться Survey-In: `svin_valid=1`.
+4. Включить ровер, дождаться `wifi=connected ip=192.168.31.222`.
+5. Подключить iPhone к `Xiaomi_6A92`.
+6. В приложении открыть `GPS Отладка`, IP ровера: `192.168.31.222`.
+7. Смотреть `RTCM`, `carrier`, `sv`, `gpsAge`.
+
+Для RTK fixed нужны открытое небо, хорошие антенны и непрерывный RTCM.
