@@ -9,6 +9,28 @@ import 'package:go_router/go_router.dart';
 import '../../core/gps_perimeter_storage.dart';
 import '../../core/wifi_connection.dart';
 
+@visibleForTesting
+List<GpsPerimeterPoint> gpsDebugVisibleMapPoints({
+  required List<GpsPerimeterPoint> currentPerimeter,
+  required List<GpsPerimeterPoint> openedPerimeter,
+  required List<GpsPerimeterPoint> track,
+  required GpsPerimeterPoint? currentPosition,
+}) {
+  if (currentPerimeter.isNotEmpty) {
+    return List<GpsPerimeterPoint>.unmodifiable(currentPerimeter);
+  }
+  if (openedPerimeter.isNotEmpty) {
+    return List<GpsPerimeterPoint>.unmodifiable(openedPerimeter);
+  }
+  if (track.isNotEmpty) {
+    return List<GpsPerimeterPoint>.unmodifiable(track);
+  }
+  if (currentPosition != null) {
+    return List<GpsPerimeterPoint>.unmodifiable([currentPosition]);
+  }
+  return const [];
+}
+
 class GpsDebugScreen extends ConsumerStatefulWidget {
   const GpsDebugScreen({super.key});
 
@@ -60,6 +82,13 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     final ageText = _ageText(wifi);
     final accM = wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0;
     final currentPoint = _currentPoint(wifi);
+    final openedPoints = _activeSaved?.points ?? const <GpsPerimeterPoint>[];
+    final visibleMapPoints = gpsDebugVisibleMapPoints(
+      currentPerimeter: _points,
+      openedPerimeter: openedPoints,
+      track: _trail,
+      currentPosition: currentPoint,
+    );
     final mapSpanM = _mapSpanM(currentPoint);
     ref.listen<WifiConnectionState>(wifiConnectionProvider, (_, next) {
       _appendTrail(next);
@@ -289,28 +318,23 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                           ],
                         ),
                         const SizedBox(height: 10),
+                        _MapDebugInfo(
+                          currentPoints: _points.length,
+                          openedPoints: openedPoints.length,
+                          trackPoints: _trail.length,
+                          currentPosition: currentPoint,
+                        ),
+                        const SizedBox(height: 10),
                         SizedBox(
                           height: 300,
                           child: ClipRRect(
                             borderRadius: BorderRadius.circular(8),
                             child: CustomPaint(
                               painter: _SiteMapPainter(
-                                trail: _trail,
-                                perimeter: _points,
-                                savedPerimeter:
-                                    _activeSaved?.points ?? const [],
+                                points: visibleMapPoints,
                                 current: currentPoint,
-                                heading: wifi.gpsHeading,
-                                fresh: _hasUsableGps(wifi),
                               ),
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFF0C1014),
-                                  border: Border.all(
-                                    color: Colors.white.withValues(alpha: 0.10),
-                                  ),
-                                ),
-                              ),
+                              child: const SizedBox.expand(),
                             ),
                           ),
                         ),
@@ -1132,6 +1156,53 @@ class _SavedPerimeterCard extends StatelessWidget {
   }
 }
 
+class _MapDebugInfo extends StatelessWidget {
+  final int currentPoints;
+  final int openedPoints;
+  final int trackPoints;
+  final GpsPerimeterPoint? currentPosition;
+
+  const _MapDebugInfo({
+    required this.currentPoints,
+    required this.openedPoints,
+    required this.trackPoints,
+    required this.currentPosition,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final position = currentPosition == null
+        ? 'none'
+        : '${currentPosition!.lat.toStringAsFixed(8)}, '
+            '${currentPosition!.lon.toStringAsFixed(8)}';
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.055),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+      ),
+      child: DefaultTextStyle(
+        style: TextStyle(
+          color: Colors.white.withValues(alpha: 0.76),
+          fontSize: 12,
+          fontWeight: FontWeight.w800,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('current points: $currentPoints'),
+            Text('saved/opened perimeter points: $openedPoints'),
+            Text('track points: $trackPoints'),
+            Text('current position: $position'),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _Action extends StatelessWidget {
   final IconData icon;
   final String label;
@@ -1239,104 +1310,113 @@ class _Notice extends StatelessWidget {
 }
 
 class _SiteMapPainter extends CustomPainter {
-  final List<GpsPerimeterPoint> trail;
-  final List<GpsPerimeterPoint> perimeter;
-  final List<GpsPerimeterPoint> savedPerimeter;
+  final List<GpsPerimeterPoint> points;
   final GpsPerimeterPoint? current;
-  final double? heading;
-  final bool fresh;
 
   const _SiteMapPainter({
-    required this.trail,
-    required this.perimeter,
-    required this.savedPerimeter,
+    required this.points,
     required this.current,
-    required this.heading,
-    required this.fresh,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    final all = <GpsPerimeterPoint>[
-      ...trail,
-      ...savedPerimeter,
-      ...perimeter,
-    ];
-    final currentPoint = current;
-    if (currentPoint != null) all.add(currentPoint);
+    final background = Paint()..color = const Color(0xFF2B2F36);
+    canvas.drawRect(Offset.zero & size, background);
+    _drawGrid(canvas, size);
 
-    if (all.isEmpty) {
-      _drawGrid(canvas, size);
-      _drawCenterText(canvas, size, 'Нет координат');
+    final display = List<GpsPerimeterPoint>.from(points);
+    final currentPoint = current;
+    if (display.isEmpty && currentPoint != null) {
+      display.add(currentPoint);
+    }
+
+    if (display.isEmpty) {
+      _drawCenterText(canvas, size, 'Нет точек');
       return;
     }
 
-    final projection = _MapProjection(all, size);
-    _drawMeterGrid(canvas, size, projection);
+    final projected = _projectSimple(display, size);
 
-    if (savedPerimeter.length >= 2) {
+    if (projected.length >= 2) {
       _drawPath(
         canvas,
-        savedPerimeter.map(projection.project).toList(),
-        const Color(0xFFFFD166),
-        close: savedPerimeter.length >= 3,
-        width: 2.0,
+        projected,
+        Colors.white,
+        close: projected.length >= 3,
+        width: 3.0,
       );
     }
 
-    if (perimeter.length >= 2) {
-      _drawPath(
-        canvas,
-        perimeter.map(projection.project).toList(),
-        const Color(0xFF38F6A7),
-        close: perimeter.length >= 3,
-        width: 2.4,
-      );
-    }
-
-    if (trail.length >= 2) {
-      _drawPath(
-        canvas,
-        trail.map(projection.project).toList(),
-        const Color(0xFF7AA2FF),
-        width: 2.0,
-      );
-    }
-
+    final outlinePaint = Paint()..color = Colors.black;
     final pointPaint = Paint()..color = Colors.white;
-    final savedPointPaint = Paint()..color = const Color(0xFFFFD166);
-    for (final p in savedPerimeter.map(projection.project)) {
-      canvas.drawCircle(p, 3.2, savedPointPaint);
-    }
-    for (final p in perimeter.map(projection.project)) {
-      canvas.drawCircle(p, 3.8, pointPaint);
-    }
-
-    if (trail.isNotEmpty) {
-      canvas.drawCircle(
-        projection.project(trail.first),
-        4.5,
-        Paint()..color = const Color(0xFFFFD166),
+    for (var i = 0; i < projected.length; i++) {
+      final p = projected[i];
+      canvas.drawCircle(p, 10, outlinePaint);
+      canvas.drawCircle(p, 8, pointPaint);
+      _drawLabel(
+        canvas,
+        p + const Offset(11, -22),
+        '${i + 1}',
+        Colors.white,
+        14,
       );
     }
 
     if (currentPoint != null) {
-      _drawCurrentMarker(
-        canvas,
-        projection.project(currentPoint),
-        heading ?? 0,
-        fresh ? const Color(0xFFFF4D6D) : Colors.white54,
-      );
+      final currentProjected = _projectSimple([currentPoint, ...display], size);
+      final currentOffset = currentProjected.first;
+      canvas.drawCircle(currentOffset, 13, Paint()..color = Colors.red);
+      canvas.drawCircle(currentOffset, 8, Paint()..color = Colors.white);
     }
 
-    _drawScale(canvas, size, projection);
     _drawLabel(
       canvas,
-      Offset(10, size.height - 26),
-      'след ${trail.length}  |  периметр ${perimeter.length}  |  открыт ${savedPerimeter.length}',
-      Colors.white.withValues(alpha: 0.72),
+      const Offset(10, 10),
+      'points: ${display.length}',
+      Colors.white,
       12,
     );
+  }
+
+  List<Offset> _projectSimple(List<GpsPerimeterPoint> src, Size size) {
+    double minLat = src.first.lat;
+    double maxLat = src.first.lat;
+    double minLon = src.first.lon;
+    double maxLon = src.first.lon;
+
+    for (final p in src) {
+      minLat = math.min(minLat, p.lat);
+      maxLat = math.max(maxLat, p.lat);
+      minLon = math.min(minLon, p.lon);
+      maxLon = math.max(maxLon, p.lon);
+    }
+
+    const minRange = 0.00001;
+    if ((maxLat - minLat).abs() < minRange) {
+      final center = (minLat + maxLat) / 2;
+      minLat = center - minRange / 2;
+      maxLat = center + minRange / 2;
+    }
+    if ((maxLon - minLon).abs() < minRange) {
+      final center = (minLon + maxLon) / 2;
+      minLon = center - minRange / 2;
+      maxLon = center + minRange / 2;
+    }
+
+    final latPad = (maxLat - minLat) * 0.20;
+    final lonPad = (maxLon - minLon) * 0.20;
+    minLat -= latPad;
+    maxLat += latPad;
+    minLon -= lonPad;
+    maxLon += lonPad;
+
+    final drawW = math.max(1.0, size.width);
+    final drawH = math.max(1.0, size.height);
+    return src.map((p) {
+      final x = ((p.lon - minLon) / (maxLon - minLon)) * drawW;
+      final y = drawH - ((p.lat - minLat) / (maxLat - minLat)) * drawH;
+      return Offset(x.clamp(12.0, drawW - 12.0), y.clamp(12.0, drawH - 12.0));
+    }).toList();
   }
 
   void _drawGrid(Canvas canvas, Size size) {
@@ -1349,43 +1429,6 @@ class _SiteMapPainter extends CustomPainter {
     for (double y = 0; y <= size.height; y += 32) {
       canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
     }
-  }
-
-  void _drawMeterGrid(Canvas canvas, Size size, _MapProjection projection) {
-    final gridM = _niceGrid(projection.visibleSpanM / 5.0);
-    final paint = Paint()
-      ..color = Colors.white.withValues(alpha: 0.065)
-      ..strokeWidth = 1;
-    final axisPaint = Paint()
-      ..color = Colors.white.withValues(alpha: 0.12)
-      ..strokeWidth = 1.2;
-
-    final minX = projection.centerWorld.dx - projection.visibleWorldW / 2;
-    final maxX = projection.centerWorld.dx + projection.visibleWorldW / 2;
-    final minY = projection.centerWorld.dy - projection.visibleWorldH / 2;
-    final maxY = projection.centerWorld.dy + projection.visibleWorldH / 2;
-
-    for (double x = (minX / gridM).floor() * gridM; x <= maxX; x += gridM) {
-      final a = projection.worldToScreen(Offset(x, minY));
-      final b = projection.worldToScreen(Offset(x, maxY));
-      canvas.drawLine(a, b, x.abs() < 0.001 ? axisPaint : paint);
-    }
-    for (double y = (minY / gridM).floor() * gridM; y <= maxY; y += gridM) {
-      final a = projection.worldToScreen(Offset(minX, y));
-      final b = projection.worldToScreen(Offset(maxX, y));
-      canvas.drawLine(a, b, y.abs() < 0.001 ? axisPaint : paint);
-    }
-  }
-
-  double _niceGrid(double raw) {
-    if (raw <= 0.5) return 0.5;
-    if (raw <= 1) return 1;
-    if (raw <= 2) return 2;
-    if (raw <= 5) return 5;
-    if (raw <= 10) return 10;
-    if (raw <= 20) return 20;
-    if (raw <= 50) return 50;
-    return 100;
   }
 
   void _drawPath(
@@ -1409,46 +1452,6 @@ class _SiteMapPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeCap = StrokeCap.round
         ..strokeJoin = StrokeJoin.round,
-    );
-  }
-
-  void _drawCurrentMarker(
-      Canvas canvas, Offset center, double heading, Color c) {
-    canvas.drawCircle(center, 10, Paint()..color = c.withValues(alpha: 0.20));
-    canvas.drawCircle(center, 5.5, Paint()..color = c);
-
-    final angle = (heading - 90) * math.pi / 180.0;
-    final tip = center + Offset(math.cos(angle), math.sin(angle)) * 17;
-    final left =
-        center + Offset(math.cos(angle + 2.45), math.sin(angle + 2.45)) * 9;
-    final right =
-        center + Offset(math.cos(angle - 2.45), math.sin(angle - 2.45)) * 9;
-    final path = Path()
-      ..moveTo(tip.dx, tip.dy)
-      ..lineTo(left.dx, left.dy)
-      ..lineTo(right.dx, right.dy)
-      ..close();
-    canvas.drawPath(path, Paint()..color = c);
-  }
-
-  void _drawScale(Canvas canvas, Size size, _MapProjection projection) {
-    final barM = _niceGrid(projection.visibleSpanM / 4.0);
-    final barPx = barM * projection.scale;
-    final start = Offset(size.width - barPx - 14, size.height - 18);
-    final end = Offset(size.width - 14, size.height - 18);
-    final paint = Paint()
-      ..color = Colors.white.withValues(alpha: 0.82)
-      ..strokeWidth = 2;
-    canvas.drawLine(start, end, paint);
-    canvas.drawLine(
-        start + const Offset(0, -5), start + const Offset(0, 5), paint);
-    canvas.drawLine(end + const Offset(0, -5), end + const Offset(0, 5), paint);
-    _drawLabel(
-      canvas,
-      Offset(start.dx, start.dy - 22),
-      '${barM.toStringAsFixed(barM < 1 ? 1 : 0)} м',
-      Colors.white.withValues(alpha: 0.82),
-      11,
     );
   }
 
@@ -1490,63 +1493,6 @@ class _SiteMapPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _SiteMapPainter oldDelegate) => true;
-}
-
-class _MapProjection {
-  final List<GpsPerimeterPoint> points;
-  final Size size;
-  late final double lat0;
-  late final double lon0;
-  late final List<Offset> world;
-  late final Offset centerWorld;
-  late final double scale;
-  late final double visibleWorldW;
-  late final double visibleWorldH;
-
-  _MapProjection(this.points, this.size) {
-    lat0 = points.map((p) => p.lat).reduce((a, b) => a + b) / points.length;
-    lon0 = points.map((p) => p.lon).reduce((a, b) => a + b) / points.length;
-    const latScale = 111320.0;
-    final lonScale = 111320.0 * math.cos(lat0 * math.pi / 180.0);
-    world = points
-        .map(
-            (p) => Offset((p.lon - lon0) * lonScale, (p.lat - lat0) * latScale))
-        .toList();
-
-    double minX = world.first.dx;
-    double maxX = world.first.dx;
-    double minY = world.first.dy;
-    double maxY = world.first.dy;
-    for (final p in world) {
-      minX = math.min(minX, p.dx);
-      maxX = math.max(maxX, p.dx);
-      minY = math.min(minY, p.dy);
-      maxY = math.max(maxY, p.dy);
-    }
-
-    final worldW = math.max(8.0, maxX - minX);
-    final worldH = math.max(8.0, maxY - minY);
-    scale = math.min((size.width - 40) / worldW, (size.height - 46) / worldH);
-    centerWorld = Offset((minX + maxX) / 2, (minY + maxY) / 2);
-    visibleWorldW = size.width / scale;
-    visibleWorldH = size.height / scale;
-  }
-
-  double get visibleSpanM => math.max(visibleWorldW, visibleWorldH);
-
-  Offset project(GpsPerimeterPoint p) {
-    const latScale = 111320.0;
-    final lonScale = 111320.0 * math.cos(lat0 * math.pi / 180.0);
-    return worldToScreen(
-      Offset((p.lon - lon0) * lonScale, (p.lat - lat0) * latScale),
-    );
-  }
-
-  Offset worldToScreen(Offset p) {
-    final center = size.center(Offset.zero);
-    final local = (p - centerWorld) * scale;
-    return Offset(center.dx + local.dx, center.dy - local.dy);
-  }
 }
 
 class _PerimeterPainter extends CustomPainter {
