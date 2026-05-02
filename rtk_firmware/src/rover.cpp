@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
+#include <ArduinoOTA.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <Adafruit_BNO08x.h>
@@ -44,6 +45,8 @@ static constexpr uint32_t STATUS_MS = 1000;
 static constexpr uint32_t WIFI_RETRY_MS = 5000;
 static constexpr uint32_t RTCM_WARN_AGE_MS = 5000;
 static constexpr uint32_t RTCM_RESTART_AGE_MS = 15000;
+static constexpr uint32_t RTCM_WIFI_RECOVER_AGE_MS = 30000;
+static constexpr uint32_t RTCM_WIFI_RECOVER_MS = 15000;
 static constexpr int PIN_MOTOR_RX = 16;
 static constexpr int PIN_MOTOR_TX = 17;
 static constexpr int PIN_IMU_SDA = 21;
@@ -109,6 +112,7 @@ static uint32_t wifiReconnectCount = 0;
 static uint32_t udpRestartCount = 0;
 static uint32_t lastRtcmWarnMs = 0;
 static uint32_t lastRtcmUdpRestartMs = 0;
+static uint32_t lastRtcmWifiRecoverMs = 0;
 static uint32_t lastRoverConfigRetryMs = 0;
 static uint32_t activeGpsBaud = 0;
 static const char* activeGpsPort = GPS_PORTS[0].name;
@@ -596,6 +600,8 @@ static void relayRtcmToF9p() {
   lastRtcmMs = millis();
 }
 
+static void connectWiFi(bool force = false);
+
 static void restartRtcmUdp(const char* reason) {
   rtcmUdp.stop();
   delay(20);
@@ -604,6 +610,19 @@ static void restartRtcmUdp(const char* reason) {
   lastRtcmUdpRestartMs = millis();
   Serial.printf("RTCM UDP restart #%lu port=%u ok=%u reason=%s\n",
                 (unsigned long)udpRestartCount, RTCM_UDP_PORT, ok, reason);
+}
+
+static void recoverRtcmWiFi(const char* reason) {
+  const uint32_t now = millis();
+  if (now - lastRtcmWifiRecoverMs < RTCM_WIFI_RECOVER_MS) return;
+  lastRtcmWifiRecoverMs = now;
+  Serial.printf("WARN rover RTCM WiFi recover reason=%s age=%lums\n", reason,
+                (unsigned long)(lastRtcmMs == 0 ? 0 : now - lastRtcmMs));
+  rtcmUdp.stop();
+  WiFi.disconnect(false);
+  delay(80);
+  connectWiFi(true);
+  restartRtcmUdp(reason);
 }
 
 static void checkRtcmWatchdog() {
@@ -622,6 +641,9 @@ static void checkRtcmWatchdog() {
   if (age > RTCM_RESTART_AGE_MS &&
       now - lastRtcmUdpRestartMs > WIFI_RETRY_MS) {
     restartRtcmUdp("rtcm-age");
+  }
+  if (lastRtcmMs != 0 && age > RTCM_WIFI_RECOVER_AGE_MS) {
+    recoverRtcmWiFi("rtcm-stale");
   }
 }
 
@@ -662,7 +684,7 @@ static void broadcastGps() {
   ws.textAll(msg);
 }
 
-static void connectWiFi(bool force = false) {
+static void connectWiFi(bool force) {
   if (!ROUTER_MODE) return;
   if (!force && WiFi.status() == WL_CONNECTED) return;
 
@@ -675,6 +697,8 @@ static void connectWiFi(bool force = false) {
   wifiReconnectCount++;
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
   WiFi.config(ROVER_STA_IP, ROUTER_GATEWAY, ROUTER_SUBNET);
   if (force) {
     WiFi.disconnect(false);
@@ -917,6 +941,28 @@ static void setupWeb() {
     } else if (msg == "STOP") {
       motorsStop("ws STOP");
       client->text("OK STOP");
+    } else if (msg == "UDP_RESET") {
+      restartRtcmUdp("ws UDP_RESET");
+      client->text("OK UDP_RESET");
+    } else if (msg == "STATUS") {
+      char status[192];
+      const uint32_t now = millis();
+      const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
+      snprintf(status, sizeof(status),
+               "STATUS,wifi=%d,udpRestart=%lu,rtcmBytes=%lu,rtcmAge=%lu,imu=%d,yaw=%.2f,motor=%d/%d",
+               WiFi.status(),
+               (unsigned long)udpRestartCount,
+               (unsigned long)rtcmBytesRx,
+               (unsigned long)rtcmAgeMs,
+               imuValid ? 1 : 0,
+               imuYaw,
+               motorTargetLeft,
+               motorTargetRight);
+      client->text(status);
+    } else if (msg == "ESP_RESTART") {
+      client->text("OK ESP_RESTART");
+      delay(50);
+      ESP.restart();
     } else if (msg == "GPS_STATUS") {
       client->text(gps.valid ? "OK GPS" : "NO GPS");
     } else {
@@ -936,6 +982,20 @@ static void setupWeb() {
     req->send(200, "text/plain", "OK");
   });
   server.begin();
+}
+
+static void setupOta() {
+  ArduinoOTA.setHostname("rtk-rover");
+  ArduinoOTA.onStart([]() {
+    motorsStop("OTA start");
+    Serial.println("OTA: start");
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA: end"); });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA: error %u\n", (unsigned)error);
+  });
+  ArduinoOTA.begin();
+  Serial.println("OTA: enabled hostname=rtk-rover");
 }
 
 static void printStatus() {
@@ -994,12 +1054,14 @@ void setup() {
   motorsInit();
   imuInit();
   setupWeb();
+  setupOta();
   restartRtcmUdp("setup");
 
   autoDetectGpsBaud();
 }
 
 void loop() {
+  ArduinoOTA.handle();
   checkWiFiWatchdog();
   imuUpdate();
   relayRtcmToF9p();

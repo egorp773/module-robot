@@ -602,6 +602,8 @@ static void connectWiFi(bool force) {
   lastWiFiAttemptMs = now;
   wifiReconnectCount++;
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
   if (force) {
     rtcmUdp.stop();
     WiFi.disconnect(false);
