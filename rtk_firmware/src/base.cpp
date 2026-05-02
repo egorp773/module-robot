@@ -21,6 +21,9 @@ static constexpr uint16_t ROVER_RTCM_PORT = 2101;
 
 static constexpr uint32_t SURVEY_IN_SECONDS = 600;
 static constexpr uint32_t SURVEY_IN_ACC_LIMIT_0_1MM = 10000; // 1.0 m, precision RTK base
+static constexpr uint32_t SURVEY_IN_FALLBACK_AFTER_MS = 15UL * 60UL * 1000UL;
+static constexpr uint32_t FALLBACK_SURVEY_IN_SECONDS = 60;
+static constexpr uint32_t FALLBACK_SURVEY_IN_ACC_LIMIT_0_1MM = 250000; // 25.0 m, keeps RTK usable in weak sky
 static constexpr uint32_t WIFI_RETRY_MS = 5000;
 static constexpr uint32_t STATUS_MS = 1000;
 static constexpr uint32_t SVIN_POLL_MS = 1000;
@@ -62,6 +65,8 @@ static bool wasWiFiConnected = false;
 static uint32_t lastStatusMs = 0;
 static uint32_t lastSvinPollMs = 0;
 static uint32_t lastReconfigMs = 0;
+static uint32_t firstSurveyStartMs = 0;
+static bool fallbackSurveyMode = false;
 static uint32_t rtcmBytesSent = 0;
 static uint32_t rtcmPacketsSent = 0;
 static uint32_t udpSendOk = 0;
@@ -194,12 +199,21 @@ static bool sendValset(const char* label, const ValItem* items, size_t count) {
   return sendUbxWithAck(label, 0x06, 0x8A, payload, (uint16_t)n);
 }
 
+static uint32_t activeSurveySeconds() {
+  return fallbackSurveyMode ? FALLBACK_SURVEY_IN_SECONDS : SURVEY_IN_SECONDS;
+}
+
+static uint32_t activeSurveyAccLimit01mm() {
+  return fallbackSurveyMode ? FALLBACK_SURVEY_IN_ACC_LIMIT_0_1MM
+                            : SURVEY_IN_ACC_LIMIT_0_1MM;
+}
+
 static bool sendCfgTmode3(const char* label, uint16_t flags) {
   uint8_t payload[40] = {};
   payload[0] = 0; // version
   putU16(payload + 2, flags);
-  putU32(payload + 24, SURVEY_IN_SECONDS);
-  putU32(payload + 28, SURVEY_IN_ACC_LIMIT_0_1MM);
+  putU32(payload + 24, activeSurveySeconds());
+  putU32(payload + 28, activeSurveyAccLimit01mm());
   return sendUbxWithAck(label, 0x06, 0x71, payload, sizeof(payload));
 }
 
@@ -249,8 +263,8 @@ static void configureBase() {
   const bool disableLegacyOk = sendCfgTmode3("CFG-TMODE3 disable", 0);
 
   const ValItem surveyItems[] = {
-      {CFG_TMODE_SVIN_MIN_DUR, SURVEY_IN_SECONDS, 4},
-      {CFG_TMODE_SVIN_ACC_LIMIT, SURVEY_IN_ACC_LIMIT_0_1MM, 4},
+      {CFG_TMODE_SVIN_MIN_DUR, activeSurveySeconds(), 4},
+      {CFG_TMODE_SVIN_ACC_LIMIT, activeSurveyAccLimit01mm(), 4},
       {CFG_TMODE_MODE, 1, 1},
   };
   const bool surveyValOk =
@@ -266,6 +280,7 @@ static void configureBase() {
            surveyValOk ? 1 : 0, surveyLegacyOk ? 1 : 0);
   Serial.printf("GNSS: base config summary %s\n", lastConfigResult);
   lastReconfigMs = millis();
+  if (firstSurveyStartMs == 0) firstSurveyStartMs = lastReconfigMs;
 }
 
 enum UbxState { U_SYNC1, U_SYNC2, U_CLASS, U_ID, U_LEN1, U_LEN2, U_PAYLOAD, U_CKA, U_CKB };
@@ -627,18 +642,41 @@ static void maybeReconfigureBase() {
   configureBase();
 }
 
+static void maybeFallbackSurveyMode() {
+  if (fallbackSurveyMode || svin.valid || firstSurveyStartMs == 0) return;
+
+  const uint32_t now = millis();
+  const bool appTimerExpired =
+      now - firstSurveyStartMs >= SURVEY_IN_FALLBACK_AFTER_MS;
+  const bool gnssSurveyStuck =
+      svin.active && svin.dur >= (SURVEY_IN_FALLBACK_AFTER_MS / 1000UL) &&
+      svin.meanAcc01mm > SURVEY_IN_ACC_LIMIT_0_1MM;
+  if (!appTimerExpired && !gnssSurveyStuck) return;
+
+  fallbackSurveyMode = true;
+  Serial.printf("GNSS: precision survey stuck %.3fm for %lus; switching to fallback survey %lus %.1fm\n",
+                (double)svin.meanAcc01mm / 10000.0,
+                (unsigned long)((now - firstSurveyStartMs) / 1000),
+                (unsigned long)FALLBACK_SURVEY_IN_SECONDS,
+                (double)FALLBACK_SURVEY_IN_ACC_LIMIT_0_1MM / 10000.0);
+  configureBase();
+}
+
 static void printStatus() {
   const uint32_t now = millis();
   if (now - lastStatusMs < STATUS_MS) return;
   lastStatusMs = now;
   const uint32_t gnssAgeMs = gnss.lastMs == 0 ? 0 : now - gnss.lastMs;
   const uint32_t svinAgeMs = svin.lastMs == 0 ? 0 : now - svin.lastMs;
-  Serial.printf("BASE wifi=%s ip=%s rover=%s:%u wifiReconnect=%lu port=%s baud=%lu src=%s raw=%lu parsed=%lu ubx=%lu ack=%lu nak=%lu fix=%u sv=%u gnssAge=%lums svin_active=%u svin_valid=%u dur=%lus meanAcc=%.3fm svinAge=%lums rtcm=%lubytes/%lupkts frames=%lu udpOk=%lu udpFail=%lu udpFailStreak=%u last=%s\n",
+  Serial.printf("BASE wifi=%s ip=%s rover=%s:%u wifiReconnect=%lu mode=%s survey=%lus/%.1fm port=%s baud=%lu src=%s raw=%lu parsed=%lu ubx=%lu ack=%lu nak=%lu fix=%u sv=%u gnssAge=%lums svin_active=%u svin_valid=%u dur=%lus meanAcc=%.3fm svinAge=%lums rtcm=%lubytes/%lupkts frames=%lu udpOk=%lu udpFail=%lu udpFailStreak=%u last=%s\n",
                 WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
                 WiFi.localIP().toString().c_str(),
                 ROVER_IP.toString().c_str(),
                 ROVER_RTCM_PORT,
                 (unsigned long)wifiReconnectCount,
+                fallbackSurveyMode ? "fallback" : "precision",
+                (unsigned long)activeSurveySeconds(),
+                (double)activeSurveyAccLimit01mm() / 10000.0,
                 GPS_PORT_NAME,
                 (unsigned long)GPS_BAUD,
                 gnssSource,
@@ -691,6 +729,7 @@ void loop() {
     feedRtcm(b);
   }
   pollSvin();
+  maybeFallbackSurveyMode();
   maybeReconfigureBase();
   printStatus();
 }
