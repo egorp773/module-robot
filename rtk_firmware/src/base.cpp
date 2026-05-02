@@ -25,7 +25,9 @@ static constexpr uint32_t WIFI_RETRY_MS = 5000;
 static constexpr uint32_t STATUS_MS = 1000;
 static constexpr uint32_t SVIN_POLL_MS = 1000;
 static constexpr uint32_t BASE_RECONFIG_MS = 15000;
-static constexpr uint8_t UDP_FAIL_RECONNECT_LIMIT = 3;
+static constexpr uint8_t UDP_FAIL_RECONNECT_LIMIT = 10;
+static constexpr uint32_t UDP_RECONNECT_COOLDOWN_MS = 10000;
+static constexpr uint32_t WIFI_AFTER_CONNECT_GRACE_MS = 5000;
 
 // u-blox configuration keys for VALSET.
 static constexpr uint32_t CFG_UART1INPROT_UBX = 0x10730001;
@@ -54,6 +56,9 @@ static HardwareSerial GpsSerial(1);
 static WiFiUDP rtcmUdp;
 
 static uint32_t lastWiFiAttemptMs = 0;
+static uint32_t lastWiFiConnectedMs = 0;
+static uint32_t lastUdpReconnectMs = 0;
+static bool wasWiFiConnected = false;
 static uint32_t lastStatusMs = 0;
 static uint32_t lastSvinPollMs = 0;
 static uint32_t lastReconfigMs = 0;
@@ -510,9 +515,18 @@ static void sendRtcmFrame() {
                   beginOk, endOk, (unsigned long)udpSendFail,
                   udpSendFailStreak, ROVER_IP.toString().c_str(),
                   ROVER_RTCM_PORT);
-    if (udpSendFailStreak >= UDP_FAIL_RECONNECT_LIMIT) {
+    const uint32_t now = millis();
+    const bool wifiSettled =
+        lastWiFiConnectedMs != 0 &&
+        now - lastWiFiConnectedMs > WIFI_AFTER_CONNECT_GRACE_MS;
+    const bool reconnectCooldownOk =
+        lastUdpReconnectMs == 0 ||
+        now - lastUdpReconnectMs > UDP_RECONNECT_COOLDOWN_MS;
+    if (udpSendFailStreak >= UDP_FAIL_RECONNECT_LIMIT && wifiSettled &&
+        reconnectCooldownOk) {
       Serial.println("WARN base UDP fail streak: forcing WiFi reconnect");
       udpSendFailStreak = 0;
+      lastUdpReconnectMs = now;
       connectWiFi(true);
     }
   }
@@ -554,7 +568,18 @@ static void feedRtcm(uint8_t b) {
 
 static void connectWiFi(bool force) {
   const uint32_t now = millis();
-  if (!force && WiFi.status() == WL_CONNECTED) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wasWiFiConnected) {
+      wasWiFiConnected = true;
+      lastWiFiConnectedMs = now;
+      udpSendFailStreak = 0;
+      Serial.printf("WiFi STA connected ip=%s\n",
+                    WiFi.localIP().toString().c_str());
+    }
+    if (!force) return;
+  } else {
+    wasWiFiConnected = false;
+  }
   if (!force && lastWiFiAttemptMs != 0 &&
       now - lastWiFiAttemptMs < WIFI_RETRY_MS) {
     return;

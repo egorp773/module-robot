@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -177,16 +178,16 @@ class WifiPingCheckNotifier extends StateNotifier<bool> {
     try {
       final prefs = await SharedPreferences.getInstance();
       final value = prefs.getBool(_key);
-      print('DEBUG: Loading wifi ping check from prefs: $value');
+      debugPrint('DEBUG: Loading wifi ping check from prefs: $value');
       if (value != null) {
         state = value;
-        print('DEBUG: Set wifi ping check state to: $value');
+        debugPrint('DEBUG: Set wifi ping check state to: $value');
       } else {
-        print('DEBUG: No saved value, using default: true');
+        debugPrint('DEBUG: No saved value, using default: true');
       }
       _initialized = true;
     } catch (e) {
-      print('DEBUG: Error loading wifi ping check: $e');
+      debugPrint('DEBUG: Error loading wifi ping check: $e');
       _initialized = true;
       // Оставляем значение по умолчанию (true)
     }
@@ -196,20 +197,20 @@ class WifiPingCheckNotifier extends StateNotifier<bool> {
   Future<void> ensureInitialized() => _init();
 
   Future<void> setEnabled(bool enabled) async {
-    print('DEBUG: setEnabled called with: $enabled');
+    debugPrint('DEBUG: setEnabled called with: $enabled');
     state = enabled;
-    print('DEBUG: State updated to: $state');
+    debugPrint('DEBUG: State updated to: $state');
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_key, enabled);
       // Проверяем, что значение сохранилось
       final saved = prefs.getBool(_key);
-      print('DEBUG: Saved wifi ping check: $enabled, read back: $saved');
+      debugPrint('DEBUG: Saved wifi ping check: $enabled, read back: $saved');
       if (saved != enabled) {
-        print('DEBUG: WARNING! Saved value does not match!');
+        debugPrint('DEBUG: WARNING! Saved value does not match!');
       }
     } catch (e) {
-      print('DEBUG: Error saving wifi ping check: $e');
+      debugPrint('DEBUG: Error saving wifi ping check: $e');
       // Игнорируем ошибки сохранения
     }
   }
@@ -283,6 +284,11 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   WebSocketChannel? _channel;
   StreamSubscription? _sub;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
+  Timer? _healthTimer;
+  Timer? _reconnectTimer;
+  DateTime? _lastRxAt;
+  bool _autoReconnectEnabled = false;
+  int _reconnectAttempt = 0;
 
   Completer<void>? _pongWaiter;
 
@@ -303,10 +309,11 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
     _log("→ Connectivity changed: $results (Wi-Fi: $hasWifi)");
 
-    // Если Wi-Fi отключился и приложение было подключено, отключаемся
     if (!hasWifi && state.isConnected) {
       _log("× Wi-Fi disconnected, disconnecting...");
-      disconnect(error: "Wi-Fi отключен");
+      unawaited(_handleConnectionLost("Wi-Fi отключен"));
+    } else if (hasWifi && _autoReconnectEnabled && !state.isConnected) {
+      _scheduleReconnect("Wi-Fi вернулся");
     }
   }
 
@@ -315,6 +322,89 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     next.add(line);
     if (next.length > 200) next.removeRange(0, next.length - 200);
     state = state.copyWith(rxLog: next);
+  }
+
+  void _startHealthTimer() {
+    _healthTimer?.cancel();
+    _healthTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!state.isConnected) {
+        if (_autoReconnectEnabled && !state.isConnecting) {
+          _scheduleReconnect("нет активного соединения");
+        }
+        return;
+      }
+
+      final lastRx = _lastRxAt;
+      if (lastRx == null) return;
+      final silence = DateTime.now().difference(lastRx);
+
+      if (silence.inSeconds >= 6) {
+        final ch = _channel;
+        if (ch != null) {
+          try {
+            ch.sink.add("PING");
+            _log("→ PING watchdog");
+          } catch (e) {
+            unawaited(_handleConnectionLost("Ошибка PING: $e"));
+            return;
+          }
+        }
+      }
+
+      if (silence.inSeconds >= 12) {
+        unawaited(
+          _handleConnectionLost(
+            "Нет данных от ровера ${silence.inSeconds} секунд",
+          ),
+        );
+      }
+    });
+  }
+
+  void _scheduleReconnect(String reason) {
+    if (!_autoReconnectEnabled || state.isConnecting || state.isConnected) {
+      return;
+    }
+    if (_reconnectTimer?.isActive ?? false) return;
+
+    final delaySeconds = _reconnectAttempt <= 0
+        ? 1
+        : (_reconnectAttempt == 1 ? 2 : (_reconnectAttempt == 2 ? 3 : 5));
+    _reconnectAttempt++;
+    _log("↻ reconnect через ${delaySeconds}s: $reason");
+    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () {
+      _reconnectTimer = null;
+      if (!_autoReconnectEnabled || state.isConnected || state.isConnecting) {
+        return;
+      }
+      unawaited(connect(skipPreflight: true));
+    });
+  }
+
+  Future<void> _handleConnectionLost(String error) async {
+    if (!state.isConnected && !state.isConnecting && _channel == null) {
+      _scheduleReconnect(error);
+      return;
+    }
+
+    _log("× connection lost: $error");
+    await _closeSocketOnly();
+    state = state.copyWith(
+      isConnecting: false,
+      isConnected: false,
+      error: error,
+    );
+    _scheduleReconnect(error);
+  }
+
+  Future<void> _closeSocketOnly() async {
+    _pongWaiter = null;
+    await _sub?.cancel();
+    _sub = null;
+    try {
+      _channel?.sink.close();
+    } catch (_) {}
+    _channel = null;
   }
 
   /// Минимальная проверка Wi-Fi: пробуем подключиться к WebSocket
@@ -390,6 +480,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   Future<void> connect({bool skipPreflight = false}) async {
     if (state.isConnecting || state.isConnected) return;
 
+    _autoReconnectEnabled = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     state = state.copyWith(isConnecting: true, error: null);
     _log("=== CONNECT START ===");
     await _ref.read(wifiRobotHostProvider.notifier).ensureInitialized();
@@ -421,6 +514,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
               "Не вижу робота по Wi-Fi. Проверь что iPhone/Android подключён к сети Robot.",
         );
         _log("=== CONNECT FAIL: WebSocket test failed ===");
+        _scheduleReconnect("WebSocket preflight failed");
         return;
       }
       _log("✓ WebSocket test passed, Wi-Fi is available");
@@ -436,7 +530,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         _log("→ WebSocket channel created");
       } catch (e) {
         _log("× Failed to create WebSocket channel: $e");
-        await disconnect(error: "Не удалось создать WebSocket соединение: $e");
+        await _handleConnectFail("Не удалось создать WebSocket соединение: $e");
         return;
       }
 
@@ -452,6 +546,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       _sub?.cancel();
       _sub = ch.stream.listen(
         (msg) {
+          _lastRxAt = DateTime.now();
           final msgStr = msg.toString().trim();
           _log("← $msgStr");
           final upperMsg = msgStr.toUpperCase();
@@ -637,6 +732,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
             _log("× Completing connectionCompleter with false due to error");
             connectionCompleter.complete(false);
           }
+          if (connectionEstablished || state.isConnected) {
+            unawaited(_handleConnectionLost("WebSocket ошибка: $e"));
+          }
         },
         onDone: () {
           _log("× WS stream closed (onDone)");
@@ -644,6 +742,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
             _log(
                 "× Completing connectionCompleter with false due to stream closed");
             connectionCompleter.complete(false);
+          }
+          if (connectionEstablished || state.isConnected) {
+            unawaited(_handleConnectionLost("WebSocket закрыт"));
           }
         },
         cancelOnError: false,
@@ -662,7 +763,8 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
         if (!connected) {
           _log("× Connection completer returned false");
-          await disconnect(error: "Не удалось установить WebSocket соединение");
+          await _handleConnectFail(
+              "Не удалось установить WebSocket соединение");
           return;
         }
 
@@ -671,6 +773,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         _log("✓ Connection established, setting isConnected = true");
         state =
             state.copyWith(isConnecting: false, isConnected: true, error: null);
+        _lastRxAt = DateTime.now();
+        _reconnectAttempt = 0;
+        _startHealthTimer();
         _log("=== CONNECT OK ===");
 
         // Опционально: отправляем PING для проверки (но не ждем ответа)
@@ -678,15 +783,30 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         sendRaw("PING");
       } catch (e) {
         _log("=== CONNECT FAIL: $e ===");
-        await disconnect(error: "Не удалось подключиться по WebSocket: $e");
+        await _handleConnectFail("Не удалось подключиться по WebSocket: $e");
       }
     } catch (e) {
       _log("=== CONNECT FAIL: $e ===");
-      await disconnect(error: "Не удалось подключиться по WebSocket: $e");
+      await _handleConnectFail("Не удалось подключиться по WebSocket: $e");
     }
   }
 
+  Future<void> _handleConnectFail(String error) async {
+    await _closeSocketOnly();
+    state = state.copyWith(
+      isConnecting: false,
+      isConnected: false,
+      error: error,
+    );
+    _scheduleReconnect(error);
+  }
+
   Future<void> disconnect({String? error}) async {
+    _autoReconnectEnabled = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _healthTimer?.cancel();
+    _healthTimer = null;
     state = state.copyWith(
       isConnecting: false,
       isConnected: false,
@@ -694,21 +814,15 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       batteryPercent: null, // Сбрасываем данные батареи при отключении
     );
 
-    _pongWaiter = null;
-
-    await _sub?.cancel();
-    _sub = null;
-
-    try {
-      _channel?.sink.close();
-    } catch (_) {}
-
-    _channel = null;
+    await _closeSocketOnly();
     _log("=== DISCONNECTED ===");
   }
 
   @override
   void dispose() {
+    _autoReconnectEnabled = false;
+    _healthTimer?.cancel();
+    _reconnectTimer?.cancel();
     _connectivitySubscription?.cancel();
     _sub?.cancel();
     _channel?.sink.close();
@@ -726,7 +840,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       ch.sink.add(text);
     } catch (e) {
       _log("× sendRaw error: $e");
-      disconnect(error: "Ошибка отправки: $e");
+      unawaited(_handleConnectionLost("Ошибка отправки: $e"));
     }
   }
 

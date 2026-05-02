@@ -518,15 +518,17 @@ static void restartRtcmUdp(const char* reason) {
 }
 
 static void checkRtcmWatchdog() {
-  if (lastRtcmMs == 0) return;
-
   const uint32_t now = millis();
-  const uint32_t age = now - lastRtcmMs;
+  const uint32_t referenceMs =
+      lastRtcmMs != 0 ? lastRtcmMs : lastRtcmUdpRestartMs;
+  if (referenceMs == 0) return;
+
+  const uint32_t age = now - referenceMs;
   if (age > RTCM_WARN_AGE_MS && now - lastRtcmWarnMs > 1000) {
     lastRtcmWarnMs = now;
-    Serial.printf("WARN rover RTCM age=%lums packets=%lu udpRestart=%lu\n",
+    Serial.printf("WARN rover RTCM age=%lums packets=%lu udpRestart=%lu seen=%u\n",
                   (unsigned long)age, (unsigned long)rtcmPacketsRx,
-                  (unsigned long)udpRestartCount);
+                  (unsigned long)udpRestartCount, lastRtcmMs != 0 ? 1 : 0);
   }
   if (age > RTCM_RESTART_AGE_MS &&
       now - lastRtcmUdpRestartMs > WIFI_RETRY_MS) {
