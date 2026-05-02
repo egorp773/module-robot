@@ -258,13 +258,10 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                             Expanded(
                               child: _Metric(
                                 label: 'RTCM возраст',
-                                value: wifi.rtcmAgeMs == null
-                                    ? rtcmText
-                                    : '${wifi.rtcmAgeMs} ms / $rtcmText',
+                                value: _rtcmMetricValue(wifi.rtcmAgeMs),
                                 good: rtcmFresh,
                               ),
                             ),
-                            const Expanded(child: SizedBox.shrink()),
                           ],
                         ),
                         const SizedBox(height: 12),
@@ -396,14 +393,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                             borderRadius: BorderRadius.circular(8),
                             child: CustomPaint(
                               painter: _PerimeterPainter(_points),
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFF0C1014),
-                                  border: Border.all(
-                                    color: Colors.white.withValues(alpha: 0.10),
-                                  ),
-                                ),
-                              ),
+                              child: const SizedBox.expand(),
                             ),
                           ),
                         ),
@@ -806,6 +796,13 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     return 'RTCM свежий';
   }
 
+  static String _rtcmMetricValue(int? ageMs) {
+    if (ageMs == null) return 'нет данных';
+    if (ageMs > 10000) return '$ageMs ms\nпотерян';
+    if (ageMs > 3000) return '$ageMs ms\nстарый';
+    return '$ageMs ms\nсвежий';
+  }
+
   static bool _hasUsableGps(WifiConnectionState wifi) {
     final lat = wifi.gpsLat;
     final lon = wifi.gpsLon;
@@ -941,11 +938,8 @@ class _StatusStrip extends StatelessWidget {
         Expanded(
           child: _Pill(
             icon: Icons.satellite_alt_rounded,
-            text:
-                '${_GpsDebugScreenState._carrierLabel(carrier)} / $rtcmText',
-            color: rtkOk
-                ? const Color(0xFF38F6A7)
-                : const Color(0xFFFFD166),
+            text: '${_GpsDebugScreenState._carrierLabel(carrier)} / $rtcmText',
+            color: rtkOk ? const Color(0xFF38F6A7) : const Color(0xFFFFD166),
           ),
         ),
       ],
@@ -1025,12 +1019,13 @@ class _Metric extends StatelessWidget {
           const SizedBox(height: 5),
           Text(
             value,
-            maxLines: 1,
+            maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: color,
               fontWeight: FontWeight.w900,
-              fontSize: 15,
+              fontSize: 14,
+              height: 1.12,
             ),
           ),
         ],
@@ -1512,8 +1507,13 @@ class _PerimeterPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    canvas.drawRect(
+      Offset.zero & size,
+      Paint()..color = const Color(0xFF2B2F36),
+    );
+
     final gridPaint = Paint()
-      ..color = Colors.white.withValues(alpha: 0.055)
+      ..color = Colors.white.withValues(alpha: 0.10)
       ..strokeWidth = 1;
     for (double x = 0; x <= size.width; x += 32) {
       canvas.drawLine(Offset(x, 0), Offset(x, size.height), gridPaint);
@@ -1529,10 +1529,11 @@ class _PerimeterPainter extends CustomPainter {
 
     final screen = _project(points, size);
     final linePaint = Paint()
-      ..color = const Color(0xFF38F6A7)
-      ..strokeWidth = 2.5
+      ..color = Colors.white
+      ..strokeWidth = 3.0
       ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round;
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
 
     if (screen.length >= 2) {
       final path = Path()..moveTo(screen.first.dx, screen.first.dy);
@@ -1543,46 +1544,70 @@ class _PerimeterPainter extends CustomPainter {
       canvas.drawPath(path, linePaint);
     }
 
+    final outlinePaint = Paint()..color = Colors.black;
     final pointPaint = Paint()..color = Colors.white;
-    for (final p in screen) {
-      canvas.drawCircle(p, 4.0, pointPaint);
+    for (var i = 0; i < screen.length; i++) {
+      final p = screen[i];
+      canvas.drawCircle(p, 9.5, outlinePaint);
+      canvas.drawCircle(p, 7.5, pointPaint);
+      _drawLabel(canvas, p + const Offset(10, -21), '${i + 1}');
     }
-    canvas.drawCircle(
-        screen.first, 6.0, Paint()..color = const Color(0xFF7AA2FF));
   }
 
   List<Offset> _project(List<GpsPerimeterPoint> pts, Size size) {
-    final lat0 = pts.map((p) => p.lat).reduce((a, b) => a + b) / pts.length;
-    final lon0 = pts.map((p) => p.lon).reduce((a, b) => a + b) / pts.length;
-    const latScale = 111320.0;
-    final lonScale = 111320.0 * math.cos(lat0 * math.pi / 180.0);
+    double minLat = pts.first.lat;
+    double maxLat = pts.first.lat;
+    double minLon = pts.first.lon;
+    double maxLon = pts.first.lon;
 
-    final local = pts
-        .map((p) =>
-            Offset((p.lon - lon0) * lonScale, -(p.lat - lat0) * latScale))
-        .toList();
-
-    double minX = local.first.dx;
-    double maxX = local.first.dx;
-    double minY = local.first.dy;
-    double maxY = local.first.dy;
-    for (final p in local) {
-      minX = math.min(minX, p.dx);
-      maxX = math.max(maxX, p.dx);
-      minY = math.min(minY, p.dy);
-      maxY = math.max(maxY, p.dy);
+    for (final p in pts) {
+      minLat = math.min(minLat, p.lat);
+      maxLat = math.max(maxLat, p.lat);
+      minLon = math.min(minLon, p.lon);
+      maxLon = math.max(maxLon, p.lon);
     }
 
-    final worldW = math.max(1.0, maxX - minX);
-    final worldH = math.max(1.0, maxY - minY);
-    final scale = math.min(
-      (size.width - 34) / worldW,
-      (size.height - 34) / worldH,
-    );
-    final center = size.center(Offset.zero);
-    final worldCenter = Offset((minX + maxX) / 2, (minY + maxY) / 2);
+    const minRange = 0.00001;
+    if ((maxLat - minLat).abs() < minRange) {
+      final center = (minLat + maxLat) / 2;
+      minLat = center - minRange / 2;
+      maxLat = center + minRange / 2;
+    }
+    if ((maxLon - minLon).abs() < minRange) {
+      final center = (minLon + maxLon) / 2;
+      minLon = center - minRange / 2;
+      maxLon = center + minRange / 2;
+    }
 
-    return local.map((p) => center + (p - worldCenter) * scale).toList();
+    final latPad = (maxLat - minLat) * 0.20;
+    final lonPad = (maxLon - minLon) * 0.20;
+    minLat -= latPad;
+    maxLat += latPad;
+    minLon -= lonPad;
+    maxLon += lonPad;
+
+    final drawW = math.max(1.0, size.width);
+    final drawH = math.max(1.0, size.height);
+    return pts.map((p) {
+      final x = ((p.lon - minLon) / (maxLon - minLon)) * drawW;
+      final y = drawH - ((p.lat - minLat) / (maxLat - minLat)) * drawH;
+      return Offset(x.clamp(12.0, drawW - 12.0), y.clamp(12.0, drawH - 12.0));
+    }).toList();
+  }
+
+  void _drawLabel(Canvas canvas, Offset offset, String text) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 13,
+          fontWeight: FontWeight.w900,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    painter.paint(canvas, offset);
   }
 
   void _drawCenterText(Canvas canvas, Size size, String text) {
