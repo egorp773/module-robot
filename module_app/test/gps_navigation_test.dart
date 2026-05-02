@@ -76,4 +76,29 @@ void main() {
     expect(result.command, NavigationCommand.arrived);
     expect(result.distanceMeters, lessThan(0.3));
   });
+
+  test('motor mapper keeps route commands conservative', () {
+    const mapper = NavigationMotorMapper();
+
+    expect(
+      mapper.toMotorCommand(NavigationCommand.forward).protocol,
+      'M,22,22',
+    );
+    expect(
+      mapper.toMotorCommand(NavigationCommand.turnLeft).protocol,
+      'M,-18,18',
+    );
+    expect(
+      mapper.toMotorCommand(NavigationCommand.turnRight).protocol,
+      'M,18,-18',
+    );
+    expect(
+      mapper.toMotorCommand(NavigationCommand.stop).protocol,
+      'STOP',
+    );
+    expect(
+      mapper.toMotorCommand(NavigationCommand.arrived).protocol,
+      'STOP',
+    );
+  });
 }

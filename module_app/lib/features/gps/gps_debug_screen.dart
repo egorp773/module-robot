@@ -52,6 +52,13 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   int? _navigationTargetIndex;
   NavigationCommand? _lastLoggedNavigationCommand;
   DateTime? _lastNavigationLogAt;
+  Timer? _motorDriveTimer;
+  bool _motorsEnabled = false;
+  bool _routeRunning = false;
+  int _forwardPercent = 22;
+  int _turnPercent = 18;
+  MotorDriveCommand? _lastSentMotorCommand;
+  DateTime? _lastMotorLogAt;
   final TextEditingController _nameCtrl = TextEditingController();
   final TextEditingController _hostCtrl = TextEditingController();
   final FocusNode _hostFocus = FocusNode();
@@ -73,6 +80,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   @override
   void dispose() {
     _recordTimer?.cancel();
+    _motorDriveTimer?.cancel();
     _nameCtrl.dispose();
     _hostCtrl.dispose();
     _hostFocus.dispose();
@@ -115,10 +123,19 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       originLat: navigationOrigin?.lat,
       originLon: navigationOrigin?.lon,
     );
+    final motorPreview = const NavigationMotorMapper().toMotorCommand(
+      navigation.command,
+      forwardPercent: _forwardPercent,
+      turnPercent: _turnPercent,
+    );
+    final routeLabel = _navigationTargetIndex == null
+        ? 'ручная цель'
+        : 'точка ${_navigationTargetIndex! + 1}/${navigationPoints.length}';
     final mapSpanM = _mapSpanM(currentPoint);
     ref.listen<WifiConnectionState>(wifiConnectionProvider, (_, next) {
       _appendTrail(next);
       _maybeLogNavigation(next);
+      _handleAutoRouteAdvance(next);
     });
     if (!_hostFocus.hasFocus && _hostCtrl.text != robotHost) {
       _hostCtrl.text = robotHost;
@@ -342,10 +359,21 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                       origin: navigationOrigin,
                       target: _navigationTarget,
                       targetIndex: _navigationTargetIndex,
+                      routeLabel: routeLabel,
                       routePoints: navigationPoints,
                       result: navigation,
+                      motorPreview: motorPreview,
+                      motorsEnabled: _motorsEnabled,
+                      routeRunning: _routeRunning,
+                      forwardPercent: _forwardPercent,
+                      turnPercent: _turnPercent,
                       headingDegrees: navigationHeading,
                       headingSource: navigationHeadingSource,
+                      onToggleMotors: _toggleMotors,
+                      onStartRoute: navigationPoints.isEmpty
+                          ? null
+                          : () => _startRoute(navigationPoints),
+                      onPauseRoute: _pauseRoute,
                       onSetCurrentTarget: currentPoint == null
                           ? null
                           : () => _setNavigationTargetToCurrent(wifi),
@@ -358,6 +386,10 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                       onClearTarget: _navigationTarget == null
                           ? null
                           : _clearNavigationTarget,
+                      onForwardChanged: (value) =>
+                          setState(() => _forwardPercent = value.round()),
+                      onTurnChanged: (value) =>
+                          setState(() => _turnPercent = value.round()),
                     ),
                   ),
                   const SizedBox(height: 10),
@@ -403,6 +435,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                               painter: _SiteMapPainter(
                                 points: visibleMapPoints,
                                 current: currentPoint,
+                                target: _navigationTarget,
+                                targetIndex: _navigationTargetIndex,
                               ),
                               child: const SizedBox.expand(),
                             ),
@@ -721,8 +755,232 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     _setNavigationTargetByIndex(nextIndex);
   }
 
-  void _clearNavigationTarget() {
+  void _startRoute(List<GpsPerimeterPoint> routePoints) {
+    if (routePoints.isEmpty) {
+      setState(() => _notice = 'Нет точек маршрута.');
+      return;
+    }
+    final current = _currentPoint(ref.read(wifiConnectionProvider));
     setState(() {
+      _navigationOrigin = current ?? routePoints.first;
+      _navigationTarget = routePoints.first;
+      _navigationTargetIndex = 0;
+      _routeRunning = true;
+      _lastLoggedNavigationCommand = null;
+      _notice = 'Маршрут выбран: точка 1/${routePoints.length}.';
+    });
+    _maybeLogNavigation(ref.read(wifiConnectionProvider), force: true);
+  }
+
+  void _pauseRoute() {
+    _sendStopIfConnected();
+    _motorDriveTimer?.cancel();
+    _motorDriveTimer = null;
+    setState(() {
+      _motorsEnabled = false;
+      _routeRunning = false;
+      _notice = 'Маршрут остановлен, моторы выключены.';
+    });
+  }
+
+  void _toggleMotors() {
+    if (_motorsEnabled) {
+      _sendStopIfConnected();
+      _motorDriveTimer?.cancel();
+      _motorDriveTimer = null;
+      setState(() {
+        _motorsEnabled = false;
+        _notice = 'Моторы выключены.';
+      });
+      return;
+    }
+
+    final wifi = ref.read(wifiConnectionProvider);
+    if (!wifi.isConnected) {
+      setState(() => _notice = 'Нет WebSocket-связи с роботом.');
+      return;
+    }
+    if (_navigationTarget == null) {
+      final routePoints = _currentRoutePoints();
+      if (routePoints.isEmpty) {
+        setState(() => _notice = 'Сначала выбери цель или маршрут.');
+        return;
+      }
+      _startRoute(routePoints);
+    }
+
+    setState(() {
+      _motorsEnabled = true;
+      _routeRunning = _navigationTargetIndex != null || _routeRunning;
+      _notice = 'Моторы включены. Команды M/STOP отправляются каждые 150 мс.';
+    });
+    _startMotorTimer();
+  }
+
+  void _startMotorTimer() {
+    _motorDriveTimer?.cancel();
+    _sendMotorTick();
+    _motorDriveTimer = Timer.periodic(
+      const Duration(milliseconds: 150),
+      (_) => _sendMotorTick(),
+    );
+  }
+
+  void _sendMotorTick() {
+    if (!_motorsEnabled) return;
+    final wifi = ref.read(wifiConnectionProvider);
+    if (!wifi.isConnected) {
+      _motorDriveTimer?.cancel();
+      _motorDriveTimer = null;
+      if (mounted) {
+        setState(() {
+          _motorsEnabled = false;
+          _notice = 'Связь потеряна, моторы выключены.';
+        });
+      }
+      return;
+    }
+
+    final target = _navigationTarget;
+    if (target == null) {
+      _sendStopIfConnected();
+      return;
+    }
+
+    final current = _currentPoint(wifi);
+    final origin = _navigationOrigin ?? current ?? target;
+    final result = const GpsNavigationController().evaluate(
+      currentLat: wifi.gpsLat,
+      currentLon: wifi.gpsLon,
+      targetLat: target.lat,
+      targetLon: target.lon,
+      headingDegrees: wifi.imuYaw ?? wifi.gpsHeading,
+      rtkFixed: wifi.gpsCarrier == 'fixed',
+      rtcmAgeMs: wifi.rtcmAgeMs,
+      hAccMm: wifi.gpsAccuracy,
+      originLat: origin.lat,
+      originLon: origin.lon,
+    );
+
+    if (result.command == NavigationCommand.arrived) {
+      final advanced = _advanceRouteAfterArrival();
+      _sendStopIfConnected();
+      if (advanced) return;
+    }
+
+    final motorCommand = const NavigationMotorMapper().toMotorCommand(
+      result.command,
+      forwardPercent: _forwardPercent,
+      turnPercent: _turnPercent,
+    );
+    final notifier = ref.read(wifiConnectionProvider.notifier);
+    if (motorCommand.isStop) {
+      notifier.sendStop();
+    } else {
+      notifier.sendMove(motorCommand.left, motorCommand.right);
+    }
+    _logMotorCommand(motorCommand, result);
+  }
+
+  void _sendStopIfConnected() {
+    if (ref.read(wifiConnectionProvider).isConnected) {
+      ref.read(wifiConnectionProvider.notifier).sendStop();
+    }
+    _lastSentMotorCommand = null;
+  }
+
+  void _logMotorCommand(
+    MotorDriveCommand motorCommand,
+    NavigationResult result,
+  ) {
+    final now = DateTime.now();
+    final last = _lastMotorLogAt;
+    final changed = _lastSentMotorCommand?.left != motorCommand.left ||
+        _lastSentMotorCommand?.right != motorCommand.right;
+    final due =
+        last == null || now.difference(last) >= const Duration(seconds: 2);
+    if (!changed && !due) return;
+
+    _lastSentMotorCommand = motorCommand;
+    _lastMotorLogAt = now;
+    final distance = result.distanceMeters?.toStringAsFixed(2) ?? '-';
+    final target = _navigationTargetIndex == null
+        ? 'manual'
+        : '${_navigationTargetIndex! + 1}/${_currentRoutePoints().length}';
+    ref.read(wifiConnectionProvider.notifier).addLocalLog(
+          'MOTOR ${motorCommand.protocol} target=$target dist=${distance}m ${result.reason}',
+        );
+  }
+
+  List<GpsPerimeterPoint> _currentRoutePoints() {
+    return _points.isNotEmpty ? _points : (_activeSaved?.points ?? const []);
+  }
+
+  void _handleAutoRouteAdvance(WifiConnectionState wifi) {
+    if (!_routeRunning || _navigationTarget == null) return;
+    final origin =
+        _navigationOrigin ?? _currentPoint(wifi) ?? _navigationTarget!;
+    final result = const GpsNavigationController().evaluate(
+      currentLat: wifi.gpsLat,
+      currentLon: wifi.gpsLon,
+      targetLat: _navigationTarget!.lat,
+      targetLon: _navigationTarget!.lon,
+      headingDegrees: wifi.imuYaw ?? wifi.gpsHeading,
+      rtkFixed: wifi.gpsCarrier == 'fixed',
+      rtcmAgeMs: wifi.rtcmAgeMs,
+      hAccMm: wifi.gpsAccuracy,
+      originLat: origin.lat,
+      originLon: origin.lon,
+    );
+    if (result.command == NavigationCommand.arrived) {
+      _advanceRouteAfterArrival();
+    }
+  }
+
+  bool _advanceRouteAfterArrival() {
+    if (!_routeRunning || _navigationTargetIndex == null) return false;
+    final routePoints = _currentRoutePoints();
+    final currentIndex = _navigationTargetIndex!;
+    final nextIndex = currentIndex + 1;
+    if (nextIndex >= routePoints.length) {
+      _motorDriveTimer?.cancel();
+      _motorDriveTimer = null;
+      if (mounted) {
+        setState(() {
+          _routeRunning = false;
+          _motorsEnabled = false;
+          _navigationTargetIndex = null;
+          _notice = 'Маршрут завершен, моторы остановлены.';
+        });
+      }
+      ref.read(wifiConnectionProvider.notifier).addLocalLog(
+            'NAV route complete points=${routePoints.length}',
+          );
+      return true;
+    }
+
+    if (mounted) {
+      setState(() {
+        _navigationTarget = routePoints[nextIndex];
+        _navigationTargetIndex = nextIndex;
+        _lastLoggedNavigationCommand = null;
+        _notice =
+            'Следующая цель: точка ${nextIndex + 1}/${routePoints.length}.';
+      });
+    }
+    ref.read(wifiConnectionProvider.notifier).addLocalLog(
+          'NAV next target ${nextIndex + 1}/${routePoints.length}',
+        );
+    return true;
+  }
+
+  void _clearNavigationTarget() {
+    _sendStopIfConnected();
+    _motorDriveTimer?.cancel();
+    _motorDriveTimer = null;
+    setState(() {
+      _motorsEnabled = false;
+      _routeRunning = false;
       _navigationTarget = null;
       _navigationTargetIndex = null;
       _lastLoggedNavigationCommand = null;
@@ -857,9 +1115,14 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
 
   void _clearPoints() {
     _recordTimer?.cancel();
+    _motorDriveTimer?.cancel();
     _recordTimer = null;
+    _motorDriveTimer = null;
+    _sendStopIfConnected();
     setState(() {
       _recording = false;
+      _motorsEnabled = false;
+      _routeRunning = false;
       _points.clear();
       _activeSaved = null;
       _navigationTarget = null;
@@ -1398,28 +1661,50 @@ class _NavigationPanel extends StatelessWidget {
   final GpsPerimeterPoint? origin;
   final GpsPerimeterPoint? target;
   final int? targetIndex;
+  final String routeLabel;
   final List<GpsPerimeterPoint> routePoints;
   final NavigationResult result;
+  final MotorDriveCommand motorPreview;
+  final bool motorsEnabled;
+  final bool routeRunning;
+  final int forwardPercent;
+  final int turnPercent;
   final double? headingDegrees;
   final String headingSource;
+  final VoidCallback onToggleMotors;
+  final VoidCallback? onStartRoute;
+  final VoidCallback onPauseRoute;
   final VoidCallback? onSetCurrentTarget;
   final ValueChanged<int>? onSelectRoutePoint;
   final VoidCallback? onNextRoutePoint;
   final VoidCallback? onClearTarget;
+  final ValueChanged<double> onForwardChanged;
+  final ValueChanged<double> onTurnChanged;
 
   const _NavigationPanel({
     required this.current,
     required this.origin,
     required this.target,
     required this.targetIndex,
+    required this.routeLabel,
     required this.routePoints,
     required this.result,
+    required this.motorPreview,
+    required this.motorsEnabled,
+    required this.routeRunning,
+    required this.forwardPercent,
+    required this.turnPercent,
     required this.headingDegrees,
     required this.headingSource,
+    required this.onToggleMotors,
+    required this.onStartRoute,
+    required this.onPauseRoute,
     required this.onSetCurrentTarget,
     required this.onSelectRoutePoint,
     required this.onNextRoutePoint,
     required this.onClearTarget,
+    required this.onForwardChanged,
+    required this.onTurnChanged,
   });
 
   @override
@@ -1446,6 +1731,14 @@ class _NavigationPanel extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 10),
+        _RouteHeader(
+          routeLabel: routeLabel,
+          targetIndex: targetIndex,
+          total: routePoints.length,
+          routeRunning: routeRunning,
+          motorsEnabled: motorsEnabled,
+        ),
+        const SizedBox(height: 10),
         Row(
           children: [
             Expanded(
@@ -1468,6 +1761,25 @@ class _NavigationPanel extends StatelessWidget {
                 good: result.headingErrorDegrees != null &&
                     result.headingErrorDegrees!.abs() <=
                         GpsNavigationController.turnThresholdDeg,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: _Metric(
+                label: 'Моторы',
+                value: motorsEnabled ? 'ВКЛ' : 'ВЫКЛ',
+                good: motorsEnabled,
+              ),
+            ),
+            Expanded(
+              child: _Metric(
+                label: 'M-команда',
+                value: motorPreview.protocol,
+                good: motorsEnabled && !motorPreview.isStop,
               ),
             ),
           ],
@@ -1507,6 +1819,28 @@ class _NavigationPanel extends StatelessWidget {
           runSpacing: 8,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
+            _Action(
+              icon: motorsEnabled
+                  ? Icons.power_settings_new_rounded
+                  : Icons.power_rounded,
+              label: motorsEnabled ? 'Моторы выкл' : 'Моторы вкл',
+              color: motorsEnabled
+                  ? const Color(0xFFFF4D6D)
+                  : const Color(0xFF38F6A7),
+              onTap: onToggleMotors,
+            ),
+            _Action(
+              icon: Icons.route_rounded,
+              label: 'Старт маршрут',
+              color: const Color(0xFF7AA2FF),
+              onTap: onStartRoute,
+            ),
+            _Action(
+              icon: Icons.stop_circle_rounded,
+              label: 'Стоп маршрут',
+              color: const Color(0xFFFFD166),
+              onTap: onPauseRoute,
+            ),
             _Action(
               icon: Icons.my_location_rounded,
               label: 'Цель = я',
@@ -1561,9 +1895,24 @@ class _NavigationPanel extends StatelessWidget {
               ),
           ],
         ),
+        const SizedBox(height: 12),
+        _MotorSlider(
+          label: 'Скорость вперед',
+          value: forwardPercent.toDouble(),
+          min: 8,
+          max: 35,
+          onChanged: onForwardChanged,
+        ),
+        _MotorSlider(
+          label: 'Скорость поворота',
+          value: turnPercent.toDouble(),
+          min: 8,
+          max: 35,
+          onChanged: onTurnChanged,
+        ),
         const SizedBox(height: 8),
         Text(
-          'Моторы не управляются. Это сухой расчет для GPS + BNO085: команда только показывается на экране и пишется в журнал.',
+          'Курс берется с BNO085, если есть IMU yaw; иначе используется GPS heading. Моторы двигаются только когда включен тумблер "Моторы вкл".',
           style: TextStyle(
             color: Colors.white.withValues(alpha: 0.58),
             fontSize: 12,
@@ -1638,6 +1987,146 @@ class _CommandBadge extends StatelessWidget {
           fontSize: 12,
         ),
       ),
+    );
+  }
+}
+
+class _RouteHeader extends StatelessWidget {
+  final String routeLabel;
+  final int? targetIndex;
+  final int total;
+  final bool routeRunning;
+  final bool motorsEnabled;
+
+  const _RouteHeader({
+    required this.routeLabel,
+    required this.targetIndex,
+    required this.total,
+    required this.routeRunning,
+    required this.motorsEnabled,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = targetIndex == null || total == 0
+        ? 0.0
+        : ((targetIndex! + 1) / total).clamp(0.0, 1.0);
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(
+                motorsEnabled
+                    ? Icons.play_circle_fill_rounded
+                    : Icons.pause_circle_filled_rounded,
+                color: motorsEnabled
+                    ? const Color(0xFF38F6A7)
+                    : const Color(0xFFFFD166),
+                size: 20,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  routeRunning
+                      ? 'Едет к цели: $routeLabel'
+                      : 'Цель: $routeLabel',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w900,
+                    fontSize: 14,
+                  ),
+                ),
+              ),
+              Text(
+                total == 0 ? '0/0' : '${(targetIndex ?? -1) + 1}/$total',
+                style: TextStyle(
+                  color: Colors.white.withValues(alpha: 0.70),
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: LinearProgressIndicator(
+              minHeight: 8,
+              value: total == 0 ? 0 : progress,
+              backgroundColor: Colors.black.withValues(alpha: 0.30),
+              valueColor: AlwaysStoppedAnimation<Color>(
+                motorsEnabled
+                    ? const Color(0xFF38F6A7)
+                    : const Color(0xFF7AA2FF),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MotorSlider extends StatelessWidget {
+  final String label;
+  final double value;
+  final double min;
+  final double max;
+  final ValueChanged<double> onChanged;
+
+  const _MotorSlider({
+    required this.label,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 118,
+          child: Text(
+            label,
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.62),
+              fontWeight: FontWeight.w800,
+              fontSize: 12,
+            ),
+          ),
+        ),
+        Expanded(
+          child: Slider(
+            value: value.clamp(min, max),
+            min: min,
+            max: max,
+            divisions: (max - min).round(),
+            label: '${value.round()}%',
+            onChanged: onChanged,
+          ),
+        ),
+        SizedBox(
+          width: 42,
+          child: Text(
+            '${value.round()}%',
+            textAlign: TextAlign.right,
+            style: const TextStyle(
+              fontWeight: FontWeight.w900,
+              fontSize: 12,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -1751,10 +2240,14 @@ class _Notice extends StatelessWidget {
 class _SiteMapPainter extends CustomPainter {
   final List<GpsPerimeterPoint> points;
   final GpsPerimeterPoint? current;
+  final GpsPerimeterPoint? target;
+  final int? targetIndex;
 
   const _SiteMapPainter({
     required this.points,
     required this.current,
+    required this.target,
+    required this.targetIndex,
   });
 
   @override
@@ -1774,7 +2267,17 @@ class _SiteMapPainter extends CustomPainter {
       return;
     }
 
-    final projected = _projectSimple(display, size);
+    final projectionSource = <GpsPerimeterPoint>[...display];
+    final currentPointIndex =
+        currentPoint == null ? null : projectionSource.length;
+    if (currentPoint != null) projectionSource.add(currentPoint);
+    final targetPoint = target;
+    final targetPointIndex =
+        targetPoint == null ? null : projectionSource.length;
+    if (targetPoint != null) projectionSource.add(targetPoint);
+
+    final projectedAll = _projectSimple(projectionSource, size);
+    final projected = projectedAll.take(display.length).toList();
 
     if (projected.length >= 2) {
       _drawPath(
@@ -1802,10 +2305,31 @@ class _SiteMapPainter extends CustomPainter {
     }
 
     if (currentPoint != null) {
-      final currentProjected = _projectSimple([currentPoint, ...display], size);
-      final currentOffset = currentProjected.first;
+      final currentOffset = projectedAll[currentPointIndex!];
       canvas.drawCircle(currentOffset, 13, Paint()..color = Colors.red);
       canvas.drawCircle(currentOffset, 8, Paint()..color = Colors.white);
+    }
+
+    if (targetPoint != null) {
+      final targetOffset = projectedAll[targetPointIndex!];
+      canvas.drawCircle(
+        targetOffset,
+        16,
+        Paint()..color = const Color(0xFF38F6A7),
+      );
+      canvas.drawCircle(targetOffset, 10, Paint()..color = Colors.black);
+      canvas.drawCircle(
+        targetOffset,
+        7,
+        Paint()..color = const Color(0xFF38F6A7),
+      );
+      _drawLabel(
+        canvas,
+        targetOffset + const Offset(14, 12),
+        targetIndex == null ? 'TARGET' : 'TARGET ${targetIndex! + 1}',
+        const Color(0xFF38F6A7),
+        13,
+      );
     }
 
     _drawLabel(

@@ -138,6 +138,60 @@ class NavigationResult {
   );
 }
 
+class MotorDriveCommand {
+  final int left;
+  final int right;
+  final String label;
+
+  const MotorDriveCommand({
+    required this.left,
+    required this.right,
+    required this.label,
+  });
+
+  bool get isStop => left == 0 && right == 0;
+
+  String get protocol => isStop ? 'STOP' : 'M,$left,$right';
+}
+
+class NavigationMotorMapper {
+  const NavigationMotorMapper();
+
+  MotorDriveCommand toMotorCommand(
+    NavigationCommand command, {
+    int forwardPercent = 22,
+    int turnPercent = 18,
+  }) {
+    final forward = forwardPercent.clamp(0, 45);
+    final turn = turnPercent.clamp(0, 40);
+    switch (command) {
+      case NavigationCommand.forward:
+        return MotorDriveCommand(
+          left: forward,
+          right: forward,
+          label: 'ехать вперед',
+        );
+      case NavigationCommand.turnLeft:
+        return MotorDriveCommand(
+          left: -turn,
+          right: turn,
+          label: 'поворот влево',
+        );
+      case NavigationCommand.turnRight:
+        return MotorDriveCommand(
+          left: turn,
+          right: -turn,
+          label: 'поворот вправо',
+        );
+      case NavigationCommand.stop:
+        return const MotorDriveCommand(left: 0, right: 0, label: 'стоп');
+      case NavigationCommand.arrived:
+        return const MotorDriveCommand(
+            left: 0, right: 0, label: 'точка достигнута');
+    }
+  }
+}
+
 class GpsNavigationController {
   static const double maxRtcmAgeMs = 1500;
   static const int maxHorizontalAccuracyMm = 50;
