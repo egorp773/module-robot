@@ -287,6 +287,8 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   Timer? _healthTimer;
   Timer? _reconnectTimer;
   DateTime? _lastRxAt;
+  DateTime? _lastTelemetryLogAt;
+  DateTime? _lastGpsDebugAt;
   bool _autoReconnectEnabled = false;
   int _reconnectAttempt = 0;
 
@@ -322,6 +324,38 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     next.add(line);
     if (next.length > 200) next.removeRange(0, next.length - 200);
     state = state.copyWith(rxLog: next);
+  }
+
+  bool _isHighRateTelemetry(String msg) {
+    return msg.startsWith("GPS,") ||
+        msg.startsWith("GPSDBG,") ||
+        msg.startsWith("RTCM,") ||
+        msg.startsWith("IMU,");
+  }
+
+  void _logIncoming(String msg) {
+    if (_isHighRateTelemetry(msg)) return;
+    _log("← $msg");
+  }
+
+  void _maybeLogTelemetrySummary() {
+    final now = DateTime.now();
+    final last = _lastTelemetryLogAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 1)) {
+      return;
+    }
+    _lastTelemetryLogAt = now;
+
+    final carrier = state.gpsCarrier ?? '-';
+    final hAcc = state.gpsAccuracy == null ? '-' : '${state.gpsAccuracy}mm';
+    final rtcmAge = state.rtcmAgeMs == null ? '-' : '${state.rtcmAgeMs}ms';
+    final sv = state.gpsSatellites?.toString() ?? '-';
+    _log("← telemetry rtk=$carrier hAcc=$hAcc rtcm=$rtcmAge sv=$sv");
+  }
+
+  bool _hasFreshGpsDebug(DateTime now) {
+    final last = _lastGpsDebugAt;
+    return last != null && now.difference(last) < const Duration(seconds: 2);
   }
 
   void _startHealthTimer() {
@@ -481,6 +515,8 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     if (state.isConnecting || state.isConnected) return;
 
     _autoReconnectEnabled = true;
+    _lastTelemetryLogAt = null;
+    _lastGpsDebugAt = null;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     state = state.copyWith(isConnecting: true, error: null);
@@ -548,7 +584,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         (msg) {
           _lastRxAt = DateTime.now();
           final msgStr = msg.toString().trim();
-          _log("← $msgStr");
+          _logIncoming(msgStr);
           final upperMsg = msgStr.toUpperCase();
 
           // Парсинг BAT_PCT,<int>
@@ -580,15 +616,17 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                 final fixType = int.tryParse(parts[4]);
                 final hAcc = int.tryParse(parts[5]);
 
-                if (lat != null && lon != null) {
+                final now = DateTime.now();
+                if (lat != null && lon != null && !_hasFreshGpsDebug(now)) {
                   state = state.copyWith(
                     gpsLat: lat,
                     gpsLon: lon,
                     gpsHeading: heading,
                     gpsFixType: fixType,
                     gpsAccuracy: hAcc,
-                    gpsReceivedAt: DateTime.now(),
+                    gpsReceivedAt: now,
                   );
+                  _maybeLogTelemetrySummary();
                 }
               }
             } catch (e) {
@@ -618,6 +656,8 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                 final ageMs = int.tryParse(parts[13]);
 
                 if (lat != null && lon != null) {
+                  final now = DateTime.now();
+                  _lastGpsDebugAt = now;
                   state = state.copyWith(
                     gpsLat: lat,
                     gpsLon: lon,
@@ -632,8 +672,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                     gpsSpeedMps: speedMps,
                     gpsPDop: pDop,
                     gpsAgeMs: ageMs,
-                    gpsReceivedAt: DateTime.now(),
+                    gpsReceivedAt: now,
                   );
+                  _maybeLogTelemetrySummary();
                 }
               }
             } catch (e) {
@@ -652,6 +693,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                   rtcmBytes: bytes,
                   rtcmAgeMs: ageMs,
                 );
+                _maybeLogTelemetrySummary();
               }
             } catch (e) {
               _log("× Failed to parse RTCM: $e");
