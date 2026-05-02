@@ -326,6 +326,10 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     state = state.copyWith(rxLog: next);
   }
 
+  void addLocalLog(String line) {
+    _log(line);
+  }
+
   bool _isHighRateTelemetry(String msg) {
     return msg.startsWith("GPS,") ||
         msg.startsWith("GPSDBG,") ||

@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../core/gps_navigation.dart';
 import '../../core/gps_perimeter_storage.dart';
 import '../../core/wifi_connection.dart';
 
@@ -46,6 +47,11 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   final List<GpsPerimeterPoint> _points = [];
   final List<GpsPerimeterPoint> _trail = [];
   GpsPerimeter? _activeSaved;
+  GpsPerimeterPoint? _navigationOrigin;
+  GpsPerimeterPoint? _navigationTarget;
+  int? _navigationTargetIndex;
+  NavigationCommand? _lastLoggedNavigationCommand;
+  DateTime? _lastNavigationLogAt;
   final TextEditingController _nameCtrl = TextEditingController();
   final TextEditingController _hostCtrl = TextEditingController();
   final FocusNode _hostFocus = FocusNode();
@@ -92,9 +98,27 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       track: _trail,
       currentPosition: currentPoint,
     );
+    final navigationPoints = _points.isNotEmpty ? _points : openedPoints;
+    final navigationOrigin =
+        _navigationOrigin ?? currentPoint ?? _firstPoint(navigationPoints);
+    final navigationHeading = wifi.imuYaw ?? wifi.gpsHeading;
+    final navigationHeadingSource = wifi.imuYaw != null ? 'BNO085' : 'GPS';
+    final navigation = const GpsNavigationController().evaluate(
+      currentLat: wifi.gpsLat,
+      currentLon: wifi.gpsLon,
+      targetLat: _navigationTarget?.lat,
+      targetLon: _navigationTarget?.lon,
+      headingDegrees: navigationHeading,
+      rtkFixed: wifi.gpsCarrier == 'fixed',
+      rtcmAgeMs: wifi.rtcmAgeMs,
+      hAccMm: wifi.gpsAccuracy,
+      originLat: navigationOrigin?.lat,
+      originLon: navigationOrigin?.lon,
+    );
     final mapSpanM = _mapSpanM(currentPoint);
     ref.listen<WifiConnectionState>(wifiConnectionProvider, (_, next) {
       _appendTrail(next);
+      _maybeLogNavigation(next);
     });
     if (!_hostFocus.hasFocus && _hostCtrl.text != robotHost) {
       _hostCtrl.text = robotHost;
@@ -309,6 +333,31 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                               : '${wifi.gpsHeading!.toStringAsFixed(1)} град',
                         ),
                       ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  _Panel(
+                    child: _NavigationPanel(
+                      current: currentPoint,
+                      origin: navigationOrigin,
+                      target: _navigationTarget,
+                      targetIndex: _navigationTargetIndex,
+                      routePoints: navigationPoints,
+                      result: navigation,
+                      headingDegrees: navigationHeading,
+                      headingSource: navigationHeadingSource,
+                      onSetCurrentTarget: currentPoint == null
+                          ? null
+                          : () => _setNavigationTargetToCurrent(wifi),
+                      onSelectRoutePoint: navigationPoints.isEmpty
+                          ? null
+                          : _setNavigationTargetByIndex,
+                      onNextRoutePoint: navigationPoints.isEmpty
+                          ? null
+                          : _setNextNavigationTarget,
+                      onClearTarget: _navigationTarget == null
+                          ? null
+                          : _clearNavigationTarget,
                     ),
                   ),
                   const SizedBox(height: 10),
@@ -629,6 +678,93 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     return math.max(10.0, math.max(maxX - minX, maxY - minY));
   }
 
+  static GpsPerimeterPoint? _firstPoint(List<GpsPerimeterPoint> points) {
+    return points.isEmpty ? null : points.first;
+  }
+
+  void _setNavigationTargetToCurrent(WifiConnectionState wifi) {
+    final point = _currentPoint(wifi);
+    if (point == null) {
+      setState(() => _notice = 'Нет текущей GPS-позиции для цели.');
+      return;
+    }
+    setState(() {
+      _navigationOrigin ??= point;
+      _navigationTarget = point;
+      _navigationTargetIndex = null;
+      _notice = 'Цель навигации: текущая позиция.';
+    });
+    _maybeLogNavigation(wifi, force: true);
+  }
+
+  void _setNavigationTargetByIndex(int index) {
+    final routePoints =
+        _points.isNotEmpty ? _points : (_activeSaved?.points ?? const []);
+    if (index < 0 || index >= routePoints.length) return;
+    final current = _currentPoint(ref.read(wifiConnectionProvider));
+    setState(() {
+      _navigationOrigin ??= current ?? routePoints.first;
+      _navigationTarget = routePoints[index];
+      _navigationTargetIndex = index;
+      _notice = 'Цель навигации: точка ${index + 1}.';
+    });
+    _maybeLogNavigation(ref.read(wifiConnectionProvider), force: true);
+  }
+
+  void _setNextNavigationTarget() {
+    final routePoints =
+        _points.isNotEmpty ? _points : (_activeSaved?.points ?? const []);
+    if (routePoints.isEmpty) return;
+    final nextIndex = _navigationTargetIndex == null
+        ? 0
+        : (_navigationTargetIndex! + 1) % routePoints.length;
+    _setNavigationTargetByIndex(nextIndex);
+  }
+
+  void _clearNavigationTarget() {
+    setState(() {
+      _navigationTarget = null;
+      _navigationTargetIndex = null;
+      _lastLoggedNavigationCommand = null;
+      _notice = 'Цель навигации очищена.';
+    });
+  }
+
+  void _maybeLogNavigation(WifiConnectionState wifi, {bool force = false}) {
+    final target = _navigationTarget;
+    if (target == null) return;
+    final current = _currentPoint(wifi);
+    final origin = _navigationOrigin ?? current ?? target;
+    final heading = wifi.imuYaw ?? wifi.gpsHeading;
+    final result = const GpsNavigationController().evaluate(
+      currentLat: wifi.gpsLat,
+      currentLon: wifi.gpsLon,
+      targetLat: target.lat,
+      targetLon: target.lon,
+      headingDegrees: heading,
+      rtkFixed: wifi.gpsCarrier == 'fixed',
+      rtcmAgeMs: wifi.rtcmAgeMs,
+      hAccMm: wifi.gpsAccuracy,
+      originLat: origin.lat,
+      originLon: origin.lon,
+    );
+
+    final now = DateTime.now();
+    final changed = result.command != _lastLoggedNavigationCommand;
+    final last = _lastNavigationLogAt;
+    final due =
+        last == null || now.difference(last) >= const Duration(seconds: 2);
+    if (!force && !changed && !due) return;
+
+    _lastLoggedNavigationCommand = result.command;
+    _lastNavigationLogAt = now;
+    final distance = result.distanceMeters?.toStringAsFixed(2) ?? '-';
+    final error = result.headingErrorDegrees?.toStringAsFixed(1) ?? '-';
+    ref.read(wifiConnectionProvider.notifier).addLocalLog(
+          'NAV dry ${result.command.wireName} dist=${distance}m err=${error}deg ${result.reason}',
+        );
+  }
+
   void _toggleRecording(WifiConnectionState wifi) {
     if (_recording) {
       _recordTimer?.cancel();
@@ -726,6 +862,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _recording = false;
       _points.clear();
       _activeSaved = null;
+      _navigationTarget = null;
+      _navigationTargetIndex = null;
       _notice = 'Текущий периметр очищен.';
     });
   }
@@ -1249,6 +1387,255 @@ class _MapDebugInfo extends StatelessWidget {
             Text('track points: $trackPoints'),
             Text('current position: $position'),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _NavigationPanel extends StatelessWidget {
+  final GpsPerimeterPoint? current;
+  final GpsPerimeterPoint? origin;
+  final GpsPerimeterPoint? target;
+  final int? targetIndex;
+  final List<GpsPerimeterPoint> routePoints;
+  final NavigationResult result;
+  final double? headingDegrees;
+  final String headingSource;
+  final VoidCallback? onSetCurrentTarget;
+  final ValueChanged<int>? onSelectRoutePoint;
+  final VoidCallback? onNextRoutePoint;
+  final VoidCallback? onClearTarget;
+
+  const _NavigationPanel({
+    required this.current,
+    required this.origin,
+    required this.target,
+    required this.targetIndex,
+    required this.routePoints,
+    required this.result,
+    required this.headingDegrees,
+    required this.headingSource,
+    required this.onSetCurrentTarget,
+    required this.onSelectRoutePoint,
+    required this.onNextRoutePoint,
+    required this.onClearTarget,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final commandColor = _commandColor(result.command);
+    final selectedIndex = targetIndex != null &&
+            targetIndex! >= 0 &&
+            targetIndex! < routePoints.length
+        ? targetIndex
+        : null;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                'Навигация к точке',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
+              ),
+            ),
+            _CommandBadge(command: result.command, color: commandColor),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: _Metric(
+                label: 'Дистанция',
+                value: _meters(result.distanceMeters),
+                good: result.command == NavigationCommand.arrived,
+              ),
+            ),
+            Expanded(
+              child: _Metric(
+                label: 'Азимут',
+                value: _degrees(result.bearingDegrees),
+              ),
+            ),
+            Expanded(
+              child: _Metric(
+                label: 'Ошибка',
+                value: _signedDegrees(result.headingErrorDegrees),
+                good: result.headingErrorDegrees != null &&
+                    result.headingErrorDegrees!.abs() <=
+                        GpsNavigationController.turnThresholdDeg,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        _CoordLine(label: 'Команда', value: result.command.wireName),
+        _CoordLine(label: 'Причина', value: result.reason),
+        _CoordLine(
+          label: 'Курс',
+          value: headingDegrees == null
+              ? '-'
+              : '${headingDegrees!.toStringAsFixed(1)} deg ($headingSource)',
+        ),
+        _CoordLine(
+          label: 'Текущая',
+          value: _latLon(current),
+        ),
+        _CoordLine(
+          label: 'Тек. X/Y',
+          value: _xy(result.currentLocal),
+        ),
+        _CoordLine(
+          label: 'Цель',
+          value: _latLon(target),
+        ),
+        _CoordLine(
+          label: 'Цель X/Y',
+          value: _xy(result.targetLocal),
+        ),
+        _CoordLine(
+          label: 'Origin',
+          value: _latLon(origin),
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            _Action(
+              icon: Icons.my_location_rounded,
+              label: 'Цель = я',
+              color: const Color(0xFF7AA2FF),
+              onTap: onSetCurrentTarget,
+            ),
+            _Action(
+              icon: Icons.skip_next_rounded,
+              label: 'Следующая',
+              color: const Color(0xFF38F6A7),
+              onTap: onNextRoutePoint,
+            ),
+            _Action(
+              icon: Icons.close_rounded,
+              label: 'Сброс',
+              color: const Color(0xFFFFD166),
+              onTap: onClearTarget,
+            ),
+            if (routePoints.isNotEmpty && onSelectRoutePoint != null)
+              Container(
+                height: 42,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.07),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.14),
+                  ),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<int>(
+                    value: selectedIndex,
+                    dropdownColor: const Color(0xFF191D24),
+                    hint: const Text('Точка периметра'),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w900,
+                    ),
+                    iconEnabledColor: Colors.white,
+                    items: [
+                      for (var i = 0; i < routePoints.length; i++)
+                        DropdownMenuItem<int>(
+                          value: i,
+                          child: Text('Точка ${i + 1}'),
+                        ),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) onSelectRoutePoint!(value);
+                    },
+                  ),
+                ),
+              ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Моторы не управляются. Это сухой расчет для GPS + BNO085: команда только показывается на экране и пишется в журнал.',
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: 0.58),
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ],
+    );
+  }
+
+  static Color _commandColor(NavigationCommand command) {
+    switch (command) {
+      case NavigationCommand.forward:
+        return const Color(0xFF38F6A7);
+      case NavigationCommand.arrived:
+        return const Color(0xFF7AA2FF);
+      case NavigationCommand.turnLeft:
+      case NavigationCommand.turnRight:
+        return const Color(0xFFFFD166);
+      case NavigationCommand.stop:
+        return const Color(0xFFFF4D6D);
+    }
+  }
+
+  static String _latLon(GpsPerimeterPoint? point) {
+    if (point == null) return '-';
+    return '${point.lat.toStringAsFixed(8)}, ${point.lon.toStringAsFixed(8)}';
+  }
+
+  static String _xy(LocalPointMeters? point) {
+    if (point == null) return '-';
+    return 'X ${point.x.toStringAsFixed(2)} m, Y ${point.y.toStringAsFixed(2)} m';
+  }
+
+  static String _meters(double? value) {
+    if (value == null) return '-';
+    return '${value.toStringAsFixed(2)} m';
+  }
+
+  static String _degrees(double? value) {
+    if (value == null) return '-';
+    return '${value.toStringAsFixed(1)} deg';
+  }
+
+  static String _signedDegrees(double? value) {
+    if (value == null) return '-';
+    final sign = value > 0 ? '+' : '';
+    return '$sign${value.toStringAsFixed(1)} deg';
+  }
+}
+
+class _CommandBadge extends StatelessWidget {
+  final NavigationCommand command;
+  final Color color;
+
+  const _CommandBadge({required this.command, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.34)),
+      ),
+      child: Text(
+        command.wireName,
+        style: TextStyle(
+          color: color,
+          fontWeight: FontWeight.w900,
+          fontSize: 12,
         ),
       ),
     );
