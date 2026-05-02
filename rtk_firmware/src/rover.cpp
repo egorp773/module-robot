@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <Wire.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <Adafruit_BNO08x.h>
 
 #if __has_include("rtk_config_private.h")
 #include "rtk_config_private.h"
@@ -20,7 +22,6 @@ struct GpsPortConfig {
 
 static constexpr GpsPortConfig GPS_PORTS[] = {
     {"GPIO4/GPIO5", 4, 5},
-    {"GPIO16/GPIO17", 16, 17},
 };
 
 static constexpr bool ROUTER_MODE = true;
@@ -43,6 +44,22 @@ static constexpr uint32_t STATUS_MS = 1000;
 static constexpr uint32_t WIFI_RETRY_MS = 5000;
 static constexpr uint32_t RTCM_WARN_AGE_MS = 5000;
 static constexpr uint32_t RTCM_RESTART_AGE_MS = 15000;
+static constexpr int PIN_MOTOR_RX = 16;
+static constexpr int PIN_MOTOR_TX = 17;
+static constexpr int PIN_IMU_SDA = 21;
+static constexpr int PIN_IMU_SCL = 22;
+static constexpr uint32_t MOTOR_BAUD = 115200;
+static constexpr uint32_t IMU_BROADCAST_MS = 200;
+static constexpr uint32_t MOTOR_SEND_MS = 20;
+static constexpr uint32_t MOTOR_RAMP_MS = 20;
+static constexpr uint32_t MOTOR_CMD_TIMEOUT_MS = 400;
+static constexpr int16_t MAX_SPEED_PERCENT = 70;
+static constexpr int16_t HOVER_MAX_CMD = 300;
+static constexpr int16_t INPUT_DIV = 2;
+static constexpr int16_t RAMP_STEP_PER_TICK = 1;
+static constexpr int16_t SLEW_SPEED_PER_SEND = 4;
+static constexpr int16_t SLEW_STEER_PER_SEND = 6;
+static constexpr uint16_t HOVER_START_FRAME = 0xABCD;
 
 static constexpr uint32_t CFG_UART1INPROT_UBX = 0x10730001;
 static constexpr uint32_t CFG_UART1INPROT_NMEA = 0x10730002;
@@ -74,7 +91,7 @@ struct GpsFix {
 };
 
 static HardwareSerial GpsSerial(1);
-static HardwareSerial GpsSerialAlt(2);
+static HardwareSerial MotorSerial(2);
 static AsyncWebServer server(WS_PORT);
 static AsyncWebSocket ws("/ws");
 static WiFiUDP rtcmUdp;
@@ -83,6 +100,7 @@ static uint32_t rtcmBytesRx = 0;
 static uint32_t rtcmPacketsRx = 0;
 static uint32_t lastRtcmMs = 0;
 static uint32_t lastGpsBroadcastMs = 0;
+static uint32_t lastImuBroadcastMs = 0;
 static uint32_t lastStatusMs = 0;
 static uint32_t lastWiFiAttemptMs = 0;
 static uint32_t wifiDisconnectedSinceMs = 0;
@@ -94,7 +112,6 @@ static uint32_t lastRtcmUdpRestartMs = 0;
 static uint32_t lastRoverConfigRetryMs = 0;
 static uint32_t activeGpsBaud = 0;
 static const char* activeGpsPort = GPS_PORTS[0].name;
-static bool altGpsTxEnabled = false;
 static uint32_t gpsRawBytes = 0;
 static uint32_t gpsParsedMessages = 0;
 static uint32_t f9pRtcmMessages = 0;
@@ -102,6 +119,32 @@ static uint32_t f9pRtcmCrcFail = 0;
 static uint16_t f9pLastRtcmType = 0;
 static uint32_t f9pLastRtcmMs = 0;
 static const char* gpsSource = "none";
+
+struct HoverSerialCommand {
+  uint16_t start;
+  int16_t steer;
+  int16_t speed;
+  uint16_t checksum;
+} __attribute__((packed));
+
+static int16_t motorTargetLeft = 0;
+static int16_t motorTargetRight = 0;
+static int16_t motorCurrentLeft = 0;
+static int16_t motorCurrentRight = 0;
+static int16_t motorCmdSpeed = 0;
+static int16_t motorCmdSteer = 0;
+static uint32_t lastMotorCmdMs = 0;
+static uint32_t lastMotorRampMs = 0;
+static uint32_t lastMotorSendMs = 0;
+static uint32_t motorCommandCount = 0;
+static uint32_t motorStopCount = 0;
+
+static Adafruit_BNO08x bno08x;
+static sh2_SensorValue_t imuValue;
+static bool imuDetected = false;
+static bool imuValid = false;
+static float imuYaw = 0.0f;
+static uint32_t lastImuMs = 0;
 
 static void putU32(uint8_t* p, uint32_t v) {
   p[0] = (uint8_t)v;
@@ -129,6 +172,19 @@ static uint16_t getU16(const uint8_t* p) {
   return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
+static int16_t clampI16(int32_t v, int16_t lo, int16_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return (int16_t)v;
+}
+
+static int16_t stepToward(int16_t cur, int16_t target, int16_t maxDelta) {
+  int32_t diff = (int32_t)target - (int32_t)cur;
+  if (diff > maxDelta) diff = maxDelta;
+  if (diff < -maxDelta) diff = -maxDelta;
+  return (int16_t)((int32_t)cur + diff);
+}
+
 static void writeUbx(uint8_t cls, uint8_t id, const uint8_t* payload,
                      uint16_t len) {
   uint8_t ckA = 0;
@@ -138,10 +194,7 @@ static void writeUbx(uint8_t cls, uint8_t id, const uint8_t* payload,
     ckB += ckA;
   };
 
-  auto out = [&](uint8_t b) {
-    GpsSerial.write(b);
-    if (altGpsTxEnabled) GpsSerialAlt.write(b);
-  };
+  auto out = [&](uint8_t b) { GpsSerial.write(b); };
 
   out(0xB5);
   out(0x62);
@@ -420,13 +473,8 @@ static bool startGpsAtConfig(const GpsPortConfig& port, uint32_t baud) {
   Serial.printf("GNSS: trying UART1 %s baud %lu\n", port.name,
                 (unsigned long)baud);
   GpsSerial.end();
-  GpsSerialAlt.end();
   delay(80);
   GpsSerial.begin(baud, SERIAL_8N1, port.rx, port.tx);
-  altGpsTxEnabled = port.tx != GPS_PORTS[1].tx;
-  if (altGpsTxEnabled) {
-    GpsSerialAlt.begin(baud, SERIAL_8N1, GPS_PORTS[1].rx, GPS_PORTS[1].tx);
-  }
   delay(300);
   configureRover();
 
@@ -469,14 +517,8 @@ static void autoDetectGpsBaud() {
   activeGpsBaud = bestBaud;
   activeGpsPort = bestPort->name;
   GpsSerial.end();
-  GpsSerialAlt.end();
   delay(80);
   GpsSerial.begin(activeGpsBaud, SERIAL_8N1, bestPort->rx, bestPort->tx);
-  altGpsTxEnabled = bestPort->tx != GPS_PORTS[1].tx;
-  if (altGpsTxEnabled) {
-    GpsSerialAlt.begin(activeGpsBaud, SERIAL_8N1, GPS_PORTS[1].rx,
-                       GPS_PORTS[1].tx);
-  }
   delay(300);
   configureRover();
   Serial.printf("GNSS: GPS messages not detected, staying on %s at %lu baud, total raw=%lu\n",
@@ -549,7 +591,6 @@ static void relayRtcmToF9p() {
   if (len <= 0) return;
 
   GpsSerial.write(buf, len);
-  if (altGpsTxEnabled) GpsSerialAlt.write(buf, len);
   rtcmBytesRx += len;
   rtcmPacketsRx++;
   lastRtcmMs = millis();
@@ -674,6 +715,173 @@ static void checkWiFiWatchdog() {
   }
 }
 
+static void motorsInit() {
+  MotorSerial.begin(MOTOR_BAUD, SERIAL_8N1, PIN_MOTOR_RX, PIN_MOTOR_TX);
+  motorTargetLeft = 0;
+  motorTargetRight = 0;
+  motorCurrentLeft = 0;
+  motorCurrentRight = 0;
+  motorCmdSpeed = 0;
+  motorCmdSteer = 0;
+  lastMotorCmdMs = millis();
+  lastMotorRampMs = millis();
+  lastMotorSendMs = millis();
+  Serial.printf("MOTORS: UART2 baud=%lu RX=%d TX=%d\n",
+                (unsigned long)MOTOR_BAUD, PIN_MOTOR_RX, PIN_MOTOR_TX);
+}
+
+static void motorsStop(const char* reason) {
+  motorTargetLeft = 0;
+  motorTargetRight = 0;
+  lastMotorCmdMs = millis();
+  motorStopCount++;
+  if (reason != nullptr && reason[0] != '\0') {
+    Serial.printf("MOTORS: stop %s\n", reason);
+  }
+}
+
+static void motorsSetTarget(int left, int right) {
+  motorTargetLeft =
+      clampI16(left / INPUT_DIV, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  motorTargetRight =
+      clampI16(right / INPUT_DIV, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  lastMotorCmdMs = millis();
+  motorCommandCount++;
+}
+
+static void motorsCheckFailsafe() {
+  const uint32_t now = millis();
+  if (now - lastMotorCmdMs <= MOTOR_CMD_TIMEOUT_MS) return;
+  if (motorTargetLeft != 0 || motorTargetRight != 0) {
+    motorTargetLeft = 0;
+    motorTargetRight = 0;
+    Serial.println("MOTORS: command timeout, stopping targets");
+  }
+}
+
+static void motorsUpdateRamp() {
+  const uint32_t now = millis();
+  const uint32_t dt = now - lastMotorRampMs;
+  if (dt < MOTOR_RAMP_MS) return;
+  const uint32_t ticks = dt / MOTOR_RAMP_MS;
+  lastMotorRampMs += ticks * MOTOR_RAMP_MS;
+  uint32_t delta = ticks * RAMP_STEP_PER_TICK;
+  if (delta < 1) delta = 1;
+  const int16_t maxDelta = (int16_t)delta;
+
+  motorCurrentLeft = stepToward(motorCurrentLeft, motorTargetLeft, maxDelta);
+  motorCurrentRight = stepToward(motorCurrentRight, motorTargetRight, maxDelta);
+  motorCurrentLeft =
+      clampI16(motorCurrentLeft, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  motorCurrentRight =
+      clampI16(motorCurrentRight, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+}
+
+static void motorsSend() {
+  const uint32_t now = millis();
+  if (now - lastMotorSendMs < MOTOR_SEND_MS) return;
+  lastMotorSendMs = now;
+
+  const int16_t left =
+      clampI16(motorCurrentLeft, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  const int16_t right =
+      clampI16(motorCurrentRight, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  const int32_t speedTarget =
+      (int32_t)(left + right) * HOVER_MAX_CMD / (2 * MAX_SPEED_PERCENT);
+  const int32_t steerTarget =
+      (int32_t)(right - left) * HOVER_MAX_CMD / (2 * MAX_SPEED_PERCENT);
+
+  motorCmdSpeed = stepToward(
+      motorCmdSpeed, clampI16(speedTarget, -HOVER_MAX_CMD, HOVER_MAX_CMD),
+      SLEW_SPEED_PER_SEND);
+  motorCmdSteer = stepToward(
+      motorCmdSteer, clampI16(steerTarget, -HOVER_MAX_CMD, HOVER_MAX_CMD),
+      SLEW_STEER_PER_SEND);
+
+  HoverSerialCommand cmd{};
+  cmd.start = HOVER_START_FRAME;
+  cmd.steer = motorCmdSteer;
+  cmd.speed = motorCmdSpeed;
+  cmd.checksum = (uint16_t)(cmd.start ^ cmd.steer ^ cmd.speed);
+  MotorSerial.write((uint8_t*)&cmd, sizeof(cmd));
+}
+
+static bool parseMoveCommand(const String& msg, int* left, int* right) {
+  if (!msg.startsWith("M,")) return false;
+  const int comma = msg.indexOf(',', 2);
+  if (comma < 0) return false;
+  *left = msg.substring(2, comma).toInt();
+  *right = msg.substring(comma + 1).toInt();
+  return true;
+}
+
+static void imuInit() {
+  Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);
+  Serial.printf("IMU: I2C SDA=%d SCL=%d\n", PIN_IMU_SDA, PIN_IMU_SCL);
+
+  uint8_t found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("IMU: I2C device found at 0x%02X\n", addr);
+      found++;
+    }
+  }
+  if (found == 0) {
+    Serial.println("IMU: I2C scan found no devices");
+  }
+
+  if (!bno08x.begin_I2C(0x4A, &Wire) && !bno08x.begin_I2C(0x4B, &Wire)) {
+    imuDetected = false;
+    imuValid = false;
+    Serial.println("IMU: BNO085 not found at 0x4A/0x4B");
+    return;
+  }
+  imuDetected = true;
+  if (!bno08x.enableReport(SH2_ROTATION_VECTOR, 20000)) {
+    imuValid = false;
+    Serial.println("IMU: BNO085 rotation vector enable failed");
+    return;
+  }
+  imuValid = true;
+  lastImuMs = millis();
+  Serial.println("IMU: BNO085 found, rotation vector 50Hz");
+}
+
+static void imuUpdate() {
+  if (!imuDetected) return;
+  if (bno08x.wasReset()) {
+    Serial.println("IMU: BNO085 reset, re-enabling rotation vector");
+    imuValid = bno08x.enableReport(SH2_ROTATION_VECTOR, 20000);
+    if (!imuValid) return;
+  }
+
+  while (bno08x.getSensorEvent(&imuValue)) {
+    if (imuValue.sensorId != SH2_ROTATION_VECTOR) continue;
+    const float qw = imuValue.un.rotationVector.real;
+    const float qx = imuValue.un.rotationVector.i;
+    const float qy = imuValue.un.rotationVector.j;
+    const float qz = imuValue.un.rotationVector.k;
+    float yaw = atan2(2.0f * (qw * qz + qx * qy),
+                      1.0f - 2.0f * (qy * qy + qz * qz)) *
+                180.0f / PI;
+    if (yaw < 0) yaw += 360.0f;
+    imuYaw = yaw;
+    imuValid = true;
+    lastImuMs = millis();
+  }
+}
+
+static void broadcastImu() {
+  const uint32_t now = millis();
+  if (now - lastImuBroadcastMs < IMU_BROADCAST_MS) return;
+  lastImuBroadcastMs = now;
+  if (!imuValid || lastImuMs == 0 || now - lastImuMs > 1000) return;
+  char msg[32];
+  snprintf(msg, sizeof(msg), "IMU,%.2f", imuYaw);
+  ws.textAll(msg);
+}
+
 static void setupWeb() {
   if (ROUTER_MODE) {
     connectWiFi();
@@ -692,6 +900,10 @@ static void setupWeb() {
       client->text("STATE,CONNECTED");
       return;
     }
+    if (type == WS_EVT_DISCONNECT) {
+      motorsStop("websocket disconnect");
+      return;
+    }
     if (type != WS_EVT_DATA || len == 0) return;
 
     String msg;
@@ -700,9 +912,23 @@ static void setupWeb() {
     msg.trim();
     msg.toUpperCase();
 
-    if (msg == "PING") client->text("PONG");
-    else if (msg == "GPS_STATUS") client->text(gps.valid ? "OK GPS" : "NO GPS");
-    else client->text("ERR,UNKNOWN");
+    if (msg == "PING") {
+      client->text("PONG");
+    } else if (msg == "STOP") {
+      motorsStop("ws STOP");
+      client->text("OK STOP");
+    } else if (msg == "GPS_STATUS") {
+      client->text(gps.valid ? "OK GPS" : "NO GPS");
+    } else {
+      int left = 0;
+      int right = 0;
+      if (parseMoveCommand(msg, &left, &right)) {
+        motorsSetTarget(left, right);
+        client->text("OK M");
+      } else {
+        client->text("ERR,UNKNOWN");
+      }
+    }
   });
 
   server.addHandler(&ws);
@@ -721,13 +947,13 @@ static void printStatus() {
   const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
   const uint32_t f9pRtcmAgeMs =
       f9pLastRtcmMs == 0 ? 0 : now - f9pLastRtcmMs;
-  Serial.printf("ROVER wifi=%s ip=%s wifiReconnect=%lu udpRestart=%lu port=%s altTx=%u baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu udpRtcm=%lubytes/%lupkts age=%lums f9pRtcm=%lu crcFail=%lu lastType=%u age=%lums\n",
+  const uint32_t imuAgeMs = lastImuMs == 0 ? 0 : now - lastImuMs;
+  Serial.printf("ROVER wifi=%s ip=%s wifiReconnect=%lu udpRestart=%lu port=%s baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu udpRtcm=%lubytes/%lupkts age=%lums f9pRtcm=%lu crcFail=%lu lastType=%u age=%lums imu=%s yaw=%.2f age=%lums motorTarget=%d/%d motorCur=%d/%d motorCmd=%d/%d motorCount=%lu stopCount=%lu\n",
                 WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
                 WiFi.localIP().toString().c_str(),
                 (unsigned long)wifiReconnectCount,
                 (unsigned long)udpRestartCount,
                 activeGpsPort,
-                altGpsTxEnabled ? 1 : 0,
                 (unsigned long)activeGpsBaud,
                 gpsSource,
                 (unsigned long)gpsParsedMessages,
@@ -745,7 +971,18 @@ static void printStatus() {
                 (unsigned long)f9pRtcmMessages,
                 (unsigned long)f9pRtcmCrcFail,
                 f9pLastRtcmType,
-                (unsigned long)f9pRtcmAgeMs);
+                (unsigned long)f9pRtcmAgeMs,
+                imuValid ? "ok" : (imuDetected ? "stale" : "not_found"),
+                imuYaw,
+                (unsigned long)imuAgeMs,
+                motorTargetLeft,
+                motorTargetRight,
+                motorCurrentLeft,
+                motorCurrentRight,
+                motorCmdSpeed,
+                motorCmdSteer,
+                (unsigned long)motorCommandCount,
+                (unsigned long)motorStopCount);
 }
 
 void setup() {
@@ -754,6 +991,8 @@ void setup() {
   Serial.println();
   Serial.println("ESP32 ZED-F9P RTK ROVER");
 
+  motorsInit();
+  imuInit();
   setupWeb();
   restartRtcmUdp("setup");
 
@@ -762,6 +1001,7 @@ void setup() {
 
 void loop() {
   checkWiFiWatchdog();
+  imuUpdate();
   relayRtcmToF9p();
   while (GpsSerial.available()) {
     gpsRawBytes++;
@@ -771,6 +1011,10 @@ void loop() {
   }
 
   broadcastGps();
+  broadcastImu();
+  motorsCheckFailsafe();
+  motorsUpdateRamp();
+  motorsSend();
   checkRtcmWatchdog();
   checkF9pRtcmWatchdog();
   printStatus();
