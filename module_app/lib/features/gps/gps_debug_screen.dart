@@ -80,6 +80,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     final ctrl = ref.read(wifiConnectionProvider.notifier);
     final fixOk = _fixOk(wifi);
     final rtkOk = _rtkOk(wifi);
+    final precisionOk = _precisionOk(wifi);
     final rtcmText = _rtcmStatusText(wifi.rtcmAgeMs);
     final rtcmFresh = _rtcmFresh(wifi.rtcmAgeMs);
     final accM = wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0;
@@ -222,7 +223,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                                 value: accM == null
                                     ? '-'
                                     : '${accM.toStringAsFixed(2)} m',
-                                good: accM != null && accM <= 0.50,
+                                good: accM != null && accM <= 0.03,
                               ),
                             ),
                             Expanded(
@@ -239,6 +240,28 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                                 value: wifi.gpsPDop?.toStringAsFixed(2) ?? '-',
                                 good: wifi.gpsPDop != null &&
                                     wifi.gpsPDop! <= 2.0,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _Metric(
+                                label: '2 см режим',
+                                value: precisionOk ? 'готов' : 'ждем fixed',
+                                good: precisionOk,
+                              ),
+                            ),
+                            Expanded(
+                              child: _Metric(
+                                label: 'hAcc',
+                                value: wifi.gpsAccuracy == null
+                                    ? '-'
+                                    : '${wifi.gpsAccuracy} mm',
+                                good: wifi.gpsAccuracy != null &&
+                                    wifi.gpsAccuracy! <= 30,
                               ),
                             ),
                           ],
@@ -614,8 +637,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       return;
     }
 
-    if (!_hasUsableGps(wifi)) {
-      setState(() => _notice = _gpsBlockedReason(wifi));
+    if (!_precisionOk(wifi)) {
+      setState(() => _notice = _precisionBlockedReason(wifi));
       return;
     }
 
@@ -639,8 +662,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   void _addCurrentPoint(WifiConnectionState wifi, {bool force = false}) {
     final lat = wifi.gpsLat;
     final lon = wifi.gpsLon;
-    if (!_hasUsableGps(wifi) || lat == null || lon == null) {
-      setState(() => _notice = _gpsBlockedReason(wifi));
+    if (!_precisionOk(wifi) || lat == null || lon == null) {
+      setState(() => _notice = _precisionBlockedReason(wifi));
       return;
     }
 
@@ -785,6 +808,13 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     return wifi.gpsCarrier == 'fixed' && _rtcmFresh(wifi.rtcmAgeMs);
   }
 
+  static bool _precisionOk(WifiConnectionState wifi) {
+    return _hasUsableGps(wifi) &&
+        _rtkOk(wifi) &&
+        wifi.gpsAccuracy != null &&
+        wifi.gpsAccuracy! <= 30;
+  }
+
   static bool _rtcmFresh(int? ageMs) {
     return ageMs != null && ageMs <= 3000;
   }
@@ -825,6 +855,23 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       return 'GPS-данные устарели, подожди новое сообщение от ровера.';
     }
     return 'Координаты пока не готовы.';
+  }
+
+  static String _precisionBlockedReason(WifiConnectionState wifi) {
+    final usableReason = _gpsBlockedReason(wifi);
+    if (!_hasUsableGps(wifi)) return usableReason;
+    if (wifi.gpsCarrier != 'fixed') {
+      return 'Для 2 см нужна RTK FIXED. Сейчас: ${_carrierLabel(wifi.gpsCarrier)}.';
+    }
+    if (!_rtcmFresh(wifi.rtcmAgeMs)) {
+      return 'RTCM не свежий: ${_rtcmStatusText(wifi.rtcmAgeMs)}.';
+    }
+    final hAcc = wifi.gpsAccuracy;
+    if (hAcc == null) return 'Нет hAcc от ровера.';
+    if (hAcc > 30) {
+      return 'Точность пока $hAcc мм. Для записи нужно 30 мм или лучше.';
+    }
+    return 'Ждем точный RTK FIXED.';
   }
 
   static String _fixLabel(int? fixType) {
