@@ -74,6 +74,7 @@ struct GpsFix {
 };
 
 static HardwareSerial GpsSerial(1);
+static HardwareSerial GpsSerialAlt(2);
 static AsyncWebServer server(WS_PORT);
 static AsyncWebSocket ws("/ws");
 static WiFiUDP rtcmUdp;
@@ -90,8 +91,10 @@ static uint32_t wifiReconnectCount = 0;
 static uint32_t udpRestartCount = 0;
 static uint32_t lastRtcmWarnMs = 0;
 static uint32_t lastRtcmUdpRestartMs = 0;
+static uint32_t lastRoverConfigRetryMs = 0;
 static uint32_t activeGpsBaud = 0;
 static const char* activeGpsPort = GPS_PORTS[0].name;
+static bool altGpsTxEnabled = false;
 static uint32_t gpsRawBytes = 0;
 static uint32_t gpsParsedMessages = 0;
 static uint32_t f9pRtcmMessages = 0;
@@ -105,6 +108,11 @@ static void putU32(uint8_t* p, uint32_t v) {
   p[1] = (uint8_t)(v >> 8);
   p[2] = (uint8_t)(v >> 16);
   p[3] = (uint8_t)(v >> 24);
+}
+
+static void putU16(uint8_t* p, uint16_t v) {
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
 }
 
 static int32_t getI32(const uint8_t* p) {
@@ -130,22 +138,27 @@ static void writeUbx(uint8_t cls, uint8_t id, const uint8_t* payload,
     ckB += ckA;
   };
 
-  GpsSerial.write(0xB5);
-  GpsSerial.write(0x62);
-  GpsSerial.write(cls);
+  auto out = [&](uint8_t b) {
+    GpsSerial.write(b);
+    if (altGpsTxEnabled) GpsSerialAlt.write(b);
+  };
+
+  out(0xB5);
+  out(0x62);
+  out(cls);
   ck(cls);
-  GpsSerial.write(id);
+  out(id);
   ck(id);
-  GpsSerial.write((uint8_t)len);
+  out((uint8_t)len);
   ck((uint8_t)len);
-  GpsSerial.write((uint8_t)(len >> 8));
+  out((uint8_t)(len >> 8));
   ck((uint8_t)(len >> 8));
   for (uint16_t i = 0; i < len; i++) {
-    GpsSerial.write(payload[i]);
+    out(payload[i]);
     ck(payload[i]);
   }
-  GpsSerial.write(ckA);
-  GpsSerial.write(ckB);
+  out(ckA);
+  out(ckB);
 }
 
 struct ValItem {
@@ -174,13 +187,33 @@ static void sendValset(const ValItem* items, size_t count) {
   delay(80);
 }
 
+static void sendLegacyCfgPrt() {
+  uint8_t payload[20] = {};
+  payload[0] = 1; // UART1
+  putU32(payload + 4, 0x000008D0); // 8N1
+  putU32(payload + 8, activeGpsBaud == 0 ? GPS_BAUDS[0] : activeGpsBaud);
+  putU16(payload + 12, 0x0023); // UBX + NMEA + RTCM3 input
+  putU16(payload + 14, 0x0003); // UBX + NMEA output
+  writeUbx(0x06, 0x00, payload, sizeof(payload));
+  delay(80);
+}
+
+static void sendLegacyCfgMsg(uint8_t msgClass, uint8_t msgId, uint8_t rate) {
+  uint8_t payload[8] = {};
+  payload[0] = msgClass;
+  payload[1] = msgId;
+  payload[3] = rate; // UART1
+  writeUbx(0x06, 0x01, payload, sizeof(payload));
+  delay(80);
+}
+
 static void configureRover() {
   const ValItem portItems[] = {
       {CFG_UART1INPROT_UBX, 1, 1},
       {CFG_UART1INPROT_NMEA, 1, 1},
       {CFG_UART1INPROT_RTCM3, 1, 1},
       {CFG_UART1OUTPROT_UBX, 1, 1},
-      {CFG_UART1OUTPROT_NMEA, 0, 1},
+      {CFG_UART1OUTPROT_NMEA, 1, 1},
       {CFG_UART1OUTPROT_RTCM3, 0, 1},
       {CFG_MSGOUT_UBX_NAV_PVT_UART1, 1, 1},
       {CFG_MSGOUT_UBX_RXM_RTCM_UART1, 1, 1},
@@ -189,7 +222,10 @@ static void configureRover() {
       {CFG_RATE_TIMEREF, 1, 1},
   };
   sendValset(portItems, sizeof(portItems) / sizeof(portItems[0]));
-  Serial.println("GNSS: rover NAV-PVT and RTCM input configured");
+  sendLegacyCfgPrt();
+  sendLegacyCfgMsg(0x01, 0x07, 1); // NAV-PVT on UART1
+  sendLegacyCfgMsg(0x02, 0x32, 1); // RXM-RTCM on UART1
+  Serial.println("GNSS: rover NAV-PVT, NMEA fallback, and RTCM input configured");
 }
 
 enum UbxState { U_SYNC1, U_SYNC2, U_CLASS, U_ID, U_LEN1, U_LEN2, U_PAYLOAD, U_CKA, U_CKB };
@@ -384,8 +420,13 @@ static bool startGpsAtConfig(const GpsPortConfig& port, uint32_t baud) {
   Serial.printf("GNSS: trying UART1 %s baud %lu\n", port.name,
                 (unsigned long)baud);
   GpsSerial.end();
+  GpsSerialAlt.end();
   delay(80);
   GpsSerial.begin(baud, SERIAL_8N1, port.rx, port.tx);
+  altGpsTxEnabled = port.tx != GPS_PORTS[1].tx;
+  if (altGpsTxEnabled) {
+    GpsSerialAlt.begin(baud, SERIAL_8N1, GPS_PORTS[1].rx, GPS_PORTS[1].tx);
+  }
   delay(300);
   configureRover();
 
@@ -428,8 +469,14 @@ static void autoDetectGpsBaud() {
   activeGpsBaud = bestBaud;
   activeGpsPort = bestPort->name;
   GpsSerial.end();
+  GpsSerialAlt.end();
   delay(80);
   GpsSerial.begin(activeGpsBaud, SERIAL_8N1, bestPort->rx, bestPort->tx);
+  altGpsTxEnabled = bestPort->tx != GPS_PORTS[1].tx;
+  if (altGpsTxEnabled) {
+    GpsSerialAlt.begin(activeGpsBaud, SERIAL_8N1, GPS_PORTS[1].rx,
+                       GPS_PORTS[1].tx);
+  }
   delay(300);
   configureRover();
   Serial.printf("GNSS: GPS messages not detected, staying on %s at %lu baud, total raw=%lu\n",
@@ -502,6 +549,7 @@ static void relayRtcmToF9p() {
   if (len <= 0) return;
 
   GpsSerial.write(buf, len);
+  if (altGpsTxEnabled) GpsSerialAlt.write(buf, len);
   rtcmBytesRx += len;
   rtcmPacketsRx++;
   lastRtcmMs = millis();
@@ -534,6 +582,16 @@ static void checkRtcmWatchdog() {
       now - lastRtcmUdpRestartMs > WIFI_RETRY_MS) {
     restartRtcmUdp("rtcm-age");
   }
+}
+
+static void checkF9pRtcmWatchdog() {
+  const uint32_t now = millis();
+  if (rtcmPacketsRx < 10 || f9pRtcmMessages > 0) return;
+  if (now - lastRoverConfigRetryMs < 10000) return;
+  lastRoverConfigRetryMs = now;
+  Serial.printf("WARN rover UDP RTCM is fresh but F9P reports no RTCM; reconfiguring UART protocols packets=%lu bytes=%lu\n",
+                (unsigned long)rtcmPacketsRx, (unsigned long)rtcmBytesRx);
+  configureRover();
 }
 
 static void broadcastGps() {
@@ -663,12 +721,13 @@ static void printStatus() {
   const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
   const uint32_t f9pRtcmAgeMs =
       f9pLastRtcmMs == 0 ? 0 : now - f9pLastRtcmMs;
-  Serial.printf("ROVER wifi=%s ip=%s wifiReconnect=%lu udpRestart=%lu port=%s baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu udpRtcm=%lubytes/%lupkts age=%lums f9pRtcm=%lu crcFail=%lu lastType=%u age=%lums\n",
+  Serial.printf("ROVER wifi=%s ip=%s wifiReconnect=%lu udpRestart=%lu port=%s altTx=%u baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu udpRtcm=%lubytes/%lupkts age=%lums f9pRtcm=%lu crcFail=%lu lastType=%u age=%lums\n",
                 WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
                 WiFi.localIP().toString().c_str(),
                 (unsigned long)wifiReconnectCount,
                 (unsigned long)udpRestartCount,
                 activeGpsPort,
+                altGpsTxEnabled ? 1 : 0,
                 (unsigned long)activeGpsBaud,
                 gpsSource,
                 (unsigned long)gpsParsedMessages,
@@ -713,6 +772,7 @@ void loop() {
 
   broadcastGps();
   checkRtcmWatchdog();
+  checkF9pRtcmWatchdog();
   printStatus();
   ws.cleanupClients();
 }
