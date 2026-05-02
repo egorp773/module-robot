@@ -19,8 +19,8 @@ static const IPAddress ROVER_IP(RTK_ROVER_IP_A, RTK_ROVER_IP_B,
                                 RTK_ROVER_IP_C, RTK_ROVER_IP_D);
 static constexpr uint16_t ROVER_RTCM_PORT = 2101;
 
-static constexpr uint32_t SURVEY_IN_SECONDS = 60;
-static constexpr uint32_t SURVEY_IN_ACC_LIMIT_0_1MM = 50000; // 5.0 m, fast field test
+static constexpr uint32_t SURVEY_IN_SECONDS = 30;
+static constexpr uint32_t SURVEY_IN_ACC_LIMIT_0_1MM = 500000; // 50.0 m, fast indoor/field test
 static constexpr uint32_t WIFI_RETRY_MS = 5000;
 static constexpr uint32_t STATUS_MS = 1000;
 static constexpr uint32_t SVIN_POLL_MS = 1000;
