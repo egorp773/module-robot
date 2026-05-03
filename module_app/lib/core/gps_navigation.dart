@@ -247,7 +247,7 @@ class GpsNavigationController {
   static const int maxHorizontalAccuracyMm = 50;
   static const double arrivedDistanceM = 0.3;
   static const double turnThresholdDeg = 20;
-  static const Duration maxGpsAge = Duration(seconds: 5);
+  static const Duration maxGpsAge = Duration(seconds: 30);
 
   const GpsNavigationController();
 

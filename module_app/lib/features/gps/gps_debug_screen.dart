@@ -1554,7 +1554,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
 
     final receivedAt = wifi.gpsReceivedAt;
     if (receivedAt == null) return true;
-    return DateTime.now().difference(receivedAt).inSeconds < 5;
+    return DateTime.now().difference(receivedAt) <
+        GpsNavigationController.maxGpsAge;
   }
 
   static String _gpsBlockedReason(WifiConnectionState wifi) {
@@ -1564,7 +1565,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     }
     final receivedAt = wifi.gpsReceivedAt;
     if (receivedAt != null &&
-        DateTime.now().difference(receivedAt).inSeconds >= 5) {
+        DateTime.now().difference(receivedAt) >=
+            GpsNavigationController.maxGpsAge) {
       return 'GPS-данные устарели, подожди новое сообщение от ровера.';
     }
     return 'Координаты пока не готовы.';

@@ -73,7 +73,7 @@ void main() {
       originLat: 55.0,
       originLon: 37.0,
       gpsFixType: 3,
-      gpsReceivedAt: now.subtract(const Duration(seconds: 6)),
+      gpsReceivedAt: now.subtract(const Duration(seconds: 31)),
       now: now,
     );
 
