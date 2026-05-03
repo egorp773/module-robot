@@ -121,6 +121,7 @@ static uint32_t rtcmPacketsRx = 0;
 static uint32_t lastRtcmMs = 0;
 static uint32_t lastGpsBroadcastMs = 0;
 static uint32_t lastImuBroadcastMs = 0;
+static uint32_t wsTelemetryDropCount = 0;
 static uint32_t lastStatusMs = 0;
 static uint32_t lastWiFiAttemptMs = 0;
 static uint32_t wifiDisconnectedSinceMs = 0;
@@ -192,6 +193,16 @@ static uint32_t effectiveRtcmAgeMs(uint32_t now) {
     if (age == 0 || f9pAge < age) age = f9pAge;
   }
   return age;
+}
+
+static bool broadcastTelemetry(const char* msg) {
+  if (ws.count() == 0) return false;
+  if (!ws.availableForWriteAll()) {
+    wsTelemetryDropCount++;
+    return false;
+  }
+  ws.textAll(msg);
+  return true;
 }
 
 static void putU32(uint8_t* p, uint32_t v) {
@@ -794,7 +805,7 @@ static void broadcastGps() {
            gps.speedMps, gps.pDop, (unsigned long)gpsAgeMs,
            (unsigned long)rtcmBytesRx, (unsigned long)rtcmAgeMs,
            imuYaw, (unsigned long)imuAgeMs, freshImu ? 1 : 0);
-  ws.textAll(tel);
+  broadcastTelemetry(tel);
 
   if (now - lastLegacyBroadcastMs < LEGACY_BROADCAST_MS) return;
   lastLegacyBroadcastMs = now;
@@ -803,7 +814,7 @@ static void broadcastGps() {
   snprintf(msg, sizeof(msg), "GPS,%.8f,%.8f,%.2f,%u,%lu",
            gps.lat, gps.lon, gps.heading, gps.fixType,
            (unsigned long)gps.hAccMm);
-  ws.textAll(msg);
+  broadcastTelemetry(msg);
 
   snprintf(msg, sizeof(msg),
            "GPSDBG,%.8f,%.8f,%.3f,%.2f,%u,%s,%u,%u,%lu,%lu,%.3f,%.2f,%lu",
@@ -811,11 +822,11 @@ static void broadcastGps() {
            carrierName(gps.carrier), gps.diff ? 1 : 0, gps.numSv,
            (unsigned long)gps.hAccMm, (unsigned long)gps.vAccMm,
            gps.speedMps, gps.pDop, (unsigned long)gpsAgeMs);
-  ws.textAll(msg);
+  broadcastTelemetry(msg);
 
   snprintf(msg, sizeof(msg), "RTCM,%lu,%lu",
            (unsigned long)rtcmBytesRx, (unsigned long)rtcmAgeMs);
-  ws.textAll(msg);
+  broadcastTelemetry(msg);
 }
 
 static void connectWiFi(bool force) {
@@ -1104,7 +1115,7 @@ static void broadcastImu() {
   char msg[48];
   snprintf(msg, sizeof(msg), "IMU,%.2f,%lu,1", imuYaw,
            (unsigned long)imuAgeMs);
-  ws.textAll(msg);
+  broadcastTelemetry(msg);
 }
 
 static void setupWeb() {
