@@ -8,6 +8,11 @@
 #define RTK_ROVER_IP_C 31
 #define RTK_ROVER_IP_D 222
 
+#define RTK_BASE_IP_A 192
+#define RTK_BASE_IP_B 168
+#define RTK_BASE_IP_C 31
+#define RTK_BASE_IP_D 207
+
 #define RTK_ROUTER_GATEWAY_A 192
 #define RTK_ROUTER_GATEWAY_B 168
 #define RTK_ROUTER_GATEWAY_C 31

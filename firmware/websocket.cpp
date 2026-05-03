@@ -135,6 +135,11 @@ static void onWsEvent(AsyncWebSocket *serverPtr, AsyncWebSocketClient *client,
       char* end3 = nullptr;
       double lon = strtod(p3, &end3);
       if (!end3) { client->text("ERR ROUTE_WP_FORMAT"); return; }
+      if (idx != g_navWpTotal) {
+        Serial.printf("WS: ROUTE_WP index mismatch idx=%d expected=%d\n", idx, g_navWpTotal);
+        client->text("ERR ROUTE_WP_INDEX");
+        return;
+      }
 
       if (nav_add_waypoint(lat, lon)) {
         Serial.printf("WS: ROUTE_WP %d: %.8f, %.8f\n", idx, lat, lon);

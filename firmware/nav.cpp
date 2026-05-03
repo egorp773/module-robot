@@ -130,7 +130,7 @@ void nav_update() {
 
   // Check GPS validity
   if (!g_gpsData.valid || g_gpsData.hAcc > MIN_GPS_ACC_MM) {
-    if (now - g_lastGoodGpsMs > 2000) {
+    if (now - g_lastGoodGpsMs > GPS_TIMEOUT_MS) {
       Serial.println("NAV: GPS accuracy too low, stopping");
       g_navState = NAV_ERROR;
       g_targetLeft = 0;
@@ -192,7 +192,9 @@ void nav_update() {
 
   // Reduce speed when heading error is large
   if (abs(headingError) > 15.0f) {
-    baseSpeed *= cos(headingError * PI / 180.0f);
+    float headingScale = cos(headingError * PI / 180.0f);
+    if (headingScale < 0.0f) headingScale = 0.0f;
+    baseSpeed *= headingScale;
   }
 
   // Reduce speed when approaching waypoint (last 1m)
