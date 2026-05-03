@@ -76,6 +76,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   DateTime? _lastAutoHeadingCalibrationAt;
   double? _lastStableHeadingDegrees;
   DateTime? _lastStableHeadingAt;
+  double? _smoothedHeadingDegrees;
+  DateTime? _lastHeadingSampleAt;
   final TextEditingController _nameCtrl = TextEditingController();
   final TextEditingController _hostCtrl = TextEditingController();
   final FocusNode _hostFocus = FocusNode();
@@ -154,8 +156,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                 movementBearing,
                 navigation.bearingDegrees!,
               );
-    final motorPreview = const NavigationMotorMapper().toMotorCommand(
-      navigation.command,
+    final motorPreview = const NavigationMotorMapper().toMotorCommandForResult(
+      navigation,
       forwardPercent: _forwardPercent,
       turnPercent: _turnPercent,
       invertForward: _invertForward,
@@ -968,6 +970,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       heading = wifi.gpsHeading;
     }
     if (heading != null) {
+      heading = _smoothHeading(heading);
       _lastStableHeadingDegrees = heading;
       _lastStableHeadingAt = DateTime.now();
       return heading;
@@ -978,6 +981,25 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       return _lastStableHeadingDegrees;
     }
     return null;
+  }
+
+  double _smoothHeading(double rawDegrees) {
+    final now = DateTime.now();
+    final previous = _smoothedHeadingDegrees;
+    final previousAt = _lastHeadingSampleAt;
+    _lastHeadingSampleAt = now;
+    if (previous == null ||
+        previousAt == null ||
+        now.difference(previousAt) > const Duration(seconds: 3)) {
+      _smoothedHeadingDegrees = rawDegrees;
+      return rawDegrees;
+    }
+
+    final error = GpsLocalGeometry.headingErrorDegrees(previous, rawDegrees);
+    final gain = error.abs() > 45 ? 0.30 : 0.45;
+    final next = GpsLocalGeometry.normalizeDegrees(previous + error * gain);
+    _smoothedHeadingDegrees = next;
+    return next;
   }
 
   String _navigationHeadingSourceFor(WifiConnectionState wifi) {
@@ -1166,8 +1188,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       if (advanced) return;
     }
 
-    final motorCommand = const NavigationMotorMapper().toMotorCommand(
-      result.command,
+    final motorCommand = const NavigationMotorMapper().toMotorCommandForResult(
+      result,
       forwardPercent: _forwardPercent,
       turnPercent: _turnPercent,
       invertForward: _invertForward,

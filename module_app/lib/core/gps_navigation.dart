@@ -203,6 +203,10 @@ class MotorDriveCommand {
 class NavigationMotorMapper {
   const NavigationMotorMapper();
 
+  static int _signedClamp(num value, int limit) {
+    return value.round().clamp(-limit, limit);
+  }
+
   MotorDriveCommand toMotorCommand(
     NavigationCommand command, {
     int forwardPercent = 22,
@@ -237,6 +241,62 @@ class NavigationMotorMapper {
         return const MotorDriveCommand(
             left: 0, right: 0, label: 'точка достигнута');
     }
+  }
+
+  MotorDriveCommand toMotorCommandForResult(
+    NavigationResult result, {
+    int forwardPercent = 22,
+    int turnPercent = 18,
+    bool invertForward = false,
+    bool invertSteering = false,
+  }) {
+    if (result.command == NavigationCommand.stop ||
+        result.command == NavigationCommand.arrived) {
+      return toMotorCommand(
+        result.command,
+        forwardPercent: forwardPercent,
+        turnPercent: turnPercent,
+        invertForward: invertForward,
+        invertSteering: invertSteering,
+      );
+    }
+
+    final error = result.headingErrorDegrees;
+    if (error == null) {
+      return const MotorDriveCommand(left: 0, right: 0, label: 'no heading');
+    }
+
+    final absError = error.abs();
+    final maxForward = forwardPercent.clamp(0, 45);
+    final maxTurn = turnPercent.clamp(0, 40);
+
+    if (absError >= 75) {
+      return toMotorCommand(
+        error > 0 ? NavigationCommand.turnRight : NavigationCommand.turnLeft,
+        forwardPercent: forwardPercent,
+        turnPercent: turnPercent,
+        invertForward: invertForward,
+        invertSteering: invertSteering,
+      );
+    }
+
+    final distance = result.distanceMeters ?? 99.0;
+    final distanceScale = distance < 1.2 ? (0.45 + distance / 1.2 * 0.55) : 1.0;
+    final errorScale = absError > 35 ? 0.55 : 1.0;
+    final minForward = maxForward == 0 ? 0 : 6;
+    final baseMagnitude = (maxForward * distanceScale * errorScale)
+        .round()
+        .clamp(minForward, maxForward);
+    final base = baseMagnitude * (invertForward ? -1 : 1);
+
+    final steerMagnitude =
+        (maxTurn * (absError / 45.0).clamp(0.0, 1.0)).round();
+    final steerSign = error > 0 ? 1 : -1;
+    final steer = steerMagnitude * steerSign * (invertSteering ? -1 : 1);
+
+    final left = _signedClamp(base + steer, 100);
+    final right = _signedClamp(base - steer, 100);
+    return MotorDriveCommand(left: left, right: right, label: 'track');
   }
 }
 

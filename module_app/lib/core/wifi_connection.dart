@@ -334,6 +334,8 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   }
 
   static const int _port = 81;
+  static const int _rtcmRecoveryAgeMs = 7000;
+  static const Duration _rtcmRecoveryInterval = Duration(seconds: 8);
 
   WebSocketChannel? _channel;
   StreamSubscription? _sub;
@@ -343,6 +345,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   DateTime? _lastRxAt;
   DateTime? _lastTelemetryLogAt;
   DateTime? _lastGpsDebugAt;
+  DateTime? _lastRtcmRecoveryAt;
   bool _autoReconnectEnabled = false;
   int _reconnectAttempt = 0;
 
@@ -427,6 +430,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
       final lastRx = _lastRxAt;
       if (lastRx == null) return;
+      _recoverRtcmIfNeeded();
       final silence = DateTime.now().difference(lastRx);
 
       if (silence.inSeconds >= 4) {
@@ -450,6 +454,24 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         );
       }
     });
+  }
+
+  void _recoverRtcmIfNeeded() {
+    final age = state.rtcmAgeMs;
+    if (age == null || age <= _rtcmRecoveryAgeMs) return;
+    final now = DateTime.now();
+    final last = _lastRtcmRecoveryAt;
+    if (last != null && now.difference(last) < _rtcmRecoveryInterval) return;
+    final ch = _channel;
+    if (ch == null) return;
+    _lastRtcmRecoveryAt = now;
+    try {
+      ch.sink.add("UDP_RESET");
+      ch.sink.add("STATUS");
+      _log("→ UDP_RESET RTCM stale ${age}ms");
+    } catch (e) {
+      unawaited(_handleConnectionLost("RTCM recovery send error: $e"));
+    }
   }
 
   void _scheduleReconnect(String reason) {
@@ -505,6 +527,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     _autoReconnectEnabled = true;
     _lastTelemetryLogAt = null;
     _lastGpsDebugAt = null;
+    _lastRtcmRecoveryAt = null;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     state = state.clearTelemetry(isConnecting: true, error: null);

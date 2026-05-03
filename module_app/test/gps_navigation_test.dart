@@ -163,6 +163,34 @@ void main() {
     );
   });
 
+  test('motor mapper applies proportional steering while tracking', () {
+    const mapper = NavigationMotorMapper();
+    const result = NavigationResult(
+      command: NavigationCommand.forward,
+      reason: 'track',
+      distanceMeters: 4,
+      headingErrorDegrees: 20,
+    );
+
+    final command = mapper.toMotorCommandForResult(result);
+
+    expect(command.left, greaterThan(command.right));
+    expect(command.left, greaterThan(0));
+    expect(command.right, greaterThan(0));
+  });
+
+  test('motor mapper pivots for large heading error', () {
+    const mapper = NavigationMotorMapper();
+    const result = NavigationResult(
+      command: NavigationCommand.turnLeft,
+      reason: 'turn',
+      distanceMeters: 4,
+      headingErrorDegrees: -90,
+    );
+
+    expect(mapper.toMotorCommandForResult(result).protocol, 'M,-18,18');
+  });
+
   test('heading calibration aligns raw IMU yaw to target bearing', () {
     const calibration = HeadingCalibration();
 
