@@ -30,6 +30,12 @@ class WifiConnectionState {
   final DateTime? gpsReceivedAt;
   final int? rtcmBytes;
   final int? rtcmAgeMs;
+  final int? rtcmTransportAgeMs;
+  final int? rtcmF9pAgeMs;
+  final String? rtcmSource;
+  final int? rtcmF9pMessages;
+  final int? rtcmCrcFail;
+  final int? rtcmLastType;
 
   // IMU data
   final double? imuYaw;
@@ -65,6 +71,12 @@ class WifiConnectionState {
     this.gpsReceivedAt,
     this.rtcmBytes,
     this.rtcmAgeMs,
+    this.rtcmTransportAgeMs,
+    this.rtcmF9pAgeMs,
+    this.rtcmSource,
+    this.rtcmF9pMessages,
+    this.rtcmCrcFail,
+    this.rtcmLastType,
     this.imuYaw,
     this.imuAgeMs,
     this.imuFresh,
@@ -97,6 +109,12 @@ class WifiConnectionState {
         gpsReceivedAt: null,
         rtcmBytes: null,
         rtcmAgeMs: null,
+        rtcmTransportAgeMs: null,
+        rtcmF9pAgeMs: null,
+        rtcmSource: null,
+        rtcmF9pMessages: null,
+        rtcmCrcFail: null,
+        rtcmLastType: null,
         imuYaw: null,
         imuAgeMs: null,
         imuFresh: null,
@@ -129,6 +147,12 @@ class WifiConnectionState {
     DateTime? gpsReceivedAt,
     int? rtcmBytes,
     int? rtcmAgeMs,
+    int? rtcmTransportAgeMs,
+    int? rtcmF9pAgeMs,
+    String? rtcmSource,
+    int? rtcmF9pMessages,
+    int? rtcmCrcFail,
+    int? rtcmLastType,
     double? imuYaw,
     int? imuAgeMs,
     bool? imuFresh,
@@ -160,6 +184,12 @@ class WifiConnectionState {
       gpsReceivedAt: gpsReceivedAt ?? this.gpsReceivedAt,
       rtcmBytes: rtcmBytes ?? this.rtcmBytes,
       rtcmAgeMs: rtcmAgeMs ?? this.rtcmAgeMs,
+      rtcmTransportAgeMs: rtcmTransportAgeMs ?? this.rtcmTransportAgeMs,
+      rtcmF9pAgeMs: rtcmF9pAgeMs ?? this.rtcmF9pAgeMs,
+      rtcmSource: rtcmSource ?? this.rtcmSource,
+      rtcmF9pMessages: rtcmF9pMessages ?? this.rtcmF9pMessages,
+      rtcmCrcFail: rtcmCrcFail ?? this.rtcmCrcFail,
+      rtcmLastType: rtcmLastType ?? this.rtcmLastType,
       imuYaw: imuYaw ?? this.imuYaw,
       imuAgeMs: imuAgeMs ?? this.imuAgeMs,
       imuFresh: imuFresh ?? this.imuFresh,
@@ -199,6 +229,12 @@ class WifiConnectionState {
       gpsReceivedAt: null,
       rtcmBytes: null,
       rtcmAgeMs: null,
+      rtcmTransportAgeMs: null,
+      rtcmF9pAgeMs: null,
+      rtcmSource: null,
+      rtcmF9pMessages: null,
+      rtcmCrcFail: null,
+      rtcmLastType: null,
       imuYaw: null,
       imuAgeMs: null,
       imuFresh: null,
@@ -334,8 +370,6 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   }
 
   static const int _port = 81;
-  static const int _rtcmRecoveryAgeMs = 7000;
-  static const Duration _rtcmRecoveryInterval = Duration(seconds: 8);
 
   WebSocketChannel? _channel;
   StreamSubscription? _sub;
@@ -345,7 +379,6 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   DateTime? _lastRxAt;
   DateTime? _lastTelemetryLogAt;
   DateTime? _lastGpsDebugAt;
-  DateTime? _lastRtcmRecoveryAt;
   bool _autoReconnectEnabled = false;
   int _reconnectAttempt = 0;
 
@@ -409,8 +442,17 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     final carrier = state.gpsCarrier ?? '-';
     final hAcc = state.gpsAccuracy == null ? '-' : '${state.gpsAccuracy}mm';
     final rtcmAge = state.rtcmAgeMs == null ? '-' : '${state.rtcmAgeMs}ms';
+    final rtcmTransport = state.rtcmTransportAgeMs == null
+        ? '-'
+        : '${state.rtcmTransportAgeMs}ms';
+    final rtcmF9p =
+        state.rtcmF9pAgeMs == null ? '-' : '${state.rtcmF9pAgeMs}ms';
+    final rtcmSource = state.rtcmSource ?? '-';
     final sv = state.gpsSatellites?.toString() ?? '-';
-    _log("← telemetry rtk=$carrier hAcc=$hAcc rtcm=$rtcmAge sv=$sv");
+    _log(
+      "← telemetry rtk=$carrier hAcc=$hAcc rtcm=$rtcmAge "
+      "transport=$rtcmTransport f9p=$rtcmF9p src=$rtcmSource sv=$sv",
+    );
   }
 
   bool _hasFreshGpsDebug(DateTime now) {
@@ -430,7 +472,6 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
       final lastRx = _lastRxAt;
       if (lastRx == null) return;
-      _recoverRtcmIfNeeded();
       final silence = DateTime.now().difference(lastRx);
 
       if (silence.inSeconds >= 4) {
@@ -454,24 +495,6 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         );
       }
     });
-  }
-
-  void _recoverRtcmIfNeeded() {
-    final age = state.rtcmAgeMs;
-    if (age == null || age <= _rtcmRecoveryAgeMs) return;
-    final now = DateTime.now();
-    final last = _lastRtcmRecoveryAt;
-    if (last != null && now.difference(last) < _rtcmRecoveryInterval) return;
-    final ch = _channel;
-    if (ch == null) return;
-    _lastRtcmRecoveryAt = now;
-    try {
-      ch.sink.add("UDP_RESET");
-      ch.sink.add("STATUS");
-      _log("→ UDP_RESET RTCM stale ${age}ms");
-    } catch (e) {
-      unawaited(_handleConnectionLost("RTCM recovery send error: $e"));
-    }
   }
 
   void _scheduleReconnect(String reason) {
@@ -527,7 +550,6 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     _autoReconnectEnabled = true;
     _lastTelemetryLogAt = null;
     _lastGpsDebugAt = null;
-    _lastRtcmRecoveryAt = null;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     state = state.clearTelemetry(isConnecting: true, error: null);
@@ -593,6 +615,19 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                     gpsReceivedAt: now,
                     rtcmBytes: int.tryParse(parts[14]),
                     rtcmAgeMs: int.tryParse(parts[15]),
+                    rtcmTransportAgeMs:
+                        parts.length > 19 ? int.tryParse(parts[19]) : null,
+                    rtcmF9pAgeMs:
+                        parts.length > 20 ? int.tryParse(parts[20]) : null,
+                    rtcmSource: parts.length > 21 && parts[21].trim().isNotEmpty
+                        ? parts[21].trim()
+                        : null,
+                    rtcmF9pMessages:
+                        parts.length > 22 ? int.tryParse(parts[22]) : null,
+                    rtcmCrcFail:
+                        parts.length > 23 ? int.tryParse(parts[23]) : null,
+                    rtcmLastType:
+                        parts.length > 24 ? int.tryParse(parts[24]) : null,
                     imuYaw: imuYaw,
                     imuAgeMs: int.tryParse(parts[17]),
                     imuFresh: parts[18].trim() == '1',
@@ -702,7 +737,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
             }
           }
 
-          // RTCM,<bytesTotal>,<ageMs>
+          // RTCM,<bytesTotal>,<ageMs>[,<transportAge>,<f9pAge>,<source>,<f9pMessages>,<crcFail>,<lastType>]
           if (msgStr.startsWith("RTCM,")) {
             try {
               final parts = msgStr.split(",");
@@ -712,6 +747,18 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                 state = state.copyWith(
                   rtcmBytes: bytes,
                   rtcmAgeMs: ageMs,
+                  rtcmTransportAgeMs:
+                      parts.length > 3 ? int.tryParse(parts[3]) : null,
+                  rtcmF9pAgeMs:
+                      parts.length > 4 ? int.tryParse(parts[4]) : null,
+                  rtcmSource: parts.length > 5 && parts[5].trim().isNotEmpty
+                      ? parts[5].trim()
+                      : null,
+                  rtcmF9pMessages:
+                      parts.length > 6 ? int.tryParse(parts[6]) : null,
+                  rtcmCrcFail: parts.length > 7 ? int.tryParse(parts[7]) : null,
+                  rtcmLastType:
+                      parts.length > 8 ? int.tryParse(parts[8]) : null,
                 );
                 _maybeLogTelemetrySummary();
               }

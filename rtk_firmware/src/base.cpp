@@ -50,6 +50,8 @@ static constexpr uint32_t BASE_RECONFIG_MS = 15000;
 static constexpr uint8_t UDP_FAIL_RECONNECT_LIMIT = 10;
 static constexpr uint32_t UDP_RECONNECT_COOLDOWN_MS = 10000;
 static constexpr uint32_t WIFI_AFTER_CONNECT_GRACE_MS = 5000;
+static constexpr uint32_t RTCM_TCP_WRITE_TIMEOUT_MS = 25;
+static constexpr uint8_t RTCM_BROADCAST_EVERY_N = 10;
 
 // u-blox configuration keys for VALSET.
 static constexpr uint32_t CFG_UART1INPROT_UBX = 0x10730001;
@@ -97,6 +99,7 @@ static uint32_t udpBroadcastFail = 0;
 static uint32_t tcpClientCount = 0;
 static uint32_t tcpSendOk = 0;
 static uint32_t tcpSendFail = 0;
+static uint8_t tcpZeroWriteStreak = 0;
 static uint8_t udpSendFailStreak = 0;
 static uint32_t wifiReconnectCount = 0;
 static uint32_t gnssRawBytes = 0;
@@ -569,7 +572,7 @@ static bool sendRtcmTcp() {
 
   size_t written = 0;
   const uint32_t started = millis();
-  while (written < rtcmLen && millis() - started < 50) {
+  while (written < rtcmLen && millis() - started < RTCM_TCP_WRITE_TIMEOUT_MS) {
     const size_t n = rtcmTcpClient.write(rtcmBuf + written, rtcmLen - written);
     if (n == 0) {
       delay(1);
@@ -580,13 +583,23 @@ static bool sendRtcmTcp() {
 
   if (written == rtcmLen) {
     tcpSendOk++;
+    tcpZeroWriteStreak = 0;
     return true;
   }
 
   tcpSendFail++;
   Serial.printf("WARN base TCP RTCM failed written=%u/%u fail=%lu\n",
                 (unsigned)written, rtcmLen, (unsigned long)tcpSendFail);
-  rtcmTcpClient.stop();
+  if (written > 0) {
+    rtcmTcpClient.stop();
+  } else {
+    if (tcpZeroWriteStreak < 255) tcpZeroWriteStreak++;
+    if (tcpZeroWriteStreak >= 5) {
+      Serial.println("WARN base TCP zero-write streak: closing RTCM client");
+      tcpZeroWriteStreak = 0;
+      rtcmTcpClient.stop();
+    }
+  }
   return false;
 }
 
@@ -603,20 +616,28 @@ static bool sendRtcmUdpTo(const IPAddress& target, const char* label,
   }
 
   (*failCount)++;
-  Serial.printf("WARN base UDP RTCM %s failed begin=%d end=%d fail=%lu target=%s:%u\n",
-                label, beginOk, endOk, (unsigned long)*failCount,
-                target.toString().c_str(), ROVER_RTCM_PORT);
+  if (*failCount <= 3 || (*failCount % 25) == 0) {
+    Serial.printf("WARN base UDP RTCM %s failed begin=%d end=%d fail=%lu target=%s:%u\n",
+                  label, beginOk, endOk, (unsigned long)*failCount,
+                  target.toString().c_str(), ROVER_RTCM_PORT);
+  }
   return false;
 }
 
 static void sendRtcmFrame() {
   if (WiFi.status() != WL_CONNECTED || rtcmLen == 0) return;
 
-  const bool unicastOk =
-      sendRtcmUdpTo(ROVER_IP, "unicast", &udpSendOk, &udpSendFail);
-  const bool broadcastOk = sendRtcmUdpTo(RTCM_BROADCAST_IP, "broadcast",
-                                         &udpBroadcastOk, &udpBroadcastFail);
   const bool tcpOk = sendRtcmTcp();
+  bool unicastOk = false;
+  bool broadcastOk = false;
+  if (!tcpOk) {
+    unicastOk =
+        sendRtcmUdpTo(ROVER_IP, "unicast", &udpSendOk, &udpSendFail);
+    if ((rtcmFramesSeen % RTCM_BROADCAST_EVERY_N) == 0) {
+      broadcastOk = sendRtcmUdpTo(RTCM_BROADCAST_IP, "broadcast",
+                                  &udpBroadcastOk, &udpBroadcastFail);
+    }
+  }
 
   if (unicastOk || broadcastOk || tcpOk) {
     rtcmBytesSent += rtcmLen;
@@ -697,6 +718,7 @@ static void connectWiFi(bool force) {
   wifiReconnectCount++;
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_15dBm);
   WiFi.setAutoReconnect(true);
   WiFi.config(BASE_STA_IP, ROUTER_GATEWAY, ROUTER_SUBNET);
   if (force) {
