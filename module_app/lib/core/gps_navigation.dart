@@ -305,7 +305,7 @@ class GpsNavigationController {
   static const double maxRtcmHoldAgeMs = 60000;
   static const int maxRoverGpsAgeMs = 5000;
   static const int maxHorizontalAccuracyMm = 300;
-  static const int maxDegradedAccuracyMm = 900;
+  static const int maxDegradedAccuracyMm = 1500;
   static const double arrivedDistanceM = 0.3;
   static const double turnThresholdDeg = 20;
   static const Duration maxGpsAge = Duration(seconds: 30);

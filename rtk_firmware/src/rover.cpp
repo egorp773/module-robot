@@ -61,11 +61,11 @@ static constexpr uint32_t RTCM_TCP_CONNECT_TIMEOUT_MS = 2000;
 static constexpr uint32_t RTCM_TCP_RETRY_MS = 5000;
 static constexpr uint32_t RTCM_TCP_PRIMARY_HOLD_MS = 2500;
 static constexpr uint32_t RTCM_WARN_AGE_MS = 7000;
-static constexpr uint32_t RTCM_RESTART_AGE_MS = 10000;
-static constexpr uint32_t RTCM_TRANSPORT_RECOVER_AGE_MS = 25000;
-static constexpr uint32_t RTCM_TRANSPORT_RECOVER_MS = 10000;
-static constexpr uint32_t RTCM_WIFI_RECOVER_AGE_MS = 60000;
-static constexpr uint32_t RTCM_WIFI_RECOVER_MS = 45000;
+static constexpr uint32_t RTCM_RESTART_AGE_MS = 30000;
+static constexpr uint32_t RTCM_TRANSPORT_RECOVER_AGE_MS = 60000;
+static constexpr uint32_t RTCM_TRANSPORT_RECOVER_MS = 30000;
+static constexpr uint32_t RTCM_WIFI_RECOVER_AGE_MS = 120000;
+static constexpr uint32_t RTCM_WIFI_RECOVER_MS = 90000;
 static constexpr wifi_power_t ROVER_WIFI_TX_POWER = WIFI_POWER_15dBm;
 static constexpr int PIN_MOTOR_RX = 16;
 static constexpr int PIN_MOTOR_TX = 17;
@@ -95,7 +95,7 @@ static constexpr uint32_t NAV_MAX_RTCM_AGE_MS = 60000;
 static constexpr uint32_t NAV_MAX_IMU_AGE_MS = 5000;
 static constexpr uint32_t NAV_PRECISE_HACC_MM = 120;
 static constexpr uint32_t NAV_USABLE_HACC_MM = 300;
-static constexpr uint32_t NAV_DEGRADED_HACC_MM = 900;
+static constexpr uint32_t NAV_DEGRADED_HACC_MM = 1500;
 static constexpr float NAV_MIN_GPS_COURSE_SPEED_MPS = 0.12f;
 static constexpr float NAV_ARRIVED_M = 0.45f;
 static constexpr float NAV_PASS_WP_M = 0.85f;
@@ -596,13 +596,15 @@ static void parseNmeaSentence(char* sentence) {
   const char* type = fields[0] + strlen(fields[0]) - 3;
   if (strcmp(type, "GGA") == 0 && count > 9) {
     const int quality = atoi(fields[6]);
+    const float hdop = (float)atof(fields[8]);
     gps.lat = parseNmeaCoord(fields[2], fields[3]);
     gps.lon = parseNmeaCoord(fields[4], fields[5]);
     gps.fixType = quality > 0 ? 3 : 0;
     gps.diff = quality == 2 || quality == 4 || quality == 5;
     gps.carrier = quality == 4 ? 2 : (quality == 5 ? 1 : 0);
     gps.numSv = (uint8_t)atoi(fields[7]);
-    gps.pDop = (float)atof(fields[8]);
+    gps.pDop = hdop;
+    gps.hAccMm = quality > 0 ? (uint32_t)fmaxf(1000.0f, hdop * 1200.0f) : 999999;
     gps.heightM = (float)atof(fields[9]);
     gps.valid = quality > 0;
     gps.lastMs = millis();
@@ -977,11 +979,10 @@ static void checkRtcmWatchdog() {
   }
   if (transportAge != 0 && transportAge <= RTCM_WARN_AGE_MS && f9pAge != 0 &&
       f9pAge > RTCM_RESTART_AGE_MS &&
-      now - lastRoverConfigRetryMs >= 10000) {
+      now - lastRoverConfigRetryMs >= 30000) {
     lastRoverConfigRetryMs = now;
-    Serial.printf("WARN rover RTCM reaches ESP32 but F9P age=%lums; reconfiguring UART protocols\n",
+    Serial.printf("WARN rover RTCM reaches ESP32 but F9P RXM-RTCM age=%lums\n",
                   (unsigned long)f9pAge);
-    configureRover();
   }
 }
 
@@ -990,12 +991,11 @@ static void checkF9pRtcmWatchdog() {
   if (gpsParsedMessages == 0) return;
   if (gps.diff || gps.carrier != 0) return;
   if (rtcmPacketsRx < 10 || f9pRtcmMessages > 0) return;
-  if (now - lastRoverConfigRetryMs < 10000) return;
+  if (now - lastRoverConfigRetryMs < 30000) return;
   lastRoverConfigRetryMs = now;
-  Serial.printf("WARN rover RTCM reaches ESP32 but F9P reports no RTCM; reconfiguring UART protocols src=%s packets=%lu bytes=%lu\n",
+  Serial.printf("WARN rover RTCM reaches ESP32 but F9P RXM-RTCM is silent; keeping correction stream alive src=%s packets=%lu bytes=%lu\n",
                 rtcmInputSource, (unsigned long)rtcmPacketsRx,
                 (unsigned long)rtcmBytesRx);
-  configureRover();
 }
 
 static void broadcastGps() {
