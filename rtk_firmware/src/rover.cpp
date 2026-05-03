@@ -51,14 +51,15 @@ static constexpr char AP_WIFI_PASS[] = "rtk-rover-123";
 static constexpr uint16_t WS_PORT = 81;
 static constexpr uint16_t RTCM_UDP_PORT = 2101;
 static constexpr uint16_t RTCM_TCP_PORT = 2102;
+static constexpr bool ENABLE_RTCM_TCP_FALLBACK = false;
 static constexpr uint32_t GPS_BROADCAST_MS = 200;
 static constexpr uint32_t LEGACY_BROADCAST_MS = 1000;
 static constexpr uint32_t STATUS_MS = 3000;
 static constexpr uint32_t WIFI_RETRY_MS = 5000;
 static constexpr uint32_t RTCM_TCP_CONNECT_TIMEOUT_MS = 250;
-static constexpr uint32_t RTCM_WARN_AGE_MS = 5000;
-static constexpr uint32_t RTCM_RESTART_AGE_MS = 5000;
-static constexpr uint32_t RTCM_WIFI_RECOVER_AGE_MS = 30000;
+static constexpr uint32_t RTCM_WARN_AGE_MS = 7000;
+static constexpr uint32_t RTCM_RESTART_AGE_MS = 15000;
+static constexpr uint32_t RTCM_WIFI_RECOVER_AGE_MS = 45000;
 static constexpr uint32_t RTCM_WIFI_RECOVER_MS = 15000;
 static constexpr int PIN_MOTOR_RX = 16;
 static constexpr int PIN_MOTOR_TX = 17;
@@ -66,6 +67,8 @@ static constexpr int PIN_IMU_SDA = 21;
 static constexpr int PIN_IMU_SCL = 22;
 static constexpr uint32_t MOTOR_BAUD = 115200;
 static constexpr uint32_t IMU_BROADCAST_MS = 1000;
+static constexpr uint32_t IMU_STALE_REENABLE_MS = 1500;
+static constexpr uint32_t IMU_STALE_RESET_MS = 15000;
 static constexpr uint32_t MOTOR_SEND_MS = 20;
 static constexpr uint32_t MOTOR_RAMP_MS = 20;
 static constexpr uint32_t MOTOR_CMD_TIMEOUT_MS = 400;
@@ -176,7 +179,19 @@ static uint32_t lastImuMs = 0;
 static uint32_t lastImuRecoverMs = 0;
 
 static bool imuFresh(uint32_t now) {
-  return imuDetected && imuValid && lastImuMs != 0 && now - lastImuMs <= 1000;
+  return imuDetected && imuValid && lastImuMs != 0 && now - lastImuMs <= 5000;
+}
+
+static uint32_t effectiveRtcmAgeMs(uint32_t now) {
+  uint32_t age = 0;
+  if (lastRtcmMs != 0 && now >= lastRtcmMs) {
+    age = now - lastRtcmMs;
+  }
+  if (f9pLastRtcmMs != 0 && now >= f9pLastRtcmMs) {
+    const uint32_t f9pAge = now - f9pLastRtcmMs;
+    if (age == 0 || f9pAge < age) age = f9pAge;
+  }
+  return age;
 }
 
 static void putU32(uint8_t* p, uint32_t v) {
@@ -651,6 +666,7 @@ static bool relayRtcmToF9p() {
 static void connectWiFi(bool force = false);
 
 static void connectRtcmTcp() {
+  if (!ENABLE_RTCM_TCP_FALLBACK) return;
   if (!ROUTER_MODE || WiFi.status() != WL_CONNECTED) return;
   if (rtcmTcpClient.connected()) return;
 
@@ -678,6 +694,7 @@ static void connectRtcmTcp() {
 }
 
 static void relayTcpRtcmToF9p() {
+  if (!ENABLE_RTCM_TCP_FALLBACK) return;
   if (!rtcmTcpClient.connected()) return;
 
   uint8_t buf[512];
@@ -715,30 +732,33 @@ static void recoverRtcmWiFi(const char* reason) {
   lastRtcmWifiRecoverMs = now;
   Serial.printf("WARN rover RTCM transport recover reason=%s age=%lums\n", reason,
                 (unsigned long)(lastRtcmMs == 0 ? 0 : now - lastRtcmMs));
-  rtcmTcpClient.stop();
+  if (ENABLE_RTCM_TCP_FALLBACK) {
+    rtcmTcpClient.stop();
+  }
   lastRtcmTcpAttemptMs = 0;
   restartRtcmUdp(reason);
 }
 
 static void checkRtcmWatchdog() {
   const uint32_t now = millis();
-  const uint32_t referenceMs =
-      lastRtcmMs != 0 ? lastRtcmMs : lastRtcmUdpRestartMs;
-  if (referenceMs == 0) return;
-
-  const uint32_t age = now - referenceMs;
-  if (age > RTCM_WARN_AGE_MS && now - lastRtcmWarnMs > 1000) {
+  const uint32_t age = effectiveRtcmAgeMs(now);
+  if (age == 0) {
+    if (lastRtcmUdpRestartMs == 0) return;
+  }
+  const uint32_t watchdogAge =
+      age != 0 ? age : now - lastRtcmUdpRestartMs;
+  if (watchdogAge > RTCM_WARN_AGE_MS && now - lastRtcmWarnMs > 1000) {
     lastRtcmWarnMs = now;
     Serial.printf("WARN rover RTCM age=%lums packets=%lu udpRestart=%lu seen=%u\n",
-                  (unsigned long)age, (unsigned long)rtcmPacketsRx,
+                  (unsigned long)watchdogAge, (unsigned long)rtcmPacketsRx,
                   (unsigned long)udpRestartCount, lastRtcmMs != 0 ? 1 : 0);
   }
-  if (age > RTCM_RESTART_AGE_MS &&
+  if (watchdogAge > RTCM_RESTART_AGE_MS &&
       now - lastRtcmUdpRestartMs > WIFI_RETRY_MS) {
     restartRtcmUdp("rtcm-age");
   }
   if (WiFi.status() != WL_CONNECTED && lastRtcmMs != 0 &&
-      age > RTCM_WIFI_RECOVER_AGE_MS) {
+      watchdogAge > RTCM_WIFI_RECOVER_AGE_MS) {
     recoverRtcmWiFi("rtcm-stale");
   }
 }
@@ -761,7 +781,7 @@ static void broadcastGps() {
   lastGpsBroadcastMs = now;
 
   const uint32_t gpsAgeMs = gps.lastMs == 0 ? 0 : now - gps.lastMs;
-  const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
+  const uint32_t rtcmAgeMs = effectiveRtcmAgeMs(now);
   const uint32_t imuAgeMs = lastImuMs == 0 ? 0 : now - lastImuMs;
   const bool freshImu = imuFresh(now);
 
@@ -967,6 +987,13 @@ static void startMotorTask() {
   Serial.println("MOTORS: heartbeat task started");
 }
 
+static bool imuEnableReports() {
+  const bool gameOk = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, 20000);
+  const bool rotOk = bno08x.enableReport(SH2_ROTATION_VECTOR, 20000);
+  imuValid = gameOk || rotOk;
+  return imuValid;
+}
+
 static bool parseMoveCommand(const String& msg, int* left, int* right) {
   if (!msg.startsWith("M,")) return false;
   const int comma = msg.indexOf(',', 2);
@@ -977,7 +1004,11 @@ static bool parseMoveCommand(const String& msg, int* left, int* right) {
 }
 
 static void imuInit() {
+  Wire.end();
+  delay(20);
   Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);
+  Wire.setClock(100000);
+  Wire.setTimeOut(20);
   Serial.printf("IMU: I2C SDA=%d SCL=%d\n", PIN_IMU_SDA, PIN_IMU_SCL);
 
   uint8_t found = 0;
@@ -999,14 +1030,12 @@ static void imuInit() {
     return;
   }
   imuDetected = true;
-  if (!bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, 20000)) {
-    imuValid = false;
-    Serial.println("IMU: BNO085 game rotation vector enable failed");
+  if (!imuEnableReports()) {
+    Serial.println("IMU: BNO085 report enable failed");
     return;
   }
-  imuValid = true;
   lastImuMs = millis();
-  Serial.println("IMU: BNO085 found, game rotation vector 50Hz");
+  Serial.println("IMU: BNO085 found, rotation vectors enabled");
 }
 
 static void imuReset(const char* reason) {
@@ -1023,8 +1052,8 @@ static void imuReset(const char* reason) {
 static void imuUpdate() {
   if (!imuDetected) return;
   if (bno08x.wasReset()) {
-    Serial.println("IMU: BNO085 reset, re-enabling game rotation vector");
-    imuValid = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, 20000);
+    Serial.println("IMU: BNO085 reset, re-enabling rotation vectors");
+    imuValid = imuEnableReports();
     if (!imuValid) return;
   }
 
@@ -1047,12 +1076,22 @@ static void imuUpdate() {
   }
 
   const uint32_t now = millis();
-  if (lastImuMs != 0 && now >= lastImuMs && now - lastImuMs > 1500 &&
-      now - lastImuRecoverMs > 1500) {
+  if (lastImuMs != 0 && now >= lastImuMs &&
+      now - lastImuMs > IMU_STALE_RESET_MS &&
+      now - lastImuRecoverMs > IMU_STALE_RESET_MS) {
     lastImuRecoverMs = now;
-    Serial.printf("WARN IMU stale age=%lums, re-enabling game rotation vector\n",
+    Serial.printf("WARN IMU hard reset age=%lums\n",
                   (unsigned long)(now - lastImuMs));
-    imuValid = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, 20000);
+    imuReset("stale");
+    return;
+  }
+  if (lastImuMs != 0 && now >= lastImuMs &&
+      now - lastImuMs > IMU_STALE_REENABLE_MS &&
+      now - lastImuRecoverMs > IMU_STALE_REENABLE_MS) {
+    lastImuRecoverMs = now;
+    Serial.printf("WARN IMU stale age=%lums, re-enabling rotation vectors\n",
+                  (unsigned long)(now - lastImuMs));
+    imuValid = imuEnableReports();
   }
 }
 
@@ -1124,7 +1163,7 @@ static void setupWeb() {
     } else if (msg == "STATUS") {
       char status[192];
       const uint32_t now = millis();
-      const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
+      const uint32_t rtcmAgeMs = effectiveRtcmAgeMs(now);
       const uint32_t imuAgeMs = lastImuMs == 0 ? 0 : now - lastImuMs;
       snprintf(status, sizeof(status),
                "STATUS,wifi=%d,udpRestart=%lu,rtcmBytes=%lu,rtcmAge=%lu,imu=%d,imuAge=%lu,yaw=%.2f,motor=%d/%d",
@@ -1182,7 +1221,7 @@ static void printStatus() {
   lastStatusMs = now;
 
   const uint32_t gpsAgeMs = gps.lastMs == 0 ? 0 : now - gps.lastMs;
-  const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
+  const uint32_t rtcmAgeMs = effectiveRtcmAgeMs(now);
   const uint32_t f9pRtcmAgeMs =
       f9pLastRtcmMs == 0 ? 0 : now - f9pLastRtcmMs;
   const uint32_t imuAgeMs = lastImuMs == 0 ? 0 : now - lastImuMs;
@@ -1218,7 +1257,7 @@ static void printStatus() {
                 (unsigned long)f9pRtcmAgeMs,
                 (!imuDetected
                      ? "not_found"
-                     : (imuValid && imuAgeMs <= 1000 ? "ok" : "stale")),
+                     : (imuFresh(now) ? "ok" : "stale")),
                 imuYaw,
                 (unsigned long)imuAgeMs,
                 motorTargetLeft,

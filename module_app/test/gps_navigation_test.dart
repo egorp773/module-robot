@@ -113,7 +113,7 @@ void main() {
       originLat: 55.0,
       originLon: 37.0,
       gpsFixType: 3,
-      gpsAgeMs: 2000,
+      gpsAgeMs: 6000,
     );
 
     expect(result.command, NavigationCommand.stop);

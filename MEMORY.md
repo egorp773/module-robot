@@ -33,6 +33,10 @@ Autonomous navigation, GPS mapping, snake-route generation, and RTK are future w
 - `HARDWARE.md`: hardware assumptions and TODOs for pins/power/sensors.
 - `TEST_LOG.md`: real test results only.
 
+## Workflow rules
+
+- Whenever `module_app/` is changed, commit the app changes and push `main` to GitHub before finishing the turn, unless the user explicitly says not to push.
+
 ## Current honest state
 
 Confirmed working:

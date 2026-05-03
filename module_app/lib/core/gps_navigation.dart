@@ -241,8 +241,9 @@ class NavigationMotorMapper {
 }
 
 class GpsNavigationController {
-  static const double maxRtcmAgeMs = 1500;
-  static const int maxRoverGpsAgeMs = 1500;
+  static const double maxRtcmAgeMs = 7000;
+  static const double maxRtcmHoldAgeMs = 20000;
+  static const int maxRoverGpsAgeMs = 5000;
   static const int maxHorizontalAccuracyMm = 50;
   static const double arrivedDistanceM = 0.3;
   static const double turnThresholdDeg = 20;
@@ -336,7 +337,7 @@ class GpsNavigationController {
     if (!rtkFixed) {
       return result(NavigationCommand.stop, 'RTK не fixed');
     }
-    if (rtcmAgeMs == null || rtcmAgeMs > maxRtcmAgeMs) {
+    if (rtcmAgeMs == null || rtcmAgeMs > maxRtcmHoldAgeMs) {
       return result(NavigationCommand.stop, 'RTCM старый');
     }
     if (hAccMm == null || hAccMm > maxHorizontalAccuracyMm) {

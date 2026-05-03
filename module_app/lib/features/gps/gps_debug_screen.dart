@@ -74,6 +74,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   MotorDriveCommand? _lastSentMotorCommand;
   DateTime? _lastMotorLogAt;
   DateTime? _lastAutoHeadingCalibrationAt;
+  double? _lastStableHeadingDegrees;
+  DateTime? _lastStableHeadingAt;
   final TextEditingController _nameCtrl = TextEditingController();
   final TextEditingController _hostCtrl = TextEditingController();
   final FocusNode _hostFocus = FocusNode();
@@ -135,7 +137,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       targetLat: _navigationTarget?.lat,
       targetLon: _navigationTarget?.lon,
       headingDegrees: navigationHeading,
-      rtkFixed: wifi.gpsCarrier == 'fixed',
+      rtkFixed: _rtkOk(wifi),
       rtcmAgeMs: wifi.rtcmAgeMs,
       hAccMm: wifi.gpsAccuracy,
       originLat: navigationOrigin?.lat,
@@ -946,35 +948,57 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     final roverAge = wifi.imuAgeMs;
     return wifi.imuYaw != null &&
         roverFresh &&
-        (roverAge == null || roverAge < 1200) &&
+        (roverAge == null || roverAge < 5000) &&
         receivedAt != null &&
-        DateTime.now().difference(receivedAt).inMilliseconds < 1500;
+        DateTime.now().difference(receivedAt).inMilliseconds < 6000;
   }
 
   double? _navigationHeadingFor(WifiConnectionState wifi) {
-    if (_headingCalibrated && _hasFreshImu(wifi)) {
-      return _headingCalibration.apply(wifi.imuYaw!);
+    double? heading;
+    if (_hasFreshImu(wifi)) {
+      heading = _headingCalibrated
+          ? _headingCalibration.apply(wifi.imuYaw!)
+          : wifi.imuYaw;
     }
     final speed = wifi.gpsSpeedMps;
-    if (wifi.gpsHeading != null && speed != null && speed >= 0.35) {
-      return wifi.gpsHeading;
+    if (heading == null &&
+        wifi.gpsHeading != null &&
+        speed != null &&
+        speed >= 0.35) {
+      heading = wifi.gpsHeading;
+    }
+    if (heading != null) {
+      _lastStableHeadingDegrees = heading;
+      _lastStableHeadingAt = DateTime.now();
+      return heading;
+    }
+    final last = _lastStableHeadingAt;
+    if (last != null &&
+        DateTime.now().difference(last) < const Duration(seconds: 8)) {
+      return _lastStableHeadingDegrees;
     }
     return null;
   }
 
   String _navigationHeadingSourceFor(WifiConnectionState wifi) {
     if (_headingCalibrated && _hasFreshImu(wifi)) return 'BNO085 + offset';
-    if (!_headingCalibrated && _hasFreshImu(wifi)) {
-      return 'BNO085 not calibrated';
+    if (!_headingCalibrated && _hasFreshImu(wifi)) return 'BNO085 raw';
+    final speed = wifi.gpsSpeedMps;
+    if (wifi.gpsHeading != null && speed != null && speed >= 0.35) {
+      return 'GPS fallback';
     }
-    if (_navigationHeadingFor(wifi) != null) return 'GPS fallback';
+    final last = _lastStableHeadingAt;
+    if (last != null &&
+        DateTime.now().difference(last) < const Duration(seconds: 8)) {
+      return 'heading hold';
+    }
     return 'нет свежего курса';
   }
 
   bool _gpsCourseReliableForHeading(WifiConnectionState wifi) {
     final speed = wifi.gpsSpeedMps;
     final age = wifi.gpsAgeMs;
-    return wifi.gpsCarrier == 'fixed' &&
+    return _rtkOk(wifi) &&
         _rtcmFresh(wifi.rtcmAgeMs) &&
         wifi.gpsHeading != null &&
         speed != null &&
@@ -1126,7 +1150,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       targetLat: target.lat,
       targetLon: target.lon,
       headingDegrees: _navigationHeadingFor(wifi),
-      rtkFixed: wifi.gpsCarrier == 'fixed',
+      rtkFixed: _rtkOk(wifi),
       rtcmAgeMs: wifi.rtcmAgeMs,
       hAccMm: wifi.gpsAccuracy,
       originLat: origin.lat,
@@ -1203,7 +1227,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       targetLat: _navigationTarget!.lat,
       targetLon: _navigationTarget!.lon,
       headingDegrees: _navigationHeadingFor(wifi),
-      rtkFixed: wifi.gpsCarrier == 'fixed',
+      rtkFixed: _rtkOk(wifi),
       rtcmAgeMs: wifi.rtcmAgeMs,
       hAccMm: wifi.gpsAccuracy,
       originLat: origin.lat,
@@ -1280,7 +1304,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       targetLat: target.lat,
       targetLon: target.lon,
       headingDegrees: heading,
-      rtkFixed: wifi.gpsCarrier == 'fixed',
+      rtkFixed: _rtkOk(wifi),
       rtcmAgeMs: wifi.rtcmAgeMs,
       hAccMm: wifi.gpsAccuracy,
       originLat: origin.lat,
@@ -1489,7 +1513,10 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   }
 
   static bool _rtkOk(WifiConnectionState wifi) {
-    return wifi.gpsCarrier == 'fixed' && _rtcmFresh(wifi.rtcmAgeMs);
+    final accurateDiff =
+        (wifi.gpsDiff ?? false) && (wifi.gpsAccuracy ?? 999999) <= 50;
+    return (wifi.gpsCarrier == 'fixed' || accurateDiff) &&
+        _rtcmFresh(wifi.rtcmAgeMs);
   }
 
   static bool _precisionOk(WifiConnectionState wifi) {
@@ -1500,20 +1527,22 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   }
 
   static bool _rtcmFresh(int? ageMs) {
-    return ageMs != null && ageMs <= 3000;
+    return ageMs != null && ageMs <= GpsNavigationController.maxRtcmAgeMs;
   }
 
   static String _rtcmStatusText(int? ageMs) {
     if (ageMs == null) return 'RTCM нет';
     if (ageMs > 10000) return 'RTCM потерян';
-    if (ageMs > 3000) return 'RTCM старый';
+    if (ageMs > GpsNavigationController.maxRtcmAgeMs) return 'RTCM stale';
     return 'RTCM свежий';
   }
 
   static String _rtcmMetricValue(int? ageMs) {
     if (ageMs == null) return 'нет данных';
     if (ageMs > 10000) return '$ageMs ms\nпотерян';
-    if (ageMs > 3000) return '$ageMs ms\nстарый';
+    if (ageMs > GpsNavigationController.maxRtcmAgeMs) {
+      return '$ageMs ms\nstale';
+    }
     return '$ageMs ms\nсвежий';
   }
 
