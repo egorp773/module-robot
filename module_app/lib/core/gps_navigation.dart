@@ -112,6 +112,26 @@ class HeadingCalibration {
       invertYaw: invertYaw,
     );
   }
+
+  HeadingCalibration correctTowardObservedHeading({
+    required double rawDegrees,
+    required double observedHeadingDegrees,
+    double gain = 0.18,
+    double maxErrorDegrees = 35,
+  }) {
+    final current = apply(rawDegrees);
+    final error = GpsLocalGeometry.headingErrorDegrees(
+      current,
+      observedHeadingDegrees,
+    );
+    if (error.abs() > maxErrorDegrees) return this;
+    return HeadingCalibration(
+      offsetDegrees: GpsLocalGeometry.normalizeDegrees(
+        offsetDegrees + error * gain.clamp(0.0, 1.0),
+      ),
+      invertYaw: invertYaw,
+    );
+  }
 }
 
 enum NavigationCommand {

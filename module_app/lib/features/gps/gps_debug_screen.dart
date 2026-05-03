@@ -44,6 +44,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   static const double _autoPointMinDistanceM = 0.20;
   static const double _trailMinDistanceM = 0.10;
   static const int _trailMaxPoints = 900;
+  static const Duration _autoHeadingCalibrationInterval =
+      Duration(milliseconds: 1200);
   static const String _prefsHeadingOffsetKey = 'gps_nav_heading_offset';
   static const String _prefsInvertYawKey = 'gps_nav_invert_yaw';
   static const String _prefsInvertForwardKey = 'gps_nav_invert_forward';
@@ -71,6 +73,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   bool _invertSteering = false;
   MotorDriveCommand? _lastSentMotorCommand;
   DateTime? _lastMotorLogAt;
+  DateTime? _lastAutoHeadingCalibrationAt;
   final TextEditingController _nameCtrl = TextEditingController();
   final TextEditingController _hostCtrl = TextEditingController();
   final FocusNode _hostFocus = FocusNode();
@@ -414,6 +417,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                               navigation.bearingDegrees == null
                           ? null
                           : () => _calibrateHeadingToTarget(wifi),
+                      onResetImu:
+                          wifi.isConnected ? _resetImuCalibration : null,
                       onInvertYawChanged: _setInvertYaw,
                       onInvertForwardChanged: _setInvertForward,
                       onInvertSteeringChanged: _setInvertSteering,
@@ -937,7 +942,11 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
 
   static bool _hasFreshImu(WifiConnectionState wifi) {
     final receivedAt = wifi.imuReceivedAt;
+    final roverFresh = wifi.imuFresh ?? true;
+    final roverAge = wifi.imuAgeMs;
     return wifi.imuYaw != null &&
+        roverFresh &&
+        (roverAge == null || roverAge < 1200) &&
         receivedAt != null &&
         DateTime.now().difference(receivedAt).inMilliseconds < 1500;
   }
@@ -960,6 +969,61 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     }
     if (_navigationHeadingFor(wifi) != null) return 'GPS fallback';
     return 'нет свежего курса';
+  }
+
+  bool _gpsCourseReliableForHeading(WifiConnectionState wifi) {
+    final speed = wifi.gpsSpeedMps;
+    final age = wifi.gpsAgeMs;
+    return wifi.gpsCarrier == 'fixed' &&
+        _rtcmFresh(wifi.rtcmAgeMs) &&
+        wifi.gpsHeading != null &&
+        speed != null &&
+        speed >= 0.55 &&
+        (wifi.gpsAccuracy ?? 999999) <=
+            GpsNavigationController.maxHorizontalAccuracyMm &&
+        (age == null || age <= GpsNavigationController.maxRoverGpsAgeMs);
+  }
+
+  void _maybeAutoTuneHeadingFromGps(
+    WifiConnectionState wifi,
+    NavigationResult result,
+    MotorDriveCommand motorCommand,
+  ) {
+    if (!_hasFreshImu(wifi) || !_gpsCourseReliableForHeading(wifi)) return;
+    if (result.command != NavigationCommand.forward) return;
+    if (motorCommand.left == 0 || motorCommand.right == 0) return;
+    if (motorCommand.left.sign != motorCommand.right.sign) return;
+
+    final now = DateTime.now();
+    final last = _lastAutoHeadingCalibrationAt;
+    if (last != null &&
+        now.difference(last) < _autoHeadingCalibrationInterval) {
+      return;
+    }
+    _lastAutoHeadingCalibrationAt = now;
+
+    final nextCalibration = _headingCalibration.correctTowardObservedHeading(
+      rawDegrees: wifi.imuYaw!,
+      observedHeadingDegrees: wifi.gpsHeading!,
+    );
+    if (nextCalibration.offsetDegrees == _headingCalibration.offsetDegrees) {
+      return;
+    }
+
+    setState(() {
+      _headingCalibration = nextCalibration;
+      _headingCalibrated = true;
+    });
+    _saveNavigationSettings();
+  }
+
+  void _resetImuCalibration() {
+    ref.read(wifiConnectionProvider.notifier).sendRaw('IMU_RESET');
+    setState(() {
+      _headingCalibrated = false;
+      _notice = 'IMU reset requested. Повтори калибровку носом на цель.';
+    });
+    _saveNavigationSettings();
   }
 
   void _startRoute(List<GpsPerimeterPoint> routePoints) {
@@ -1086,6 +1150,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       invertSteering: _invertSteering,
     );
     final notifier = ref.read(wifiConnectionProvider.notifier);
+    _maybeAutoTuneHeadingFromGps(wifi, result, motorCommand);
     if (motorCommand.isStop) {
       notifier.sendStop();
     } else {
@@ -1900,6 +1965,7 @@ class _NavigationPanel extends StatelessWidget {
   final VoidCallback? onStartRoute;
   final VoidCallback onPauseRoute;
   final VoidCallback? onCalibrateHeading;
+  final VoidCallback? onResetImu;
   final ValueChanged<bool> onInvertYawChanged;
   final ValueChanged<bool> onInvertForwardChanged;
   final ValueChanged<bool> onInvertSteeringChanged;
@@ -1936,6 +2002,7 @@ class _NavigationPanel extends StatelessWidget {
     required this.onStartRoute,
     required this.onPauseRoute,
     required this.onCalibrateHeading,
+    required this.onResetImu,
     required this.onInvertYawChanged,
     required this.onInvertForwardChanged,
     required this.onInvertSteeringChanged,
@@ -2109,6 +2176,12 @@ class _NavigationPanel extends StatelessWidget {
               onTap: onCalibrateHeading,
             ),
             _Action(
+              icon: Icons.restart_alt_rounded,
+              label: 'Reset IMU',
+              color: const Color(0xFFFFD166),
+              onTap: onResetImu,
+            ),
+            _Action(
               icon: Icons.my_location_rounded,
               label: 'Цель = я',
               color: const Color(0xFF7AA2FF),
@@ -2195,7 +2268,7 @@ class _NavigationPanel extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         Text(
-          'Курс берется с BNO085, если есть IMU yaw; иначе используется GPS heading. Моторы двигаются только когда включен тумблер "Моторы вкл".',
+          'Курс берется с BNO085 только после калибровки offset; при уверенном движении offset плавно уточняется по RTK/GPS heading.',
           style: TextStyle(
             color: Colors.white.withValues(alpha: 0.58),
             fontSize: 12,

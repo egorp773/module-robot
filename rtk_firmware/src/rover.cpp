@@ -172,6 +172,10 @@ static float imuYaw = 0.0f;
 static uint32_t lastImuMs = 0;
 static uint32_t lastImuRecoverMs = 0;
 
+static bool imuFresh(uint32_t now) {
+  return imuDetected && imuValid && lastImuMs != 0 && now - lastImuMs <= 1000;
+}
+
 static void putU32(uint8_t* p, uint32_t v) {
   p[0] = (uint8_t)v;
   p[1] = (uint8_t)(v >> 8);
@@ -984,6 +988,17 @@ static void imuInit() {
   Serial.println("IMU: BNO085 found, game rotation vector 50Hz");
 }
 
+static void imuReset(const char* reason) {
+  Serial.printf("IMU: reset requested reason=%s\n", reason);
+  imuDetected = false;
+  imuValid = false;
+  lastImuMs = 0;
+  lastImuRecoverMs = 0;
+  Wire.end();
+  delay(80);
+  imuInit();
+}
+
 static void imuUpdate() {
   if (!imuDetected) return;
   if (bno08x.wasReset()) {
@@ -1024,9 +1039,11 @@ static void broadcastImu() {
   const uint32_t now = millis();
   if (now - lastImuBroadcastMs < IMU_BROADCAST_MS) return;
   lastImuBroadcastMs = now;
-  if (!imuValid || lastImuMs == 0 || now - lastImuMs > 1000) return;
-  char msg[32];
-  snprintf(msg, sizeof(msg), "IMU,%.2f", imuYaw);
+  if (!imuFresh(now)) return;
+  const uint32_t imuAgeMs = now - lastImuMs;
+  char msg[48];
+  snprintf(msg, sizeof(msg), "IMU,%.2f,%lu,1", imuYaw,
+           (unsigned long)imuAgeMs);
   ws.textAll(msg);
 }
 
@@ -1068,19 +1085,33 @@ static void setupWeb() {
     } else if (msg == "UDP_RESET") {
       restartRtcmUdp("ws UDP_RESET");
       client->text("OK UDP_RESET");
+    } else if (msg == "IMU_RESET") {
+      client->text("OK IMU_RESET");
+      imuReset("ws IMU_RESET");
+    } else if (msg == "IMU_STATUS") {
+      char status[96];
+      const uint32_t now = millis();
+      const uint32_t imuAgeMs = lastImuMs == 0 ? 0 : now - lastImuMs;
+      snprintf(status, sizeof(status),
+               "IMU_STATUS,detected=%d,valid=%d,fresh=%d,age=%lu,yaw=%.2f",
+               imuDetected ? 1 : 0,
+               imuValid ? 1 : 0,
+               imuFresh(now) ? 1 : 0,
+               (unsigned long)imuAgeMs,
+               imuYaw);
+      client->text(status);
     } else if (msg == "STATUS") {
       char status[192];
       const uint32_t now = millis();
       const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
       const uint32_t imuAgeMs = lastImuMs == 0 ? 0 : now - lastImuMs;
-      const bool imuFresh = imuDetected && imuValid && imuAgeMs <= 1000;
       snprintf(status, sizeof(status),
                "STATUS,wifi=%d,udpRestart=%lu,rtcmBytes=%lu,rtcmAge=%lu,imu=%d,imuAge=%lu,yaw=%.2f,motor=%d/%d",
                WiFi.status(),
                (unsigned long)udpRestartCount,
                (unsigned long)rtcmBytesRx,
                (unsigned long)rtcmAgeMs,
-               imuFresh ? 1 : 0,
+               imuFresh(now) ? 1 : 0,
                (unsigned long)imuAgeMs,
                imuYaw,
                motorTargetLeft,

@@ -33,6 +33,9 @@ class WifiConnectionState {
 
   // IMU data
   final double? imuYaw;
+  final int? imuAgeMs;
+  final bool? imuFresh;
+  final DateTime? imuReceivedAt;
 
   // Navigation data
   final String? navState; // IDLE, RUNNING, PAUSED, DONE, ERROR
@@ -63,6 +66,9 @@ class WifiConnectionState {
     this.rtcmBytes,
     this.rtcmAgeMs,
     this.imuYaw,
+    this.imuAgeMs,
+    this.imuFresh,
+    this.imuReceivedAt,
     this.navState,
     this.navWpIndex,
     this.navWpTotal,
@@ -92,6 +98,9 @@ class WifiConnectionState {
         rtcmBytes: null,
         rtcmAgeMs: null,
         imuYaw: null,
+        imuAgeMs: null,
+        imuFresh: null,
+        imuReceivedAt: null,
         navState: null,
         navWpIndex: null,
         navWpTotal: null,
@@ -121,6 +130,9 @@ class WifiConnectionState {
     int? rtcmBytes,
     int? rtcmAgeMs,
     double? imuYaw,
+    int? imuAgeMs,
+    bool? imuFresh,
+    DateTime? imuReceivedAt,
     String? navState,
     int? navWpIndex,
     int? navWpTotal,
@@ -149,10 +161,52 @@ class WifiConnectionState {
       rtcmBytes: rtcmBytes ?? this.rtcmBytes,
       rtcmAgeMs: rtcmAgeMs ?? this.rtcmAgeMs,
       imuYaw: imuYaw ?? this.imuYaw,
+      imuAgeMs: imuAgeMs ?? this.imuAgeMs,
+      imuFresh: imuFresh ?? this.imuFresh,
+      imuReceivedAt: imuReceivedAt ?? this.imuReceivedAt,
       navState: navState ?? this.navState,
       navWpIndex: navWpIndex ?? this.navWpIndex,
       navWpTotal: navWpTotal ?? this.navWpTotal,
       navDistToWp: navDistToWp ?? this.navDistToWp,
+    );
+  }
+
+  WifiConnectionState clearTelemetry({
+    bool? isConnecting,
+    bool? isConnected,
+    String? error,
+    List<String>? rxLog,
+  }) {
+    return WifiConnectionState(
+      isConnecting: isConnecting ?? this.isConnecting,
+      isConnected: isConnected ?? this.isConnected,
+      error: error,
+      rxLog: rxLog ?? this.rxLog,
+      batteryPercent: null,
+      gpsLat: null,
+      gpsLon: null,
+      gpsHeading: null,
+      gpsFixType: null,
+      gpsAccuracy: null,
+      gpsHeightM: null,
+      gpsCarrier: null,
+      gpsDiff: null,
+      gpsSatellites: null,
+      gpsVAccuracy: null,
+      gpsSpeedMps: null,
+      gpsPDop: null,
+      gpsAgeMs: null,
+      gpsReceivedAt: null,
+      rtcmBytes: null,
+      rtcmAgeMs: null,
+      imuYaw: null,
+      imuAgeMs: null,
+      imuFresh: null,
+      imuReceivedAt: null,
+      navState: null,
+      navWpIndex: null,
+      navWpTotal: null,
+      navDistToWp: null,
     );
   }
 }
@@ -427,7 +481,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
     _log("× connection lost: $error");
     await _closeSocketOnly();
-    state = state.copyWith(
+    state = state.clearTelemetry(
       isConnecting: false,
       isConnected: false,
       error: error,
@@ -523,7 +577,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     _lastGpsDebugAt = null;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
-    state = state.copyWith(isConnecting: true, error: null);
+    state = state.clearTelemetry(isConnecting: true, error: null);
     _log("=== CONNECT START ===");
     await _ref.read(wifiRobotHostProvider.notifier).ensureInitialized();
 
@@ -704,14 +758,23 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
             }
           }
 
-          // Парсинг IMU,<yaw>
+          // Парсинг IMU,<yaw>[,<ageMs>,<fresh>]
           if (msgStr.startsWith("IMU,")) {
             try {
               final parts = msgStr.split(",");
               if (parts.length >= 2) {
                 final yaw = double.tryParse(parts[1]);
                 if (yaw != null) {
-                  state = state.copyWith(imuYaw: yaw);
+                  final ageMs =
+                      parts.length >= 3 ? int.tryParse(parts[2]) : null;
+                  final fresh =
+                      parts.length >= 4 ? parts[3].trim() == '1' : true;
+                  state = state.copyWith(
+                    imuYaw: yaw,
+                    imuAgeMs: ageMs,
+                    imuFresh: fresh,
+                    imuReceivedAt: DateTime.now(),
+                  );
                 }
               }
             } catch (e) {
@@ -839,7 +902,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
   Future<void> _handleConnectFail(String error) async {
     await _closeSocketOnly();
-    state = state.copyWith(
+    state = state.clearTelemetry(
       isConnecting: false,
       isConnected: false,
       error: error,
@@ -853,11 +916,10 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     _reconnectTimer = null;
     _healthTimer?.cancel();
     _healthTimer = null;
-    state = state.copyWith(
+    state = state.clearTelemetry(
       isConnecting: false,
       isConnected: false,
       error: error,
-      batteryPercent: null, // Сбрасываем данные батареи при отключении
     );
 
     await _closeSocketOnly();

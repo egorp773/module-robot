@@ -175,6 +175,32 @@ void main() {
     expect(aligned.apply(103), closeTo(0, 0.001));
   });
 
+  test('heading calibration corrects gradually toward GPS course', () {
+    const calibration = HeadingCalibration(offsetDegrees: 10);
+
+    final corrected = calibration.correctTowardObservedHeading(
+      rawDegrees: 80,
+      observedHeadingDegrees: 100,
+      gain: 0.25,
+    );
+
+    expect(calibration.apply(80), closeTo(90, 0.001));
+    expect(corrected.offsetDegrees, closeTo(12.5, 0.001));
+    expect(corrected.apply(80), closeTo(92.5, 0.001));
+  });
+
+  test('heading calibration ignores impossible GPS course jumps', () {
+    const calibration = HeadingCalibration(offsetDegrees: 10);
+
+    final corrected = calibration.correctTowardObservedHeading(
+      rawDegrees: 80,
+      observedHeadingDegrees: 180,
+      gain: 0.25,
+    );
+
+    expect(corrected.offsetDegrees, calibration.offsetDegrees);
+  });
+
   test('motor mapper can invert forward and steering direction', () {
     const mapper = NavigationMotorMapper();
 
