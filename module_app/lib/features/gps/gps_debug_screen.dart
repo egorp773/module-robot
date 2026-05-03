@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/gps_navigation.dart';
 import '../../core/gps_perimeter_storage.dart';
@@ -43,6 +44,13 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   static const double _autoPointMinDistanceM = 0.20;
   static const double _trailMinDistanceM = 0.10;
   static const int _trailMaxPoints = 900;
+  static const String _prefsHeadingOffsetKey = 'gps_nav_heading_offset';
+  static const String _prefsInvertYawKey = 'gps_nav_invert_yaw';
+  static const String _prefsInvertForwardKey = 'gps_nav_invert_forward';
+  static const String _prefsInvertSteeringKey = 'gps_nav_invert_steering';
+  static const String _prefsForwardPercentKey = 'gps_nav_forward_percent';
+  static const String _prefsTurnPercentKey = 'gps_nav_turn_percent';
+  static const String _prefsHeadingCalibratedKey = 'gps_nav_heading_calibrated';
 
   final List<GpsPerimeterPoint> _points = [];
   final List<GpsPerimeterPoint> _trail = [];
@@ -57,6 +65,10 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   bool _routeRunning = false;
   int _forwardPercent = 22;
   int _turnPercent = 18;
+  HeadingCalibration _headingCalibration = const HeadingCalibration();
+  bool _headingCalibrated = false;
+  bool _invertForward = false;
+  bool _invertSteering = false;
   MotorDriveCommand? _lastSentMotorCommand;
   DateTime? _lastMotorLogAt;
   final TextEditingController _nameCtrl = TextEditingController();
@@ -75,6 +87,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     final stamp = DateTime.now();
     _nameCtrl.text =
         'GPS ${stamp.year}-${_two(stamp.month)}-${_two(stamp.day)} ${_two(stamp.hour)}-${_two(stamp.minute)}';
+    _loadNavigationSettings();
   }
 
   @override
@@ -109,8 +122,10 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     final navigationPoints = _points.isNotEmpty ? _points : openedPoints;
     final navigationOrigin =
         _navigationOrigin ?? currentPoint ?? _firstPoint(navigationPoints);
-    final navigationHeading = wifi.imuYaw ?? wifi.gpsHeading;
-    final navigationHeadingSource = wifi.imuYaw != null ? 'BNO085' : 'GPS';
+    final rawNavigationHeading =
+        _hasFreshImu(wifi) ? wifi.imuYaw : wifi.gpsHeading;
+    final navigationHeading = _navigationHeadingFor(wifi);
+    final navigationHeadingSource = _navigationHeadingSourceFor(wifi);
     final navigation = const GpsNavigationController().evaluate(
       currentLat: wifi.gpsLat,
       currentLon: wifi.gpsLon,
@@ -122,11 +137,24 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       hAccMm: wifi.gpsAccuracy,
       originLat: navigationOrigin?.lat,
       originLon: navigationOrigin?.lon,
+      gpsFixType: wifi.gpsFixType,
+      gpsAgeMs: wifi.gpsAgeMs,
+      gpsReceivedAt: wifi.gpsReceivedAt,
     );
+    final movementBearing = _movementBearing();
+    final movementTargetError =
+        movementBearing == null || navigation.bearingDegrees == null
+            ? null
+            : GpsLocalGeometry.headingErrorDegrees(
+                movementBearing,
+                navigation.bearingDegrees!,
+              );
     final motorPreview = const NavigationMotorMapper().toMotorCommand(
       navigation.command,
       forwardPercent: _forwardPercent,
       turnPercent: _turnPercent,
+      invertForward: _invertForward,
+      invertSteering: _invertSteering,
     );
     final routeLabel = _navigationTargetIndex == null
         ? 'ручная цель'
@@ -367,13 +395,28 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                       routeRunning: _routeRunning,
                       forwardPercent: _forwardPercent,
                       turnPercent: _turnPercent,
+                      rawHeadingDegrees: rawNavigationHeading,
                       headingDegrees: navigationHeading,
                       headingSource: navigationHeadingSource,
+                      headingOffsetDegrees: _headingCalibration.offsetDegrees,
+                      invertYaw: _headingCalibration.invertYaw,
+                      invertForward: _invertForward,
+                      invertSteering: _invertSteering,
+                      movementBearingDegrees: movementBearing,
+                      movementTargetErrorDegrees: movementTargetError,
                       onToggleMotors: _toggleMotors,
                       onStartRoute: navigationPoints.isEmpty
                           ? null
                           : () => _startRoute(navigationPoints),
                       onPauseRoute: _pauseRoute,
+                      onCalibrateHeading: _navigationTarget == null ||
+                              wifi.imuYaw == null ||
+                              navigation.bearingDegrees == null
+                          ? null
+                          : () => _calibrateHeadingToTarget(wifi),
+                      onInvertYawChanged: _setInvertYaw,
+                      onInvertForwardChanged: _setInvertForward,
+                      onInvertSteeringChanged: _setInvertSteering,
                       onSetCurrentTarget: currentPoint == null
                           ? null
                           : () => _setNavigationTargetToCurrent(wifi),
@@ -386,10 +429,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                       onClearTarget: _navigationTarget == null
                           ? null
                           : _clearNavigationTarget,
-                      onForwardChanged: (value) =>
-                          setState(() => _forwardPercent = value.round()),
-                      onTurnChanged: (value) =>
-                          setState(() => _turnPercent = value.round()),
+                      onForwardChanged: _setForwardPercent,
+                      onTurnChanged: _setTurnPercent,
                     ),
                   ),
                   const SizedBox(height: 10),
@@ -755,6 +796,172 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     _setNavigationTargetByIndex(nextIndex);
   }
 
+  double? _movementBearing() {
+    if (_trail.length < 2) return null;
+    for (var i = _trail.length - 2; i >= 0; i--) {
+      final from = _trail[i];
+      final to = _trail.last;
+      final distance =
+          GpsLocalGeometry.distanceMeters(from.lat, from.lon, to.lat, to.lon);
+      if (distance >= 0.35) {
+        return GpsLocalGeometry.bearingDegrees(
+          from.lat,
+          from.lon,
+          to.lat,
+          to.lon,
+        );
+      }
+    }
+    return null;
+  }
+
+  void _setInvertYaw(bool value) {
+    final wifi = ref.read(wifiConnectionProvider);
+    final targetBearing = _targetBearing(wifi);
+    setState(() {
+      _headingCalibration = HeadingCalibration(
+        offsetDegrees: _headingCalibration.offsetDegrees,
+        invertYaw: value,
+      );
+      if (wifi.imuYaw != null && targetBearing != null) {
+        _headingCalibration = _headingCalibration.alignRawToTarget(
+          rawDegrees: wifi.imuYaw!,
+          targetDegrees: targetBearing,
+        );
+        _headingCalibrated = true;
+      } else {
+        _headingCalibrated = false;
+      }
+      _notice = 'IMU invert: ${value ? 'ON' : 'OFF'}.';
+    });
+    _saveNavigationSettings();
+  }
+
+  Future<void> _loadNavigationSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
+      setState(() {
+        _headingCalibration = HeadingCalibration(
+          offsetDegrees: prefs.getDouble(_prefsHeadingOffsetKey) ?? 0,
+          invertYaw: prefs.getBool(_prefsInvertYawKey) ?? false,
+        );
+        _headingCalibrated = prefs.getBool(_prefsHeadingCalibratedKey) ?? false;
+        _invertForward = prefs.getBool(_prefsInvertForwardKey) ?? false;
+        _invertSteering = prefs.getBool(_prefsInvertSteeringKey) ?? false;
+        _forwardPercent =
+            (prefs.getInt(_prefsForwardPercentKey) ?? 22).clamp(8, 35).toInt();
+        _turnPercent =
+            (prefs.getInt(_prefsTurnPercentKey) ?? 18).clamp(8, 35).toInt();
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _notice = 'Не удалось загрузить настройки навигации: $e');
+    }
+  }
+
+  Future<void> _saveNavigationSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(
+        _prefsHeadingOffsetKey,
+        _headingCalibration.offsetDegrees,
+      );
+      await prefs.setBool(_prefsHeadingCalibratedKey, _headingCalibrated);
+      await prefs.setBool(_prefsInvertYawKey, _headingCalibration.invertYaw);
+      await prefs.setBool(_prefsInvertForwardKey, _invertForward);
+      await prefs.setBool(_prefsInvertSteeringKey, _invertSteering);
+      await prefs.setInt(_prefsForwardPercentKey, _forwardPercent);
+      await prefs.setInt(_prefsTurnPercentKey, _turnPercent);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _notice = 'Не удалось сохранить настройки навигации: $e');
+    }
+  }
+
+  void _setInvertForward(bool value) {
+    setState(() {
+      _invertForward = value;
+      _notice = 'Forward invert: ${value ? 'ON' : 'OFF'}.';
+    });
+    _saveNavigationSettings();
+  }
+
+  void _setInvertSteering(bool value) {
+    setState(() {
+      _invertSteering = value;
+      _notice = 'Steering invert: ${value ? 'ON' : 'OFF'}.';
+    });
+    _saveNavigationSettings();
+  }
+
+  void _setForwardPercent(double value) {
+    setState(() => _forwardPercent = value.round());
+    _saveNavigationSettings();
+  }
+
+  void _setTurnPercent(double value) {
+    setState(() => _turnPercent = value.round());
+    _saveNavigationSettings();
+  }
+
+  double? _targetBearing(WifiConnectionState wifi) {
+    final target = _navigationTarget;
+    final lat = wifi.gpsLat;
+    final lon = wifi.gpsLon;
+    if (target == null || lat == null || lon == null) return null;
+    return GpsLocalGeometry.bearingDegrees(lat, lon, target.lat, target.lon);
+  }
+
+  void _calibrateHeadingToTarget(WifiConnectionState wifi) {
+    final rawYaw = wifi.imuYaw;
+    final targetBearing = _targetBearing(wifi);
+    if (rawYaw == null || targetBearing == null) {
+      setState(() => _notice = 'Нет IMU yaw или цели для калибровки.');
+      return;
+    }
+    setState(() {
+      _headingCalibration = _headingCalibration.alignRawToTarget(
+        rawDegrees: rawYaw,
+        targetDegrees: targetBearing,
+      );
+      _headingCalibrated = true;
+      _notice =
+          'IMU offset: ${_headingCalibration.offsetDegrees.toStringAsFixed(1)} deg. Нос робота должен смотреть на цель.';
+    });
+    ref.read(wifiConnectionProvider.notifier).addLocalLog(
+          'NAV IMU calibrate raw=${rawYaw.toStringAsFixed(1)} target=${targetBearing.toStringAsFixed(1)} offset=${_headingCalibration.offsetDegrees.toStringAsFixed(1)} invert=${_headingCalibration.invertYaw ? 1 : 0}',
+        );
+    _saveNavigationSettings();
+  }
+
+  static bool _hasFreshImu(WifiConnectionState wifi) {
+    final receivedAt = wifi.imuReceivedAt;
+    return wifi.imuYaw != null &&
+        receivedAt != null &&
+        DateTime.now().difference(receivedAt).inMilliseconds < 1500;
+  }
+
+  double? _navigationHeadingFor(WifiConnectionState wifi) {
+    if (_headingCalibrated && _hasFreshImu(wifi)) {
+      return _headingCalibration.apply(wifi.imuYaw!);
+    }
+    final speed = wifi.gpsSpeedMps;
+    if (wifi.gpsHeading != null && speed != null && speed >= 0.35) {
+      return wifi.gpsHeading;
+    }
+    return null;
+  }
+
+  String _navigationHeadingSourceFor(WifiConnectionState wifi) {
+    if (_headingCalibrated && _hasFreshImu(wifi)) return 'BNO085 + offset';
+    if (!_headingCalibrated && _hasFreshImu(wifi)) {
+      return 'BNO085 not calibrated';
+    }
+    if (_navigationHeadingFor(wifi) != null) return 'GPS fallback';
+    return 'нет свежего курса';
+  }
+
   void _startRoute(List<GpsPerimeterPoint> routePoints) {
     if (routePoints.isEmpty) {
       setState(() => _notice = 'Нет точек маршрута.');
@@ -854,12 +1061,15 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       currentLon: wifi.gpsLon,
       targetLat: target.lat,
       targetLon: target.lon,
-      headingDegrees: wifi.imuYaw ?? wifi.gpsHeading,
+      headingDegrees: _navigationHeadingFor(wifi),
       rtkFixed: wifi.gpsCarrier == 'fixed',
       rtcmAgeMs: wifi.rtcmAgeMs,
       hAccMm: wifi.gpsAccuracy,
       originLat: origin.lat,
       originLon: origin.lon,
+      gpsFixType: wifi.gpsFixType,
+      gpsAgeMs: wifi.gpsAgeMs,
+      gpsReceivedAt: wifi.gpsReceivedAt,
     );
 
     if (result.command == NavigationCommand.arrived) {
@@ -872,6 +1082,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       result.command,
       forwardPercent: _forwardPercent,
       turnPercent: _turnPercent,
+      invertForward: _invertForward,
+      invertSteering: _invertSteering,
     );
     final notifier = ref.read(wifiConnectionProvider.notifier);
     if (motorCommand.isStop) {
@@ -925,12 +1137,15 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       currentLon: wifi.gpsLon,
       targetLat: _navigationTarget!.lat,
       targetLon: _navigationTarget!.lon,
-      headingDegrees: wifi.imuYaw ?? wifi.gpsHeading,
+      headingDegrees: _navigationHeadingFor(wifi),
       rtkFixed: wifi.gpsCarrier == 'fixed',
       rtcmAgeMs: wifi.rtcmAgeMs,
       hAccMm: wifi.gpsAccuracy,
       originLat: origin.lat,
       originLon: origin.lon,
+      gpsFixType: wifi.gpsFixType,
+      gpsAgeMs: wifi.gpsAgeMs,
+      gpsReceivedAt: wifi.gpsReceivedAt,
     );
     if (result.command == NavigationCommand.arrived) {
       _advanceRouteAfterArrival();
@@ -993,7 +1208,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     if (target == null) return;
     final current = _currentPoint(wifi);
     final origin = _navigationOrigin ?? current ?? target;
-    final heading = wifi.imuYaw ?? wifi.gpsHeading;
+    final heading = _navigationHeadingFor(wifi);
     final result = const GpsNavigationController().evaluate(
       currentLat: wifi.gpsLat,
       currentLon: wifi.gpsLon,
@@ -1005,6 +1220,9 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       hAccMm: wifi.gpsAccuracy,
       originLat: origin.lat,
       originLon: origin.lon,
+      gpsFixType: wifi.gpsFixType,
+      gpsAgeMs: wifi.gpsAgeMs,
+      gpsReceivedAt: wifi.gpsReceivedAt,
     );
 
     final now = DateTime.now();
@@ -1669,11 +1887,22 @@ class _NavigationPanel extends StatelessWidget {
   final bool routeRunning;
   final int forwardPercent;
   final int turnPercent;
+  final double? rawHeadingDegrees;
   final double? headingDegrees;
   final String headingSource;
+  final double headingOffsetDegrees;
+  final bool invertYaw;
+  final bool invertForward;
+  final bool invertSteering;
+  final double? movementBearingDegrees;
+  final double? movementTargetErrorDegrees;
   final VoidCallback onToggleMotors;
   final VoidCallback? onStartRoute;
   final VoidCallback onPauseRoute;
+  final VoidCallback? onCalibrateHeading;
+  final ValueChanged<bool> onInvertYawChanged;
+  final ValueChanged<bool> onInvertForwardChanged;
+  final ValueChanged<bool> onInvertSteeringChanged;
   final VoidCallback? onSetCurrentTarget;
   final ValueChanged<int>? onSelectRoutePoint;
   final VoidCallback? onNextRoutePoint;
@@ -1694,11 +1923,22 @@ class _NavigationPanel extends StatelessWidget {
     required this.routeRunning,
     required this.forwardPercent,
     required this.turnPercent,
+    required this.rawHeadingDegrees,
     required this.headingDegrees,
     required this.headingSource,
+    required this.headingOffsetDegrees,
+    required this.invertYaw,
+    required this.invertForward,
+    required this.invertSteering,
+    required this.movementBearingDegrees,
+    required this.movementTargetErrorDegrees,
     required this.onToggleMotors,
     required this.onStartRoute,
     required this.onPauseRoute,
+    required this.onCalibrateHeading,
+    required this.onInvertYawChanged,
+    required this.onInvertForwardChanged,
+    required this.onInvertSteeringChanged,
     required this.onSetCurrentTarget,
     required this.onSelectRoutePoint,
     required this.onNextRoutePoint,
@@ -1794,6 +2034,27 @@ class _NavigationPanel extends StatelessWidget {
               : '${headingDegrees!.toStringAsFixed(1)} deg ($headingSource)',
         ),
         _CoordLine(
+          label: 'Raw IMU',
+          value: rawHeadingDegrees == null
+              ? '-'
+              : '${rawHeadingDegrees!.toStringAsFixed(1)} deg',
+        ),
+        _CoordLine(
+          label: 'IMU offset',
+          value:
+              '${headingOffsetDegrees.toStringAsFixed(1)} deg inv=${invertYaw ? 'ON' : 'OFF'}',
+        ),
+        _CoordLine(
+          label: 'GPS move',
+          value: movementBearingDegrees == null
+              ? '-'
+              : '${movementBearingDegrees!.toStringAsFixed(1)} deg',
+        ),
+        _CoordLine(
+          label: 'Move error',
+          value: _signedDegrees(movementTargetErrorDegrees),
+        ),
+        _CoordLine(
           label: 'Текущая',
           value: _latLon(current),
         ),
@@ -1840,6 +2101,12 @@ class _NavigationPanel extends StatelessWidget {
               label: 'Стоп маршрут',
               color: const Color(0xFFFFD166),
               onTap: onPauseRoute,
+            ),
+            _Action(
+              icon: Icons.explore_rounded,
+              label: 'Калибр IMU',
+              color: const Color(0xFF38F6A7),
+              onTap: onCalibrateHeading,
             ),
             _Action(
               icon: Icons.my_location_rounded,
@@ -1909,6 +2176,22 @@ class _NavigationPanel extends StatelessWidget {
           min: 8,
           max: 35,
           onChanged: onTurnChanged,
+        ),
+        const SizedBox(height: 8),
+        _NavSwitch(
+          label: 'Invert IMU yaw',
+          value: invertYaw,
+          onChanged: onInvertYawChanged,
+        ),
+        _NavSwitch(
+          label: 'Invert forward',
+          value: invertForward,
+          onChanged: onInvertForwardChanged,
+        ),
+        _NavSwitch(
+          label: 'Invert steering',
+          value: invertSteering,
+          onChanged: onInvertSteeringChanged,
         ),
         const SizedBox(height: 8),
         Text(
@@ -2127,6 +2410,32 @@ class _MotorSlider extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _NavSwitch extends StatelessWidget {
+  final String label;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  const _NavSwitch({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SwitchListTile(
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      title: Text(
+        label,
+        style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13),
+      ),
+      value: value,
+      onChanged: onChanged,
     );
   }
 }

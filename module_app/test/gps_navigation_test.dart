@@ -59,6 +59,67 @@ void main() {
     expect(result.command, NavigationCommand.stop);
   });
 
+  test('navigation stops on stale GPS data', () {
+    final now = DateTime.utc(2026, 5, 3, 12);
+    final result = const GpsNavigationController().evaluate(
+      currentLat: 55.0,
+      currentLon: 37.0,
+      targetLat: 55.0001,
+      targetLon: 37.0,
+      headingDegrees: 0,
+      rtkFixed: true,
+      rtcmAgeMs: 200,
+      hAccMm: 16,
+      originLat: 55.0,
+      originLon: 37.0,
+      gpsFixType: 3,
+      gpsReceivedAt: now.subtract(const Duration(seconds: 6)),
+      now: now,
+    );
+
+    expect(result.command, NavigationCommand.stop);
+    expect(result.reason, 'GPS-данные устарели');
+  });
+
+  test('navigation stops on weak GPS fix', () {
+    final result = const GpsNavigationController().evaluate(
+      currentLat: 55.0,
+      currentLon: 37.0,
+      targetLat: 55.0001,
+      targetLon: 37.0,
+      headingDegrees: 0,
+      rtkFixed: true,
+      rtcmAgeMs: 200,
+      hAccMm: 16,
+      originLat: 55.0,
+      originLon: 37.0,
+      gpsFixType: 2,
+    );
+
+    expect(result.command, NavigationCommand.stop);
+    expect(result.reason, 'GPS fix слабый');
+  });
+
+  test('navigation stops on stale rover GPS age', () {
+    final result = const GpsNavigationController().evaluate(
+      currentLat: 55.0,
+      currentLon: 37.0,
+      targetLat: 55.0001,
+      targetLon: 37.0,
+      headingDegrees: 0,
+      rtkFixed: true,
+      rtcmAgeMs: 200,
+      hAccMm: 16,
+      originLat: 55.0,
+      originLon: 37.0,
+      gpsFixType: 3,
+      gpsAgeMs: 2000,
+    );
+
+    expect(result.command, NavigationCommand.stop);
+    expect(result.reason, 'GPS rover stale');
+  });
+
   test('navigation arrives inside 0.3 m', () {
     final result = const GpsNavigationController().evaluate(
       currentLat: 55.0,
@@ -99,6 +160,41 @@ void main() {
     expect(
       mapper.toMotorCommand(NavigationCommand.arrived).protocol,
       'STOP',
+    );
+  });
+
+  test('heading calibration aligns raw IMU yaw to target bearing', () {
+    const calibration = HeadingCalibration();
+
+    final aligned = calibration.alignRawToTarget(
+      rawDegrees: 103,
+      targetDegrees: 0,
+    );
+
+    expect(aligned.offsetDegrees, closeTo(257, 0.001));
+    expect(aligned.apply(103), closeTo(0, 0.001));
+  });
+
+  test('motor mapper can invert forward and steering direction', () {
+    const mapper = NavigationMotorMapper();
+
+    expect(
+      mapper
+          .toMotorCommand(
+            NavigationCommand.forward,
+            invertForward: true,
+          )
+          .protocol,
+      'M,-22,-22',
+    );
+    expect(
+      mapper
+          .toMotorCommand(
+            NavigationCommand.turnLeft,
+            invertSteering: true,
+          )
+          .protocol,
+      'M,18,-18',
     );
   });
 }

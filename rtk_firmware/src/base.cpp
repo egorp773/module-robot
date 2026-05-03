@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClient.h>
+#include <WiFiServer.h>
 #include <WiFiUdp.h>
 
 #if __has_include("rtk_config_private.h")
@@ -15,9 +17,26 @@ static constexpr uint32_t GPS_BAUD = 38400;
 
 static constexpr char ROUTER_WIFI_SSID[] = RTK_ROUTER_WIFI_SSID;
 static constexpr char ROUTER_WIFI_PASS[] = RTK_ROUTER_WIFI_PASS;
+#ifndef RTK_BASE_IP_A
+#define RTK_BASE_IP_A 192
+#define RTK_BASE_IP_B 168
+#define RTK_BASE_IP_C 31
+#define RTK_BASE_IP_D 207
+#endif
+static const IPAddress BASE_STA_IP(RTK_BASE_IP_A, RTK_BASE_IP_B,
+                                   RTK_BASE_IP_C, RTK_BASE_IP_D);
 static const IPAddress ROVER_IP(RTK_ROVER_IP_A, RTK_ROVER_IP_B,
                                 RTK_ROVER_IP_C, RTK_ROVER_IP_D);
+static const IPAddress ROUTER_GATEWAY(RTK_ROUTER_GATEWAY_A,
+                                      RTK_ROUTER_GATEWAY_B,
+                                      RTK_ROUTER_GATEWAY_C,
+                                      RTK_ROUTER_GATEWAY_D);
+static const IPAddress ROUTER_SUBNET(255, 255, 255, 0);
+static const IPAddress RTCM_BROADCAST_IP(RTK_ROUTER_GATEWAY_A,
+                                         RTK_ROUTER_GATEWAY_B,
+                                         RTK_ROUTER_GATEWAY_C, 255);
 static constexpr uint16_t ROVER_RTCM_PORT = 2101;
+static constexpr uint16_t RTCM_TCP_PORT = 2102;
 
 static constexpr uint32_t SURVEY_IN_SECONDS = 600;
 static constexpr uint32_t SURVEY_IN_ACC_LIMIT_0_1MM = 10000; // 1.0 m, precision RTK base
@@ -57,6 +76,8 @@ static constexpr uint32_t CFG_RATE_TIMEREF = 0x20210003;
 
 static HardwareSerial GpsSerial(1);
 static WiFiUDP rtcmUdp;
+static WiFiServer rtcmTcpServer(RTCM_TCP_PORT);
+static WiFiClient rtcmTcpClient;
 
 static uint32_t lastWiFiAttemptMs = 0;
 static uint32_t lastWiFiConnectedMs = 0;
@@ -71,6 +92,11 @@ static uint32_t rtcmBytesSent = 0;
 static uint32_t rtcmPacketsSent = 0;
 static uint32_t udpSendOk = 0;
 static uint32_t udpSendFail = 0;
+static uint32_t udpBroadcastOk = 0;
+static uint32_t udpBroadcastFail = 0;
+static uint32_t tcpClientCount = 0;
+static uint32_t tcpSendOk = 0;
+static uint32_t tcpSendFail = 0;
 static uint8_t udpSendFailStreak = 0;
 static uint32_t wifiReconnectCount = 0;
 static uint32_t gnssRawBytes = 0;
@@ -509,27 +535,95 @@ static uint16_t rtcmTarget = 0;
 
 static void connectWiFi(bool force = false);
 
-static void sendRtcmFrame() {
-  if (WiFi.status() != WL_CONNECTED || rtcmLen == 0) return;
+static void updateRtcmTcpClient() {
+  if (rtcmTcpClient && !rtcmTcpClient.connected()) {
+    Serial.println("RTCM TCP client disconnected");
+    rtcmTcpClient.stop();
+  }
 
-  const int beginOk = rtcmUdp.beginPacket(ROVER_IP, ROVER_RTCM_PORT);
+  WiFiClient next = rtcmTcpServer.available();
+  if (!next) return;
+
+  if (next.remoteIP() != ROVER_IP) {
+    Serial.printf("RTCM TCP rejected non-rover client from %s:%u\n",
+                  next.remoteIP().toString().c_str(),
+                  next.remotePort());
+    next.stop();
+    return;
+  }
+
+  if (rtcmTcpClient && rtcmTcpClient.connected()) {
+    rtcmTcpClient.stop();
+  }
+  rtcmTcpClient = next;
+  rtcmTcpClient.setNoDelay(true);
+  tcpClientCount++;
+  Serial.printf("RTCM TCP client #%lu connected from %s:%u\n",
+                (unsigned long)tcpClientCount,
+                rtcmTcpClient.remoteIP().toString().c_str(),
+                rtcmTcpClient.remotePort());
+}
+
+static bool sendRtcmTcp() {
+  if (!rtcmTcpClient || !rtcmTcpClient.connected()) return false;
+
+  size_t written = 0;
+  const uint32_t started = millis();
+  while (written < rtcmLen && millis() - started < 50) {
+    const size_t n = rtcmTcpClient.write(rtcmBuf + written, rtcmLen - written);
+    if (n == 0) {
+      delay(1);
+      continue;
+    }
+    written += n;
+  }
+
+  if (written == rtcmLen) {
+    tcpSendOk++;
+    return true;
+  }
+
+  tcpSendFail++;
+  Serial.printf("WARN base TCP RTCM failed written=%u/%u fail=%lu\n",
+                (unsigned)written, rtcmLen, (unsigned long)tcpSendFail);
+  rtcmTcpClient.stop();
+  return false;
+}
+
+static bool sendRtcmUdpTo(const IPAddress& target, const char* label,
+                          uint32_t* okCount, uint32_t* failCount) {
+  const int beginOk = rtcmUdp.beginPacket(target, ROVER_RTCM_PORT);
   if (beginOk == 1) {
     rtcmUdp.write(rtcmBuf, rtcmLen);
   }
   const int endOk = beginOk == 1 ? rtcmUdp.endPacket() : 0;
-
   if (endOk == 1) {
+    (*okCount)++;
+    return true;
+  }
+
+  (*failCount)++;
+  Serial.printf("WARN base UDP RTCM %s failed begin=%d end=%d fail=%lu target=%s:%u\n",
+                label, beginOk, endOk, (unsigned long)*failCount,
+                target.toString().c_str(), ROVER_RTCM_PORT);
+  return false;
+}
+
+static void sendRtcmFrame() {
+  if (WiFi.status() != WL_CONNECTED || rtcmLen == 0) return;
+
+  const bool unicastOk =
+      sendRtcmUdpTo(ROVER_IP, "unicast", &udpSendOk, &udpSendFail);
+  const bool broadcastOk = sendRtcmUdpTo(RTCM_BROADCAST_IP, "broadcast",
+                                         &udpBroadcastOk, &udpBroadcastFail);
+  const bool tcpOk = sendRtcmTcp();
+
+  if (unicastOk || broadcastOk || tcpOk) {
     rtcmBytesSent += rtcmLen;
     rtcmPacketsSent++;
-    udpSendOk++;
     udpSendFailStreak = 0;
   } else {
-    udpSendFail++;
     if (udpSendFailStreak < 255) udpSendFailStreak++;
-    Serial.printf("WARN base UDP RTCM send failed begin=%d end=%d fail=%lu streak=%u target=%s:%u\n",
-                  beginOk, endOk, (unsigned long)udpSendFail,
-                  udpSendFailStreak, ROVER_IP.toString().c_str(),
-                  ROVER_RTCM_PORT);
     const uint32_t now = millis();
     const bool wifiSettled =
         lastWiFiConnectedMs != 0 &&
@@ -604,14 +698,17 @@ static void connectWiFi(bool force) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
+  WiFi.config(BASE_STA_IP, ROUTER_GATEWAY, ROUTER_SUBNET);
   if (force) {
+    rtcmTcpClient.stop();
     rtcmUdp.stop();
     WiFi.disconnect(false);
     delay(50);
   }
   WiFi.begin(ROUTER_WIFI_SSID, ROUTER_WIFI_PASS);
-  Serial.printf("WiFi STA reconnect #%lu to %s, rover RTCM target %s:%u\n",
+  Serial.printf("WiFi STA reconnect #%lu to %s, base IP %s, rover RTCM target %s:%u\n",
                 (unsigned long)wifiReconnectCount, ROUTER_WIFI_SSID,
+                BASE_STA_IP.toString().c_str(),
                 ROVER_IP.toString().c_str(),
                 ROVER_RTCM_PORT);
 }
@@ -670,11 +767,16 @@ static void printStatus() {
   lastStatusMs = now;
   const uint32_t gnssAgeMs = gnss.lastMs == 0 ? 0 : now - gnss.lastMs;
   const uint32_t svinAgeMs = svin.lastMs == 0 ? 0 : now - svin.lastMs;
-  Serial.printf("BASE wifi=%s ip=%s rover=%s:%u wifiReconnect=%lu mode=%s survey=%lus/%.1fm port=%s baud=%lu src=%s raw=%lu parsed=%lu ubx=%lu ack=%lu nak=%lu fix=%u sv=%u gnssAge=%lums svin_active=%u svin_valid=%u dur=%lus meanAcc=%.3fm svinAge=%lums rtcm=%lubytes/%lupkts frames=%lu udpOk=%lu udpFail=%lu udpFailStreak=%u last=%s\n",
+  Serial.printf("BASE wifi=%s ip=%s rover=%s:%u bcast=%s:%u tcpClient=%u tcpOk=%lu tcpFail=%lu wifiReconnect=%lu mode=%s survey=%lus/%.1fm port=%s baud=%lu src=%s raw=%lu parsed=%lu ubx=%lu ack=%lu nak=%lu fix=%u sv=%u gnssAge=%lums svin_active=%u svin_valid=%u dur=%lus meanAcc=%.3fm svinAge=%lums rtcm=%lubytes/%lupkts frames=%lu udpOk=%lu udpFail=%lu bcastOk=%lu bcastFail=%lu udpFailStreak=%u last=%s\n",
                 WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
                 WiFi.localIP().toString().c_str(),
                 ROVER_IP.toString().c_str(),
                 ROVER_RTCM_PORT,
+                RTCM_BROADCAST_IP.toString().c_str(),
+                ROVER_RTCM_PORT,
+                rtcmTcpClient && rtcmTcpClient.connected() ? 1 : 0,
+                (unsigned long)tcpSendOk,
+                (unsigned long)tcpSendFail,
                 (unsigned long)wifiReconnectCount,
                 fallbackSurveyMode ? "fallback" : "precision",
                 (unsigned long)activeSurveySeconds(),
@@ -700,6 +802,8 @@ static void printStatus() {
                 (unsigned long)rtcmFramesSeen,
                 (unsigned long)udpSendOk,
                 (unsigned long)udpSendFail,
+                (unsigned long)udpBroadcastOk,
+                (unsigned long)udpBroadcastFail,
                 udpSendFailStreak,
                 lastConfigResult);
   if (!svin.active && !svin.valid) {
@@ -719,10 +823,14 @@ void setup() {
   delay(500);
   configureBase();
   connectWiFi();
+  rtcmTcpServer.begin();
+  rtcmTcpServer.setNoDelay(true);
+  Serial.printf("RTCM TCP server port %u\n", RTCM_TCP_PORT);
 }
 
 void loop() {
   connectWiFi();
+  updateRtcmTcpClient();
   while (GpsSerial.available()) {
     const uint8_t b = (uint8_t)GpsSerial.read();
     gnssRawBytes++;

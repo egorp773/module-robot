@@ -88,6 +88,32 @@ class GpsLocalGeometry {
   static double _radToDeg(double value) => value * 180.0 / math.pi;
 }
 
+class HeadingCalibration {
+  final double offsetDegrees;
+  final bool invertYaw;
+
+  const HeadingCalibration({
+    this.offsetDegrees = 0,
+    this.invertYaw = false,
+  });
+
+  double apply(double rawDegrees) {
+    final yaw = invertYaw ? -rawDegrees : rawDegrees;
+    return GpsLocalGeometry.normalizeDegrees(yaw + offsetDegrees);
+  }
+
+  HeadingCalibration alignRawToTarget({
+    required double rawDegrees,
+    required double targetDegrees,
+  }) {
+    final yaw = invertYaw ? -rawDegrees : rawDegrees;
+    return HeadingCalibration(
+      offsetDegrees: GpsLocalGeometry.normalizeDegrees(targetDegrees - yaw),
+      invertYaw: invertYaw,
+    );
+  }
+}
+
 enum NavigationCommand {
   stop,
   turnLeft,
@@ -161,9 +187,11 @@ class NavigationMotorMapper {
     NavigationCommand command, {
     int forwardPercent = 22,
     int turnPercent = 18,
+    bool invertForward = false,
+    bool invertSteering = false,
   }) {
-    final forward = forwardPercent.clamp(0, 45);
-    final turn = turnPercent.clamp(0, 40);
+    final forward = forwardPercent.clamp(0, 45) * (invertForward ? -1 : 1);
+    final turn = turnPercent.clamp(0, 40) * (invertSteering ? -1 : 1);
     switch (command) {
       case NavigationCommand.forward:
         return MotorDriveCommand(
@@ -194,9 +222,11 @@ class NavigationMotorMapper {
 
 class GpsNavigationController {
   static const double maxRtcmAgeMs = 1500;
+  static const int maxRoverGpsAgeMs = 1500;
   static const int maxHorizontalAccuracyMm = 50;
   static const double arrivedDistanceM = 0.3;
   static const double turnThresholdDeg = 20;
+  static const Duration maxGpsAge = Duration(seconds: 5);
 
   const GpsNavigationController();
 
@@ -211,12 +241,42 @@ class GpsNavigationController {
     required int? hAccMm,
     required double? originLat,
     required double? originLon,
+    int? gpsFixType,
+    int? gpsAgeMs,
+    DateTime? gpsReceivedAt,
+    DateTime? now,
   }) {
     if (currentLat == null ||
         currentLon == null ||
         targetLat == null ||
         targetLon == null) {
       return NavigationResult.noTarget;
+    }
+    if (currentLat.abs() < 0.000001 && currentLon.abs() < 0.000001) {
+      return const NavigationResult(
+        command: NavigationCommand.stop,
+        reason: 'Нет валидных координат',
+      );
+    }
+    if (gpsReceivedAt != null &&
+        (now ?? DateTime.now()).difference(gpsReceivedAt) > maxGpsAge) {
+      return const NavigationResult(
+        command: NavigationCommand.stop,
+        reason: 'GPS-данные устарели',
+      );
+    }
+    if (gpsFixType != null && gpsFixType < 3) {
+      return const NavigationResult(
+        command: NavigationCommand.stop,
+        reason: 'GPS fix слабый',
+      );
+    }
+
+    if (gpsAgeMs != null && gpsAgeMs > maxRoverGpsAgeMs) {
+      return const NavigationResult(
+        command: NavigationCommand.stop,
+        reason: 'GPS rover stale',
+      );
     }
 
     final geometry = GpsLocalGeometry(
