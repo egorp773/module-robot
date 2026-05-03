@@ -42,7 +42,7 @@ void main() {
     expect(GpsLocalGeometry.headingErrorDegrees(0, 270), closeTo(-90, 0.001));
   });
 
-  test('navigation stops when RTK is not fixed', () {
+  test('navigation continues degraded when RTK is not fixed', () {
     final result = const GpsNavigationController().evaluate(
       currentLat: 55.0,
       currentLon: 37.0,
@@ -56,7 +56,8 @@ void main() {
       originLon: 37.0,
     );
 
-    expect(result.command, NavigationCommand.stop);
+    expect(result.command, NavigationCommand.forward);
+    expect(result.reason, 'degraded forward');
   });
 
   test('navigation stops on stale GPS data', () {
@@ -78,7 +79,7 @@ void main() {
     );
 
     expect(result.command, NavigationCommand.stop);
-    expect(result.reason, 'GPS-данные устарели');
+    expect(result.reason, 'GPS-РґР°РЅРЅС‹Рµ СѓСЃС‚Р°СЂРµР»Рё');
   });
 
   test('navigation stops on weak GPS fix', () {
@@ -97,7 +98,7 @@ void main() {
     );
 
     expect(result.command, NavigationCommand.stop);
-    expect(result.reason, 'GPS fix слабый');
+    expect(result.reason, 'GPS fix СЃР»Р°Р±С‹Р№');
   });
 
   test('navigation stops on stale rover GPS age', () {

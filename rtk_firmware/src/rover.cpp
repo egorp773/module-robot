@@ -66,23 +66,23 @@ static constexpr uint32_t RTCM_TRANSPORT_RECOVER_AGE_MS = 25000;
 static constexpr uint32_t RTCM_TRANSPORT_RECOVER_MS = 10000;
 static constexpr uint32_t RTCM_WIFI_RECOVER_AGE_MS = 60000;
 static constexpr uint32_t RTCM_WIFI_RECOVER_MS = 45000;
-static constexpr wifi_power_t ROVER_WIFI_TX_POWER = WIFI_POWER_2dBm;
+static constexpr wifi_power_t ROVER_WIFI_TX_POWER = WIFI_POWER_15dBm;
 static constexpr int PIN_MOTOR_RX = 16;
 static constexpr int PIN_MOTOR_TX = 17;
 static constexpr int PIN_IMU_SDA = 21;
 static constexpr int PIN_IMU_SCL = 22;
 static constexpr uint32_t MOTOR_BAUD = 115200;
 static constexpr uint32_t IMU_BROADCAST_MS = 1000;
-static constexpr uint32_t IMU_REPORT_INTERVAL_US = 100000;
+static constexpr uint32_t IMU_REPORT_INTERVAL_US = 50000;
 static constexpr uint32_t IMU_NOT_FOUND_RETRY_MS = 10000;
 static constexpr uint32_t IMU_STALE_REENABLE_MS = 1500;
 static constexpr uint32_t IMU_STALE_RESET_MS = 15000;
-static constexpr uint32_t MOTOR_SEND_MS = 100;
+static constexpr uint32_t MOTOR_SEND_MS = 20;
 static constexpr uint32_t MOTOR_RAMP_MS = 20;
 static constexpr uint32_t MOTOR_CMD_TIMEOUT_MS = 400;
 static constexpr int16_t MAX_SPEED_PERCENT = 70;
-static constexpr int16_t HOVER_MAX_CMD = 300;
-static constexpr int16_t INPUT_DIV = 2;
+static constexpr int16_t HOVER_MAX_CMD = 500;
+static constexpr int16_t INPUT_DIV = 1;
 static constexpr int16_t RAMP_STEP_PER_TICK = 1;
 static constexpr int16_t SLEW_SPEED_PER_SEND = 4;
 static constexpr int16_t SLEW_STEER_PER_SEND = 6;
@@ -91,9 +91,12 @@ static constexpr uint8_t NAV_MAX_WAYPOINTS = 128;
 static constexpr uint32_t NAV_LOOP_MS = 100;
 static constexpr uint32_t NAV_BROADCAST_MS = 500;
 static constexpr uint32_t NAV_MAX_GPS_AGE_MS = 5000;
-static constexpr uint32_t NAV_MAX_RTCM_AGE_MS = 20000;
-static constexpr uint32_t NAV_MAX_IMU_AGE_MS = 1000;
-static constexpr uint32_t NAV_MAX_HACC_MM = 80;
+static constexpr uint32_t NAV_MAX_RTCM_AGE_MS = 60000;
+static constexpr uint32_t NAV_MAX_IMU_AGE_MS = 5000;
+static constexpr uint32_t NAV_PRECISE_HACC_MM = 120;
+static constexpr uint32_t NAV_USABLE_HACC_MM = 300;
+static constexpr uint32_t NAV_DEGRADED_HACC_MM = 900;
+static constexpr float NAV_MIN_GPS_COURSE_SPEED_MPS = 0.12f;
 static constexpr float NAV_ARRIVED_M = 0.45f;
 static constexpr float NAV_PASS_WP_M = 0.85f;
 static constexpr float NAV_PIVOT_ERROR_DEG = 75.0f;
@@ -147,6 +150,13 @@ struct NavLegMetrics {
   float crossTrackM = 0.0f;
   float remainingM = 0.0f;
   float aimBearing = 0.0f;
+};
+
+enum NavQuality : uint8_t {
+  NAV_Q_NONE = 0,
+  NAV_Q_DEGRADED = 1,
+  NAV_Q_USABLE = 2,
+  NAV_Q_PRECISE = 3,
 };
 
 static HardwareSerial GpsSerial(1);
@@ -1062,7 +1072,7 @@ static void connectWiFi(bool force) {
     WiFi.disconnect(false);
     delay(50);
   }
-  Serial.printf("WiFi STA reconnect #%lu to %s, static IP %s, tx=2dBm\n",
+  Serial.printf("WiFi STA reconnect #%lu to %s, static IP %s, tx=15dBm\n",
                 (unsigned long)wifiReconnectCount, ROUTER_WIFI_SSID,
                 ROVER_STA_IP.toString().c_str());
   Serial.flush();
@@ -1144,20 +1154,68 @@ static bool navHasRtcm(uint32_t now) {
   return gps.diff || gps.carrier == 2;
 }
 
-static bool navRtkUsable(uint32_t now) {
-  if (gps.hAccMm > NAV_MAX_HACC_MM) return false;
-  if (gps.carrier == 2) return navHasRtcm(now);
-  return gps.diff && navHasRtcm(now);
+static NavQuality navQuality(uint32_t now) {
+  if (!gps.valid || gps.fixType < 3 || gps.lastMs == 0 ||
+      now - gps.lastMs > NAV_MAX_GPS_AGE_MS) {
+    return NAV_Q_NONE;
+  }
+
+  const bool rtcmOk = navHasRtcm(now);
+  if (gps.carrier == 2 && gps.hAccMm <= NAV_PRECISE_HACC_MM && rtcmOk) {
+    return NAV_Q_PRECISE;
+  }
+  if ((gps.carrier == 2 || gps.carrier == 1 || gps.diff) &&
+      gps.hAccMm <= NAV_USABLE_HACC_MM && rtcmOk) {
+    return NAV_Q_USABLE;
+  }
+  if (gps.hAccMm <= NAV_DEGRADED_HACC_MM) {
+    return NAV_Q_DEGRADED;
+  }
+  return NAV_Q_NONE;
 }
 
-static bool navCurrentHeading(uint32_t now, float* heading) {
-  if (!imuDetected || !imuValid || lastImuMs == 0 ||
-      now - lastImuMs > NAV_MAX_IMU_AGE_MS) {
-    return false;
+static const char* navQualityName(NavQuality q) {
+  switch (q) {
+    case NAV_Q_PRECISE:
+      return "precise";
+    case NAV_Q_USABLE:
+      return "usable";
+    case NAV_Q_DEGRADED:
+      return "degraded";
+    default:
+      return "none";
   }
-  const float yaw = navInvertYaw ? -imuYaw : imuYaw;
-  navLastHeading = normalizeDeg(yaw + navHeadingOffsetDeg);
+}
+
+static bool navCurrentHeading(uint32_t now, float desiredBearing,
+                              float* heading, const char** source) {
+  if (imuDetected && imuValid && lastImuMs != 0 &&
+      now - lastImuMs <= NAV_MAX_IMU_AGE_MS) {
+    const float yaw = navInvertYaw ? -imuYaw : imuYaw;
+    navLastHeading = normalizeDeg(yaw + navHeadingOffsetDeg);
+    *heading = navLastHeading;
+    *source = "imu";
+    return true;
+  }
+
+  if (gps.speedMps >= NAV_MIN_GPS_COURSE_SPEED_MPS) {
+    navLastHeading = normalizeDeg(gps.heading);
+    *heading = navLastHeading;
+    *source = "gps-course";
+    return true;
+  }
+
+  if (navMotionValid) {
+    navLastHeading = navLastMotionBearing;
+    *heading = navLastHeading;
+    *source = "gps-motion";
+    return true;
+  }
+
+  // Bootstrap: start slow along the desired bearing until GPS/IMU gives motion.
+  navLastHeading = normalizeDeg(desiredBearing);
   *heading = navLastHeading;
+  *source = "bootstrap";
   return true;
 }
 
@@ -1292,11 +1350,14 @@ static void navMaybeEnterRecovery(uint32_t now) {
 }
 
 static void navSetMotor(uint32_t now, float errorDeg, float distanceM,
-                        float crossTrackM) {
+                        float crossTrackM, NavQuality quality,
+                        const char* headingSource) {
   const int16_t maxForward = clampI16(navForwardPercent, 0, 45);
   const int16_t maxTurn = clampI16(navTurnPercent, 0, 40);
   const int16_t safeTurn = maxTurn > 0 ? maxTurn : 12;
   const float absError = fabs(errorDeg);
+  const bool bootstrapHeading =
+      headingSource != nullptr && strcmp(headingSource, "bootstrap") == 0;
 
   if (now < navRecoveryUntilMs) {
     const int16_t turn =
@@ -1305,7 +1366,7 @@ static void navSetMotor(uint32_t now, float errorDeg, float distanceM,
     return;
   }
 
-  if (absError >= NAV_PIVOT_ERROR_DEG) {
+  if (!bootstrapHeading && absError >= NAV_PIVOT_ERROR_DEG) {
     const int16_t turn =
         (int16_t)(safeTurn * (errorDeg > 0.0f ? 1 : -1)) *
         (navInvertSteering ? -1 : 1);
@@ -1314,6 +1375,14 @@ static void navSetMotor(uint32_t now, float errorDeg, float distanceM,
   }
 
   float forwardScale = 1.0f;
+  if (quality == NAV_Q_DEGRADED) {
+    forwardScale *= 0.35f;
+  } else if (quality == NAV_Q_USABLE) {
+    forwardScale *= 0.70f;
+  }
+  if (bootstrapHeading) {
+    forwardScale *= 0.35f;
+  }
   if (distanceM < NAV_CLOSE_SLOW_M) {
     forwardScale *= 0.35f + distanceM / NAV_CLOSE_SLOW_M * 0.65f;
   }
@@ -1378,19 +1447,11 @@ static void navUpdate() {
     navBroadcast(true);
     return;
   }
-  if (!navRtkUsable(now)) {
-    motorsStop("nav rtk wait");
-    navState = "WAIT_RTK";
-    navReason = "rtk";
-    navBroadcast(true);
-    return;
-  }
-
-  float heading = 0.0f;
-  if (!navCurrentHeading(now, &heading)) {
-    motorsStop("nav imu wait");
-    navState = "WAIT_IMU";
-    navReason = "imu";
+  const NavQuality quality = navQuality(now);
+  if (quality == NAV_Q_NONE) {
+    motorsStop("nav gps quality");
+    navState = "WAIT_GPS";
+    navReason = "gps-quality";
     navBroadcast(true);
     return;
   }
@@ -1408,6 +1469,9 @@ static void navUpdate() {
   const NavLegMetrics leg = navComputeLegMetrics(legStart, target);
   navLastCrossTrackM = leg.crossTrackM;
   navLastAlongTrackM = leg.alongM;
+  float heading = 0.0f;
+  const char* headingSource = "none";
+  navCurrentHeading(now, leg.aimBearing, &heading, &headingSource);
   navLastHeadingError = headingErrorDeg(heading, leg.aimBearing);
 
   if (navLastDistanceM <= NAV_ARRIVED_M ||
@@ -1436,9 +1500,13 @@ static void navUpdate() {
 
   navState = "RUNNING";
   if (now >= navRecoveryUntilMs) {
-    navReason = "track-imu";
+    static char reasonBuf[32];
+    snprintf(reasonBuf, sizeof(reasonBuf), "track-%s-%s",
+             navQualityName(quality), headingSource);
+    navReason = reasonBuf;
   }
-  navSetMotor(now, navLastHeadingError, navLastDistanceM, navLastCrossTrackM);
+  navSetMotor(now, navLastHeadingError, navLastDistanceM, navLastCrossTrackM,
+              quality, headingSource);
   navBroadcast(false);
 }
 

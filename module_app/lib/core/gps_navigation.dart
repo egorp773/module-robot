@@ -180,7 +180,7 @@ class NavigationResult {
 
   static const noTarget = NavigationResult(
     command: NavigationCommand.stop,
-    reason: 'Нет цели',
+    reason: 'РќРµС‚ С†РµР»Рё',
   );
 }
 
@@ -221,25 +221,25 @@ class NavigationMotorMapper {
         return MotorDriveCommand(
           left: forward,
           right: forward,
-          label: 'ехать вперед',
+          label: 'РµС…Р°С‚СЊ РІРїРµСЂРµРґ',
         );
       case NavigationCommand.turnLeft:
         return MotorDriveCommand(
           left: -turn,
           right: turn,
-          label: 'поворот влево',
+          label: 'РїРѕРІРѕСЂРѕС‚ РІР»РµРІРѕ',
         );
       case NavigationCommand.turnRight:
         return MotorDriveCommand(
           left: turn,
           right: -turn,
-          label: 'поворот вправо',
+          label: 'РїРѕРІРѕСЂРѕС‚ РІРїСЂР°РІРѕ',
         );
       case NavigationCommand.stop:
-        return const MotorDriveCommand(left: 0, right: 0, label: 'стоп');
+        return const MotorDriveCommand(left: 0, right: 0, label: 'СЃС‚РѕРї');
       case NavigationCommand.arrived:
         return const MotorDriveCommand(
-            left: 0, right: 0, label: 'точка достигнута');
+            left: 0, right: 0, label: 'С‚РѕС‡РєР° РґРѕСЃС‚РёРіРЅСѓС‚Р°');
     }
   }
 
@@ -301,10 +301,11 @@ class NavigationMotorMapper {
 }
 
 class GpsNavigationController {
-  static const double maxRtcmAgeMs = 7000;
-  static const double maxRtcmHoldAgeMs = 20000;
+  static const double maxRtcmAgeMs = 10000;
+  static const double maxRtcmHoldAgeMs = 60000;
   static const int maxRoverGpsAgeMs = 5000;
-  static const int maxHorizontalAccuracyMm = 50;
+  static const int maxHorizontalAccuracyMm = 300;
+  static const int maxDegradedAccuracyMm = 900;
   static const double arrivedDistanceM = 0.3;
   static const double turnThresholdDeg = 20;
   static const Duration maxGpsAge = Duration(seconds: 30);
@@ -336,20 +337,20 @@ class GpsNavigationController {
     if (currentLat.abs() < 0.000001 && currentLon.abs() < 0.000001) {
       return const NavigationResult(
         command: NavigationCommand.stop,
-        reason: 'Нет валидных координат',
+        reason: 'РќРµС‚ РІР°Р»РёРґРЅС‹С… РєРѕРѕСЂРґРёРЅР°С‚',
       );
     }
     if (gpsReceivedAt != null &&
         (now ?? DateTime.now()).difference(gpsReceivedAt) > maxGpsAge) {
       return const NavigationResult(
         command: NavigationCommand.stop,
-        reason: 'GPS-данные устарели',
+        reason: 'GPS-РґР°РЅРЅС‹Рµ СѓСЃС‚Р°СЂРµР»Рё',
       );
     }
     if (gpsFixType != null && gpsFixType < 3) {
       return const NavigationResult(
         command: NavigationCommand.stop,
-        reason: 'GPS fix слабый',
+        reason: 'GPS fix СЃР»Р°Р±С‹Р№',
       );
     }
 
@@ -394,29 +395,31 @@ class GpsNavigationController {
       );
     }
 
-    if (!rtkFixed) {
-      return result(NavigationCommand.stop, 'RTK не fixed');
-    }
-    if (rtcmAgeMs == null || rtcmAgeMs > maxRtcmHoldAgeMs) {
-      return result(NavigationCommand.stop, 'RTCM старый');
-    }
-    if (hAccMm == null || hAccMm > maxHorizontalAccuracyMm) {
-      return result(NavigationCommand.stop, 'hAcc больше 50 мм');
+    final degraded = !rtkFixed ||
+        rtcmAgeMs == null ||
+        rtcmAgeMs > maxRtcmHoldAgeMs ||
+        hAccMm == null ||
+        hAccMm > maxHorizontalAccuracyMm;
+    if (hAccMm == null || hAccMm > maxDegradedAccuracyMm) {
+      return result(NavigationCommand.stop, 'GPS accuracy too weak');
     }
     if (distance < arrivedDistanceM) {
-      return result(NavigationCommand.arrived, 'Цель достигнута');
+      return result(NavigationCommand.arrived, 'target reached');
     }
     if (headingError == null) {
-      return result(NavigationCommand.stop, 'Нет курса');
+      return result(NavigationCommand.forward, 'bootstrap course');
     }
     if (headingError.abs() > turnThresholdDeg) {
       return result(
         headingError > 0
             ? NavigationCommand.turnRight
             : NavigationCommand.turnLeft,
-        'Повернуть на курс',
+        degraded ? 'degraded turn' : 'turn to course',
       );
     }
-    return result(NavigationCommand.forward, 'Ехать вперед');
+    return result(
+      NavigationCommand.forward,
+      degraded ? 'degraded forward' : 'forward',
+    );
   }
 }

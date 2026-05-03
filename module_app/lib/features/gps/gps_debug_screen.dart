@@ -1511,11 +1511,15 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
 
   static bool _rtkOkForNavigation(WifiConnectionState wifi) {
     final hAcc = wifi.gpsAccuracy ?? 999999;
-    final accurateDiff = (wifi.gpsDiff ?? false) && hAcc <= 80;
+    final accurateDiff = (wifi.gpsDiff ?? false) && hAcc <= 300;
     final rtcmAge = wifi.rtcmAgeMs;
     final rtcmUsable =
         rtcmAge != null && rtcmAge <= GpsNavigationController.maxRtcmHoldAgeMs;
-    return (wifi.gpsCarrier == 'fixed' || accurateDiff) && rtcmUsable;
+    return wifi.gpsCarrier == 'fixed' ||
+        wifi.gpsCarrier == 'float' ||
+        accurateDiff ||
+        rtcmUsable ||
+        hAcc <= GpsNavigationController.maxDegradedAccuracyMm;
   }
 
   static bool _precisionOk(WifiConnectionState wifi) {
