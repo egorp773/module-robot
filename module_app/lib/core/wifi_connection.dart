@@ -959,6 +959,22 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   }
 
   /// Navigation commands
+  void sendNavConfig({
+    required int forwardPercent,
+    required int turnPercent,
+    required bool invertForward,
+    required bool invertSteering,
+    required double headingOffsetDegrees,
+    required bool invertYaw,
+  }) {
+    if (!state.isConnected) return;
+    sendRaw(
+      "NAV_CFG,$forwardPercent,$turnPercent,${invertForward ? 1 : 0},"
+      "${invertSteering ? 1 : 0},${headingOffsetDegrees.toStringAsFixed(2)},"
+      "${invertYaw ? 1 : 0}",
+    );
+  }
+
   void sendNavStart() {
     if (!state.isConnected) return;
     sendRaw("NAV_START");

@@ -44,8 +44,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   static const double _autoPointMinDistanceM = 0.20;
   static const double _trailMinDistanceM = 0.10;
   static const int _trailMaxPoints = 900;
-  static const Duration _autoHeadingCalibrationInterval =
-      Duration(milliseconds: 1200);
+  static const int _roverMaxWaypoints = 128;
   static const String _prefsHeadingOffsetKey = 'gps_nav_heading_offset';
   static const String _prefsInvertYawKey = 'gps_nav_invert_yaw';
   static const String _prefsInvertForwardKey = 'gps_nav_invert_forward';
@@ -60,7 +59,9 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   GpsPerimeterPoint? _navigationOrigin;
   GpsPerimeterPoint? _navigationTarget;
   int? _navigationTargetIndex;
+  int _roverRouteStartIndex = 0;
   NavigationCommand? _lastLoggedNavigationCommand;
+  String? _lastRoverNavState;
   DateTime? _lastNavigationLogAt;
   Timer? _motorDriveTimer;
   bool _motorsEnabled = false;
@@ -71,9 +72,6 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   bool _headingCalibrated = false;
   bool _invertForward = false;
   bool _invertSteering = false;
-  MotorDriveCommand? _lastSentMotorCommand;
-  DateTime? _lastMotorLogAt;
-  DateTime? _lastAutoHeadingCalibrationAt;
   double? _lastStableHeadingDegrees;
   DateTime? _lastStableHeadingAt;
   double? _smoothedHeadingDegrees;
@@ -139,7 +137,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       targetLat: _navigationTarget?.lat,
       targetLon: _navigationTarget?.lon,
       headingDegrees: navigationHeading,
-      rtkFixed: _rtkOk(wifi),
+      rtkFixed: _rtkOkForNavigation(wifi),
       rtcmAgeMs: wifi.rtcmAgeMs,
       hAccMm: wifi.gpsAccuracy,
       originLat: navigationOrigin?.lat,
@@ -170,6 +168,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     ref.listen<WifiConnectionState>(wifiConnectionProvider, (_, next) {
       _appendTrail(next);
       _maybeLogNavigation(next);
+      _syncRoverNavigation(next);
       _handleAutoRouteAdvance(next);
     });
     if (!_hostFocus.hasFocus && _hostCtrl.text != robotHost) {
@@ -400,6 +399,10 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                       motorPreview: motorPreview,
                       motorsEnabled: _motorsEnabled,
                       routeRunning: _routeRunning,
+                      roverNavState: wifi.navState,
+                      roverNavWpIndex: wifi.navWpIndex,
+                      roverNavWpTotal: wifi.navWpTotal,
+                      roverNavDistToWp: wifi.navDistToWp,
                       forwardPercent: _forwardPercent,
                       turnPercent: _turnPercent,
                       rawHeadingDegrees: rawNavigationHeading,
@@ -776,6 +779,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _navigationOrigin ??= point;
       _navigationTarget = point;
       _navigationTargetIndex = null;
+      _roverRouteStartIndex = 0;
       _notice = 'Цель навигации: текущая позиция.';
     });
     _maybeLogNavigation(wifi, force: true);
@@ -790,6 +794,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _navigationOrigin ??= current ?? routePoints.first;
       _navigationTarget = routePoints[index];
       _navigationTargetIndex = index;
+      _roverRouteStartIndex = index;
       _notice = 'Цель навигации: точка ${index + 1}.';
     });
     _maybeLogNavigation(ref.read(wifiConnectionProvider), force: true);
@@ -844,6 +849,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _notice = 'IMU invert: ${value ? 'ON' : 'OFF'}.';
     });
     _saveNavigationSettings();
+    _sendRoverNavConfig();
   }
 
   Future<void> _loadNavigationSettings() async {
@@ -894,6 +900,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _notice = 'Forward invert: ${value ? 'ON' : 'OFF'}.';
     });
     _saveNavigationSettings();
+    _sendRoverNavConfig();
   }
 
   void _setInvertSteering(bool value) {
@@ -902,16 +909,19 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _notice = 'Steering invert: ${value ? 'ON' : 'OFF'}.';
     });
     _saveNavigationSettings();
+    _sendRoverNavConfig();
   }
 
   void _setForwardPercent(double value) {
     setState(() => _forwardPercent = value.round());
     _saveNavigationSettings();
+    _sendRoverNavConfig();
   }
 
   void _setTurnPercent(double value) {
     setState(() => _turnPercent = value.round());
     _saveNavigationSettings();
+    _sendRoverNavConfig();
   }
 
   double? _targetBearing(WifiConnectionState wifi) {
@@ -942,6 +952,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
           'NAV IMU calibrate raw=${rawYaw.toStringAsFixed(1)} target=${targetBearing.toStringAsFixed(1)} offset=${_headingCalibration.offsetDegrees.toStringAsFixed(1)} invert=${_headingCalibration.invertYaw ? 1 : 0}',
         );
     _saveNavigationSettings();
+    _sendRoverNavConfig();
   }
 
   static bool _hasFreshImu(WifiConnectionState wifi) {
@@ -1017,52 +1028,6 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     return 'нет свежего курса';
   }
 
-  bool _gpsCourseReliableForHeading(WifiConnectionState wifi) {
-    final speed = wifi.gpsSpeedMps;
-    final age = wifi.gpsAgeMs;
-    return _rtkOk(wifi) &&
-        _rtcmFresh(wifi.rtcmAgeMs) &&
-        wifi.gpsHeading != null &&
-        speed != null &&
-        speed >= 0.55 &&
-        (wifi.gpsAccuracy ?? 999999) <=
-            GpsNavigationController.maxHorizontalAccuracyMm &&
-        (age == null || age <= GpsNavigationController.maxRoverGpsAgeMs);
-  }
-
-  void _maybeAutoTuneHeadingFromGps(
-    WifiConnectionState wifi,
-    NavigationResult result,
-    MotorDriveCommand motorCommand,
-  ) {
-    if (!_hasFreshImu(wifi) || !_gpsCourseReliableForHeading(wifi)) return;
-    if (result.command != NavigationCommand.forward) return;
-    if (motorCommand.left == 0 || motorCommand.right == 0) return;
-    if (motorCommand.left.sign != motorCommand.right.sign) return;
-
-    final now = DateTime.now();
-    final last = _lastAutoHeadingCalibrationAt;
-    if (last != null &&
-        now.difference(last) < _autoHeadingCalibrationInterval) {
-      return;
-    }
-    _lastAutoHeadingCalibrationAt = now;
-
-    final nextCalibration = _headingCalibration.correctTowardObservedHeading(
-      rawDegrees: wifi.imuYaw!,
-      observedHeadingDegrees: wifi.gpsHeading!,
-    );
-    if (nextCalibration.offsetDegrees == _headingCalibration.offsetDegrees) {
-      return;
-    }
-
-    setState(() {
-      _headingCalibration = nextCalibration;
-      _headingCalibrated = true;
-    });
-    _saveNavigationSettings();
-  }
-
   void _resetImuCalibration() {
     ref.read(wifiConnectionProvider.notifier).sendRaw('IMU_RESET');
     setState(() {
@@ -1070,6 +1035,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _notice = 'IMU reset requested. Повтори калибровку носом на цель.';
     });
     _saveNavigationSettings();
+    _sendRoverNavConfig();
   }
 
   void _startRoute(List<GpsPerimeterPoint> routePoints) {
@@ -1082,11 +1048,91 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _navigationOrigin = current ?? routePoints.first;
       _navigationTarget = routePoints.first;
       _navigationTargetIndex = 0;
+      _roverRouteStartIndex = 0;
       _routeRunning = true;
       _lastLoggedNavigationCommand = null;
       _notice = 'Маршрут выбран: точка 1/${routePoints.length}.';
     });
     _maybeLogNavigation(ref.read(wifiConnectionProvider), force: true);
+  }
+
+  void _sendRoverNavConfig() {
+    ref.read(wifiConnectionProvider.notifier).sendNavConfig(
+          forwardPercent: _forwardPercent,
+          turnPercent: _turnPercent,
+          invertForward: _invertForward,
+          invertSteering: _invertSteering,
+          headingOffsetDegrees:
+              _headingCalibrated ? _headingCalibration.offsetDegrees : 0,
+          invertYaw: _headingCalibrated && _headingCalibration.invertYaw,
+        );
+  }
+
+  List<GpsPerimeterPoint> _roverRouteForCurrentTarget() {
+    final target = _navigationTarget;
+    final routePoints = _currentRoutePoints();
+    if (target == null) return const [];
+    if (_navigationTargetIndex == null || routePoints.isEmpty) {
+      _roverRouteStartIndex = 0;
+      return <GpsPerimeterPoint>[target];
+    }
+
+    final start =
+        _navigationTargetIndex!.clamp(0, routePoints.length - 1).toInt();
+    _roverRouteStartIndex = start;
+    return routePoints.skip(start).take(_roverMaxWaypoints).toList();
+  }
+
+  void _startRoverNavigation(List<GpsPerimeterPoint> routePoints) {
+    final notifier = ref.read(wifiConnectionProvider.notifier);
+    notifier.sendNavStop();
+    _sendRoverNavConfig();
+    notifier.sendRouteBegin(routePoints.length);
+    for (var i = 0; i < routePoints.length; i++) {
+      final point = routePoints[i];
+      notifier.sendRouteWaypoint(i, point.lat, point.lon);
+    }
+    notifier.sendRouteEnd();
+    notifier.sendNavStart();
+    notifier.addLocalLog('ROVER NAV uploaded ${routePoints.length} points');
+  }
+
+  void _syncRoverNavigation(WifiConnectionState wifi) {
+    if (!_motorsEnabled) return;
+    final navState = wifi.navState;
+    var changed = false;
+    String? notice;
+
+    if (navState != null && navState != _lastRoverNavState) {
+      _lastRoverNavState = navState;
+      notice = 'Rover NAV: $navState';
+      changed = true;
+    }
+
+    final routePoints = _currentRoutePoints();
+    final roverIndex = wifi.navWpIndex;
+    if (roverIndex != null && routePoints.isNotEmpty) {
+      final appIndex = (_roverRouteStartIndex + roverIndex)
+          .clamp(0, routePoints.length - 1)
+          .toInt();
+      if (_navigationTargetIndex != appIndex ||
+          _navigationTarget != routePoints[appIndex]) {
+        _navigationTargetIndex = appIndex;
+        _navigationTarget = routePoints[appIndex];
+        changed = true;
+      }
+    }
+
+    if (navState == 'DONE' || navState == 'ERROR') {
+      _motorsEnabled = false;
+      _routeRunning = false;
+      changed = true;
+    }
+
+    if (!changed || !mounted) return;
+    setState(() {
+      if (notice != null) _notice = notice;
+    });
   }
 
   void _pauseRoute() {
@@ -1126,113 +1172,30 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _startRoute(routePoints);
     }
 
+    final roverRoute = _roverRouteForCurrentTarget();
+    if (roverRoute.isEmpty) {
+      setState(() => _notice = 'No target for rover NAV.');
+      return;
+    }
+    _startRoverNavigation(roverRoute);
+    _motorDriveTimer?.cancel();
+    _motorDriveTimer = null;
+
     setState(() {
       _motorsEnabled = true;
       _routeRunning = _navigationTargetIndex != null || _routeRunning;
-      _notice = 'Моторы включены. Команды M/STOP отправляются каждые 150 мс.';
+      _lastRoverNavState = null;
+      _notice =
+          'Rover NAV started locally: ${roverRoute.length} point(s). App motor loop is off.';
     });
-    _startMotorTimer();
-  }
-
-  void _startMotorTimer() {
-    _motorDriveTimer?.cancel();
-    _sendMotorTick();
-    _motorDriveTimer = Timer.periodic(
-      const Duration(milliseconds: 150),
-      (_) => _sendMotorTick(),
-    );
-  }
-
-  void _sendMotorTick() {
-    if (!_motorsEnabled) return;
-    final wifi = ref.read(wifiConnectionProvider);
-    if (!wifi.isConnected) {
-      _motorDriveTimer?.cancel();
-      _motorDriveTimer = null;
-      if (mounted) {
-        setState(() {
-          _motorsEnabled = false;
-          _notice = 'Связь потеряна, моторы выключены.';
-        });
-      }
-      return;
-    }
-
-    final target = _navigationTarget;
-    if (target == null) {
-      _sendStopIfConnected();
-      return;
-    }
-
-    final current = _currentPoint(wifi);
-    final origin = _navigationOrigin ?? current ?? target;
-    final result = const GpsNavigationController().evaluate(
-      currentLat: wifi.gpsLat,
-      currentLon: wifi.gpsLon,
-      targetLat: target.lat,
-      targetLon: target.lon,
-      headingDegrees: _navigationHeadingFor(wifi),
-      rtkFixed: _rtkOk(wifi),
-      rtcmAgeMs: wifi.rtcmAgeMs,
-      hAccMm: wifi.gpsAccuracy,
-      originLat: origin.lat,
-      originLon: origin.lon,
-      gpsFixType: wifi.gpsFixType,
-      gpsAgeMs: wifi.gpsAgeMs,
-      gpsReceivedAt: wifi.gpsReceivedAt,
-    );
-
-    if (result.command == NavigationCommand.arrived) {
-      final advanced = _advanceRouteAfterArrival();
-      _sendStopIfConnected();
-      if (advanced) return;
-    }
-
-    final motorCommand = const NavigationMotorMapper().toMotorCommandForResult(
-      result,
-      forwardPercent: _forwardPercent,
-      turnPercent: _turnPercent,
-      invertForward: _invertForward,
-      invertSteering: _invertSteering,
-    );
-    final notifier = ref.read(wifiConnectionProvider.notifier);
-    _maybeAutoTuneHeadingFromGps(wifi, result, motorCommand);
-    if (motorCommand.isStop) {
-      notifier.sendStop();
-    } else {
-      notifier.sendMove(motorCommand.left, motorCommand.right);
-    }
-    _logMotorCommand(motorCommand, result);
   }
 
   void _sendStopIfConnected() {
     if (ref.read(wifiConnectionProvider).isConnected) {
-      ref.read(wifiConnectionProvider.notifier).sendStop();
+      final notifier = ref.read(wifiConnectionProvider.notifier);
+      notifier.sendNavStop();
+      notifier.sendStop();
     }
-    _lastSentMotorCommand = null;
-  }
-
-  void _logMotorCommand(
-    MotorDriveCommand motorCommand,
-    NavigationResult result,
-  ) {
-    final now = DateTime.now();
-    final last = _lastMotorLogAt;
-    final changed = _lastSentMotorCommand?.left != motorCommand.left ||
-        _lastSentMotorCommand?.right != motorCommand.right;
-    final due =
-        last == null || now.difference(last) >= const Duration(seconds: 2);
-    if (!changed && !due) return;
-
-    _lastSentMotorCommand = motorCommand;
-    _lastMotorLogAt = now;
-    final distance = result.distanceMeters?.toStringAsFixed(2) ?? '-';
-    final target = _navigationTargetIndex == null
-        ? 'manual'
-        : '${_navigationTargetIndex! + 1}/${_currentRoutePoints().length}';
-    ref.read(wifiConnectionProvider.notifier).addLocalLog(
-          'MOTOR ${motorCommand.protocol} target=$target dist=${distance}m ${result.reason}',
-        );
   }
 
   List<GpsPerimeterPoint> _currentRoutePoints() {
@@ -1240,6 +1203,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   }
 
   void _handleAutoRouteAdvance(WifiConnectionState wifi) {
+    if (_motorsEnabled) return;
     if (!_routeRunning || _navigationTarget == null) return;
     final origin =
         _navigationOrigin ?? _currentPoint(wifi) ?? _navigationTarget!;
@@ -1249,7 +1213,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       targetLat: _navigationTarget!.lat,
       targetLon: _navigationTarget!.lon,
       headingDegrees: _navigationHeadingFor(wifi),
-      rtkFixed: _rtkOk(wifi),
+      rtkFixed: _rtkOkForNavigation(wifi),
       rtcmAgeMs: wifi.rtcmAgeMs,
       hAccMm: wifi.gpsAccuracy,
       originLat: origin.lat,
@@ -1276,6 +1240,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
           _routeRunning = false;
           _motorsEnabled = false;
           _navigationTargetIndex = null;
+          _roverRouteStartIndex = 0;
           _notice = 'Маршрут завершен, моторы остановлены.';
         });
       }
@@ -1289,6 +1254,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       setState(() {
         _navigationTarget = routePoints[nextIndex];
         _navigationTargetIndex = nextIndex;
+        _roverRouteStartIndex = nextIndex;
         _lastLoggedNavigationCommand = null;
         _notice =
             'Следующая цель: точка ${nextIndex + 1}/${routePoints.length}.';
@@ -1309,6 +1275,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _routeRunning = false;
       _navigationTarget = null;
       _navigationTargetIndex = null;
+      _roverRouteStartIndex = 0;
       _lastLoggedNavigationCommand = null;
       _notice = 'Цель навигации очищена.';
     });
@@ -1326,7 +1293,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       targetLat: target.lat,
       targetLon: target.lon,
       headingDegrees: heading,
-      rtkFixed: _rtkOk(wifi),
+      rtkFixed: _rtkOkForNavigation(wifi),
       rtcmAgeMs: wifi.rtcmAgeMs,
       hAccMm: wifi.gpsAccuracy,
       originLat: origin.lat,
@@ -1456,6 +1423,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       _activeSaved = null;
       _navigationTarget = null;
       _navigationTargetIndex = null;
+      _roverRouteStartIndex = 0;
       _notice = 'Текущий периметр очищен.';
     });
   }
@@ -1539,6 +1507,15 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
         (wifi.gpsDiff ?? false) && (wifi.gpsAccuracy ?? 999999) <= 50;
     return (wifi.gpsCarrier == 'fixed' || accurateDiff) &&
         _rtcmFresh(wifi.rtcmAgeMs);
+  }
+
+  static bool _rtkOkForNavigation(WifiConnectionState wifi) {
+    final hAcc = wifi.gpsAccuracy ?? 999999;
+    final accurateDiff = (wifi.gpsDiff ?? false) && hAcc <= 80;
+    final rtcmAge = wifi.rtcmAgeMs;
+    final rtcmUsable =
+        rtcmAge != null && rtcmAge <= GpsNavigationController.maxRtcmHoldAgeMs;
+    return (wifi.gpsCarrier == 'fixed' || accurateDiff) && rtcmUsable;
   }
 
   static bool _precisionOk(WifiConnectionState wifi) {
@@ -2003,6 +1980,10 @@ class _NavigationPanel extends StatelessWidget {
   final MotorDriveCommand motorPreview;
   final bool motorsEnabled;
   final bool routeRunning;
+  final String? roverNavState;
+  final int? roverNavWpIndex;
+  final int? roverNavWpTotal;
+  final double? roverNavDistToWp;
   final int forwardPercent;
   final int turnPercent;
   final double? rawHeadingDegrees;
@@ -2040,6 +2021,10 @@ class _NavigationPanel extends StatelessWidget {
     required this.motorPreview,
     required this.motorsEnabled,
     required this.routeRunning,
+    required this.roverNavState,
+    required this.roverNavWpIndex,
+    required this.roverNavWpTotal,
+    required this.roverNavDistToWp,
     required this.forwardPercent,
     required this.turnPercent,
     required this.rawHeadingDegrees,
@@ -2098,6 +2083,12 @@ class _NavigationPanel extends StatelessWidget {
           routeRunning: routeRunning,
           motorsEnabled: motorsEnabled,
         ),
+        if (roverNavState != null)
+          _CoordLine(
+            label: 'Rover NAV',
+            value:
+                '$roverNavState wp=${roverNavWpIndex ?? '-'}/${roverNavWpTotal ?? '-'} dist=${_meters(roverNavDistToWp)}',
+          ),
         const SizedBox(height: 10),
         Row(
           children: [

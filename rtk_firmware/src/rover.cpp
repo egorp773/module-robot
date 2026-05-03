@@ -79,6 +79,15 @@ static constexpr int16_t RAMP_STEP_PER_TICK = 1;
 static constexpr int16_t SLEW_SPEED_PER_SEND = 4;
 static constexpr int16_t SLEW_STEER_PER_SEND = 6;
 static constexpr uint16_t HOVER_START_FRAME = 0xABCD;
+static constexpr uint8_t NAV_MAX_WAYPOINTS = 128;
+static constexpr uint32_t NAV_LOOP_MS = 100;
+static constexpr uint32_t NAV_BROADCAST_MS = 500;
+static constexpr uint32_t NAV_MAX_GPS_AGE_MS = 5000;
+static constexpr uint32_t NAV_MAX_RTCM_AGE_MS = 20000;
+static constexpr uint32_t NAV_HEADING_HOLD_MS = 8000;
+static constexpr uint32_t NAV_MAX_HACC_MM = 80;
+static constexpr float NAV_ARRIVED_M = 0.45f;
+static constexpr float NAV_PIVOT_ERROR_DEG = 75.0f;
 
 static constexpr uint32_t CFG_UART1INPROT_UBX = 0x10730001;
 static constexpr uint32_t CFG_UART1INPROT_NMEA = 0x10730002;
@@ -107,6 +116,11 @@ struct GpsFix {
   uint32_t vAccMm = 0;
   uint32_t lastMs = 0;
   bool valid = false;
+};
+
+struct NavWaypoint {
+  double lat = 0.0;
+  double lon = 0.0;
 };
 
 static HardwareSerial GpsSerial(1);
@@ -170,6 +184,31 @@ static uint32_t lastMotorSendMs = 0;
 static uint32_t motorCommandCount = 0;
 static uint32_t motorStopCount = 0;
 static TaskHandle_t motorTaskHandle = nullptr;
+static NavWaypoint navRoute[NAV_MAX_WAYPOINTS];
+static bool navRouteReceived[NAV_MAX_WAYPOINTS];
+static uint8_t navRouteCount = 0;
+static uint8_t navRouteExpected = 0;
+static uint8_t navRouteReceivedCount = 0;
+static bool navRouteUploading = false;
+static bool navRouteReady = false;
+static bool navRunning = false;
+static bool navPaused = false;
+static uint8_t navWpIndex = 0;
+static uint32_t lastNavLoopMs = 0;
+static uint32_t lastNavBroadcastMs = 0;
+static uint32_t lastNavGoodHeadingMs = 0;
+static float navLastHeading = 0.0f;
+static float navLastDistanceM = 0.0f;
+static float navLastBearing = 0.0f;
+static float navLastHeadingError = 0.0f;
+static int16_t navForwardPercent = 22;
+static int16_t navTurnPercent = 18;
+static bool navInvertForward = false;
+static bool navInvertSteering = false;
+static float navHeadingOffsetDeg = 0.0f;
+static bool navInvertYaw = false;
+static const char* navState = "IDLE";
+static const char* navReason = "idle";
 
 static Adafruit_BNO08x bno08x;
 static sh2_SensorValue_t imuValue;
@@ -182,6 +221,8 @@ static uint32_t lastImuRecoverMs = 0;
 static bool imuFresh(uint32_t now) {
   return imuDetected && imuValid && lastImuMs != 0 && now - lastImuMs <= 5000;
 }
+
+static void motorsSetTarget(int left, int right);
 
 static uint32_t effectiveRtcmAgeMs(uint32_t now) {
   uint32_t age = 0;
@@ -235,6 +276,47 @@ static int16_t clampI16(int32_t v, int16_t lo, int16_t hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return (int16_t)v;
+}
+
+static float normalizeDeg(float deg) {
+  while (deg < 0.0f) deg += 360.0f;
+  while (deg >= 360.0f) deg -= 360.0f;
+  return deg;
+}
+
+static float headingErrorDeg(float current, float target) {
+  float err = normalizeDeg(target) - normalizeDeg(current);
+  if (err > 180.0f) err -= 360.0f;
+  if (err < -180.0f) err += 360.0f;
+  return err;
+}
+
+static float degToRad(float deg) {
+  return deg * PI / 180.0f;
+}
+
+static float distanceMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double earthRadiusM = 6371008.8;
+  const double dLat = (lat2 - lat1) * PI / 180.0;
+  const double dLon = (lon2 - lon1) * PI / 180.0;
+  const double rLat1 = lat1 * PI / 180.0;
+  const double rLat2 = lat2 * PI / 180.0;
+  const double a = sin(dLat / 2.0) * sin(dLat / 2.0) +
+                   cos(rLat1) * cos(rLat2) *
+                       sin(dLon / 2.0) * sin(dLon / 2.0);
+  const double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+  return (float)(earthRadiusM * c);
+}
+
+static float bearingDeg(double fromLat, double fromLon, double toLat,
+                        double toLon) {
+  const double fromLatRad = fromLat * PI / 180.0;
+  const double toLatRad = toLat * PI / 180.0;
+  const double dLon = (toLon - fromLon) * PI / 180.0;
+  const double y = sin(dLon) * cos(toLatRad);
+  const double x = cos(fromLatRad) * sin(toLatRad) -
+                   sin(fromLatRad) * cos(toLatRad) * cos(dLon);
+  return normalizeDeg((float)(atan2(y, x) * 180.0 / PI));
 }
 
 static int16_t stepToward(int16_t cur, int16_t target, int16_t maxDelta) {
@@ -910,6 +992,154 @@ static void motorsStop(const char* reason) {
   }
 }
 
+static void navStop(const char* reason) {
+  navRunning = false;
+  navPaused = false;
+  navState = "IDLE";
+  navReason = reason == nullptr ? "stop" : reason;
+  motorsStop(reason);
+}
+
+static bool navHasRtcm(uint32_t now) {
+  const uint32_t rtcmAge = effectiveRtcmAgeMs(now);
+  if (rtcmAge == 0) return gps.diff || gps.carrier == 2;
+  return rtcmAge <= NAV_MAX_RTCM_AGE_MS;
+}
+
+static bool navRtkUsable(uint32_t now) {
+  if (gps.hAccMm > NAV_MAX_HACC_MM) return false;
+  if (gps.carrier == 2) return navHasRtcm(now);
+  return gps.diff && navHasRtcm(now);
+}
+
+static bool navCurrentHeading(uint32_t now, float* heading) {
+  if (imuFresh(now)) {
+    const float yaw = navInvertYaw ? -imuYaw : imuYaw;
+    navLastHeading = normalizeDeg(yaw + navHeadingOffsetDeg);
+    lastNavGoodHeadingMs = now;
+    *heading = navLastHeading;
+    return true;
+  }
+  if (gps.speedMps >= 0.35f) {
+    navLastHeading = normalizeDeg(gps.heading);
+    lastNavGoodHeadingMs = now;
+    *heading = navLastHeading;
+    return true;
+  }
+  if (lastNavGoodHeadingMs != 0 && now - lastNavGoodHeadingMs <= NAV_HEADING_HOLD_MS) {
+    *heading = navLastHeading;
+    return true;
+  }
+  return false;
+}
+
+static void navSetMotor(float errorDeg, float distanceM) {
+  const int16_t maxForward = clampI16(navForwardPercent, 0, 45);
+  const int16_t maxTurn = clampI16(navTurnPercent, 0, 40);
+  const float absError = fabs(errorDeg);
+
+  if (absError >= NAV_PIVOT_ERROR_DEG) {
+    const int16_t turn = maxTurn * (navInvertSteering ? -1 : 1);
+    if (errorDeg > 0.0f) {
+      motorsSetTarget(turn, -turn);
+    } else {
+      motorsSetTarget(-turn, turn);
+    }
+    return;
+  }
+
+  const float distanceScale =
+      distanceM < 1.2f ? (0.45f + distanceM / 1.2f * 0.55f) : 1.0f;
+  const float errorScale = absError > 35.0f ? 0.55f : 1.0f;
+  int16_t baseMag = (int16_t)roundf((float)maxForward * distanceScale * errorScale);
+  if (maxForward > 0 && baseMag < 6) baseMag = 6;
+  if (baseMag > maxForward) baseMag = maxForward;
+  const int16_t base = baseMag * (navInvertForward ? -1 : 1);
+
+  int16_t steerMag =
+      (int16_t)roundf((float)maxTurn * fminf(absError / 45.0f, 1.0f));
+  int16_t steer = steerMag * (errorDeg > 0.0f ? 1 : -1);
+  if (navInvertSteering) steer = -steer;
+
+  motorsSetTarget(clampI16(base + steer, -100, 100),
+                  clampI16(base - steer, -100, 100));
+}
+
+static void navBroadcast(bool force = false) {
+  const uint32_t now = millis();
+  if (!force && now - lastNavBroadcastMs < NAV_BROADCAST_MS) return;
+  lastNavBroadcastMs = now;
+  char msg[96];
+  snprintf(msg, sizeof(msg), "NAV,%s,%u,%u,%.2f,%.1f,%.1f",
+           navState, navWpIndex, navRouteCount, navLastDistanceM,
+           navLastHeadingError, navLastBearing);
+  broadcastTelemetry(msg);
+}
+
+static void navUpdate() {
+  const uint32_t now = millis();
+  navBroadcast(false);
+  if (!navRunning || navPaused) return;
+  if (now - lastNavLoopMs < NAV_LOOP_MS) return;
+  lastNavLoopMs = now;
+
+  if (!navRouteReady || navRouteCount == 0 || navWpIndex >= navRouteCount) {
+    navStop("nav-route-empty");
+    navState = "ERROR";
+    navBroadcast(true);
+    return;
+  }
+  if (!gps.valid || gps.fixType < 3 || gps.lastMs == 0 ||
+      now - gps.lastMs > NAV_MAX_GPS_AGE_MS) {
+    motorsStop("nav gps stale");
+    navState = "WAIT_GPS";
+    navReason = "gps";
+    navBroadcast(true);
+    return;
+  }
+  if (!navRtkUsable(now)) {
+    motorsStop("nav rtk wait");
+    navState = "WAIT_RTK";
+    navReason = "rtk";
+    navBroadcast(true);
+    return;
+  }
+
+  float heading = 0.0f;
+  if (!navCurrentHeading(now, &heading)) {
+    motorsStop("nav heading wait");
+    navState = "WAIT_HEADING";
+    navReason = "heading";
+    navBroadcast(true);
+    return;
+  }
+
+  const NavWaypoint& target = navRoute[navWpIndex];
+  navLastDistanceM = distanceMeters(gps.lat, gps.lon, target.lat, target.lon);
+  navLastBearing = bearingDeg(gps.lat, gps.lon, target.lat, target.lon);
+  navLastHeadingError = headingErrorDeg(heading, navLastBearing);
+
+  if (navLastDistanceM <= NAV_ARRIVED_M) {
+    char wpMsg[32];
+    snprintf(wpMsg, sizeof(wpMsg), "NAV_WP,%u", navWpIndex);
+    broadcastTelemetry(wpMsg);
+    navWpIndex++;
+    if (navWpIndex >= navRouteCount) {
+      navRunning = false;
+      navState = "DONE";
+      navReason = "done";
+      motorsStop("nav done");
+      navBroadcast(true);
+      return;
+    }
+  }
+
+  navState = "RUNNING";
+  navReason = "track";
+  navSetMotor(navLastHeadingError, navLastDistanceM);
+  navBroadcast(false);
+}
+
 static void motorsSetTarget(int left, int right) {
   motorTargetLeft =
       clampI16(left / INPUT_DIV, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
@@ -1012,6 +1242,80 @@ static bool parseMoveCommand(const String& msg, int* left, int* right) {
   *left = msg.substring(2, comma).toInt();
   *right = msg.substring(comma + 1).toInt();
   return true;
+}
+
+static bool handleNavConfig(const String& msg) {
+  if (!msg.startsWith("NAV_CFG,")) return false;
+  int forward = navForwardPercent;
+  int turn = navTurnPercent;
+  int invForward = navInvertForward ? 1 : 0;
+  int invSteering = navInvertSteering ? 1 : 0;
+  int invYaw = navInvertYaw ? 1 : 0;
+  float offset = navHeadingOffsetDeg;
+  if (sscanf(msg.c_str(), "NAV_CFG,%d,%d,%d,%d,%f,%d",
+             &forward, &turn, &invForward, &invSteering, &offset, &invYaw) !=
+      6) {
+    return false;
+  }
+  navForwardPercent = clampI16(forward, 0, 45);
+  navTurnPercent = clampI16(turn, 0, 40);
+  navInvertForward = invForward != 0;
+  navInvertSteering = invSteering != 0;
+  navHeadingOffsetDeg = normalizeDeg(offset);
+  navInvertYaw = invYaw != 0;
+  return true;
+}
+
+static bool handleRouteBegin(const String& msg) {
+  if (!msg.startsWith("ROUTE_BEGIN,")) return false;
+  const int requested = msg.substring(12).toInt();
+  if (requested <= 0 || requested > NAV_MAX_WAYPOINTS) return false;
+  navStop("route upload");
+  navRouteExpected = (uint8_t)requested;
+  navRouteCount = 0;
+  navRouteReceivedCount = 0;
+  navWpIndex = 0;
+  for (uint8_t i = 0; i < NAV_MAX_WAYPOINTS; i++) {
+    navRouteReceived[i] = false;
+  }
+  navRouteUploading = true;
+  navRouteReady = false;
+  navState = "ROUTE";
+  return true;
+}
+
+static bool handleRouteWaypoint(const String& msg) {
+  if (!msg.startsWith("ROUTE_WP,")) return false;
+  if (!navRouteUploading) return false;
+  const int c1 = msg.indexOf(',', 9);
+  if (c1 < 0) return false;
+  const int c2 = msg.indexOf(',', c1 + 1);
+  if (c2 < 0) return false;
+  const int index = msg.substring(9, c1).toInt();
+  if (index < 0 || index >= navRouteExpected ||
+      index >= NAV_MAX_WAYPOINTS) {
+    return false;
+  }
+  navRoute[index].lat = msg.substring(c1 + 1, c2).toDouble();
+  navRoute[index].lon = msg.substring(c2 + 1).toDouble();
+  if (!navRouteReceived[index]) {
+    navRouteReceived[index] = true;
+    navRouteReceivedCount++;
+  }
+  if (index + 1 > navRouteCount) navRouteCount = (uint8_t)(index + 1);
+  return true;
+}
+
+static bool handleRouteEnd() {
+  if (!navRouteUploading) return false;
+  navRouteUploading = false;
+  navRouteReady = navRouteCount == navRouteExpected &&
+                  navRouteReceivedCount == navRouteExpected &&
+                  navRouteCount > 0;
+  navState = navRouteReady ? "READY" : "ERROR";
+  navReason = navRouteReady ? "ready" : "route";
+  navBroadcast(true);
+  return navRouteReady;
 }
 
 static void imuInit() {
@@ -1137,7 +1441,11 @@ static void setupWeb() {
       return;
     }
     if (type == WS_EVT_DISCONNECT) {
-      motorsStop("websocket disconnect");
+      if (!navRunning) {
+        motorsStop("websocket disconnect");
+      } else {
+        Serial.println("NAV: websocket disconnected, local navigation continues");
+      }
       return;
     }
     if (type != WS_EVT_DATA || len == 0) return;
@@ -1151,7 +1459,7 @@ static void setupWeb() {
     if (msg == "PING") {
       client->text("PONG");
     } else if (msg == "STOP") {
-      motorsStop("ws STOP");
+      navStop("ws STOP");
       client->text("OK STOP");
     } else if (msg == "UDP_RESET") {
       restartRtcmUdp("ws UDP_RESET");
@@ -1194,10 +1502,53 @@ static void setupWeb() {
       ESP.restart();
     } else if (msg == "GPS_STATUS") {
       client->text(gps.valid ? "OK GPS" : "NO GPS");
+    } else if (handleNavConfig(msg)) {
+      client->text("OK NAV_CFG");
+    } else if (handleRouteBegin(msg)) {
+      client->text("OK ROUTE_BEGIN");
+    } else if (handleRouteWaypoint(msg)) {
+      client->text("OK ROUTE_WP");
+    } else if (msg == "ROUTE_END") {
+      client->text(handleRouteEnd() ? "OK ROUTE_END" : "ERR,ROUTE_END");
+    } else if (msg == "NAV_START") {
+      if (navRouteReady && navRouteCount > 0) {
+        navRunning = true;
+        navPaused = false;
+        navWpIndex = 0;
+        navState = "RUNNING";
+        navReason = "start";
+        navBroadcast(true);
+        client->text("OK NAV_START");
+      } else {
+        client->text("ERR,NAV_NO_ROUTE");
+      }
+    } else if (msg == "NAV_PAUSE") {
+      if (navRunning) {
+        navPaused = true;
+        navState = "PAUSED";
+        motorsStop("nav pause");
+        navBroadcast(true);
+      }
+      client->text("OK NAV_PAUSE");
+    } else if (msg == "NAV_RESUME") {
+      if (navRouteReady && navRouteCount > 0) {
+        navRunning = true;
+        navPaused = false;
+        navState = "RUNNING";
+        navBroadcast(true);
+      }
+      client->text("OK NAV_RESUME");
+    } else if (msg == "NAV_STOP") {
+      navStop("nav stop");
+      navBroadcast(true);
+      client->text("OK NAV_STOP");
     } else {
       int left = 0;
       int right = 0;
       if (parseMoveCommand(msg, &left, &right)) {
+        navRunning = false;
+        navPaused = false;
+        navState = "IDLE";
         motorsSetTarget(left, right);
       } else {
         client->text("ERR,UNKNOWN");
@@ -1310,6 +1661,7 @@ void loop() {
     feedNmea(b);
   }
 
+  navUpdate();
   broadcastGps();
   broadcastImu();
   checkRtcmWatchdog();
