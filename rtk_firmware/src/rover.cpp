@@ -56,24 +56,28 @@ static constexpr uint32_t GPS_BROADCAST_MS = 200;
 static constexpr uint32_t LEGACY_BROADCAST_MS = 1000;
 static constexpr uint32_t STATUS_MS = 3000;
 static constexpr uint32_t WIFI_RETRY_MS = 5000;
+static constexpr uint32_t WIFI_STARTUP_DELAY_MS = 3000;
 static constexpr uint32_t RTCM_TCP_CONNECT_TIMEOUT_MS = 2000;
 static constexpr uint32_t RTCM_TCP_RETRY_MS = 5000;
 static constexpr uint32_t RTCM_TCP_PRIMARY_HOLD_MS = 2500;
 static constexpr uint32_t RTCM_WARN_AGE_MS = 7000;
 static constexpr uint32_t RTCM_RESTART_AGE_MS = 10000;
-static constexpr uint32_t RTCM_WIFI_RECOVER_AGE_MS = 25000;
-static constexpr uint32_t RTCM_WIFI_RECOVER_MS = 15000;
+static constexpr uint32_t RTCM_TRANSPORT_RECOVER_AGE_MS = 25000;
+static constexpr uint32_t RTCM_TRANSPORT_RECOVER_MS = 10000;
+static constexpr uint32_t RTCM_WIFI_RECOVER_AGE_MS = 60000;
+static constexpr uint32_t RTCM_WIFI_RECOVER_MS = 45000;
+static constexpr wifi_power_t ROVER_WIFI_TX_POWER = WIFI_POWER_2dBm;
 static constexpr int PIN_MOTOR_RX = 16;
 static constexpr int PIN_MOTOR_TX = 17;
 static constexpr int PIN_IMU_SDA = 21;
 static constexpr int PIN_IMU_SCL = 22;
 static constexpr uint32_t MOTOR_BAUD = 115200;
 static constexpr uint32_t IMU_BROADCAST_MS = 1000;
-static constexpr uint32_t IMU_REPORT_INTERVAL_US = 50000;
+static constexpr uint32_t IMU_REPORT_INTERVAL_US = 100000;
 static constexpr uint32_t IMU_NOT_FOUND_RETRY_MS = 10000;
 static constexpr uint32_t IMU_STALE_REENABLE_MS = 1500;
 static constexpr uint32_t IMU_STALE_RESET_MS = 15000;
-static constexpr uint32_t MOTOR_SEND_MS = 20;
+static constexpr uint32_t MOTOR_SEND_MS = 100;
 static constexpr uint32_t MOTOR_RAMP_MS = 20;
 static constexpr uint32_t MOTOR_CMD_TIMEOUT_MS = 400;
 static constexpr int16_t MAX_SPEED_PERCENT = 70;
@@ -160,12 +164,16 @@ static uint32_t lastImuBroadcastMs = 0;
 static uint32_t wsTelemetryDropCount = 0;
 static uint32_t lastStatusMs = 0;
 static uint32_t lastWiFiAttemptMs = 0;
+static uint32_t wifiStartAllowedMs = 0;
 static uint32_t wifiDisconnectedSinceMs = 0;
 static bool wasWiFiConnected = false;
+static bool networkServicesStarted = false;
+static bool otaCallbacksConfigured = false;
 static uint32_t wifiReconnectCount = 0;
 static uint32_t udpRestartCount = 0;
 static uint32_t lastRtcmWarnMs = 0;
 static uint32_t lastRtcmUdpRestartMs = 0;
+static uint32_t lastRtcmTransportRecoverMs = 0;
 static uint32_t lastRtcmWifiRecoverMs = 0;
 static uint32_t lastLegacyBroadcastMs = 0;
 static uint32_t lastRtcmTcpAttemptMs = 0;
@@ -173,6 +181,7 @@ static uint32_t lastRtcmTcpMs = 0;
 static uint32_t rtcmTcpReconnectCount = 0;
 static uint32_t rtcmTcpBytesRx = 0;
 static uint32_t rtcmTcpReads = 0;
+static bool rtcmUdpActive = false;
 static uint32_t lastRoverConfigRetryMs = 0;
 static uint32_t activeGpsBaud = 0;
 static const char* activeGpsPort = GPS_PORTS[0].name;
@@ -267,6 +276,7 @@ static bool imuFresh(uint32_t now) {
 }
 
 static void motorsSetTarget(int left, int right);
+static void startMotorTask();
 
 static uint32_t rtcmTransportAgeMs(uint32_t now) {
   if (lastRtcmMs != 0 && now >= lastRtcmMs) {
@@ -788,6 +798,7 @@ static void feedUbx(uint8_t b) {
 }
 
 static bool relayRtcmToF9p() {
+  if (!rtcmUdpActive) return false;
   uint8_t buf[1200];
   uint8_t packetsHandled = 0;
   const uint32_t now = millis();
@@ -828,6 +839,7 @@ static bool relayRtcmToF9p() {
 }
 
 static void connectWiFi(bool force = false);
+static void startNetworkServices();
 
 static void connectRtcmTcp() {
   if (!ENABLE_RTCM_TCP_FALLBACK) return;
@@ -881,19 +893,29 @@ static void relayTcpRtcmToF9p() {
 }
 
 static void restartRtcmUdp(const char* reason) {
+  if (ROUTER_MODE && WiFi.status() != WL_CONNECTED) {
+    if (rtcmUdpActive) {
+      rtcmUdp.stop();
+      rtcmUdpActive = false;
+    }
+    Serial.printf("RTCM UDP deferred reason=%s\n", reason);
+    return;
+  }
   rtcmUdp.stop();
+  rtcmUdpActive = false;
   delay(20);
   const uint8_t ok = rtcmUdp.begin(RTCM_UDP_PORT);
+  rtcmUdpActive = ok == 1;
   udpRestartCount++;
   lastRtcmUdpRestartMs = millis();
   Serial.printf("RTCM UDP restart #%lu port=%u ok=%u reason=%s\n",
                 (unsigned long)udpRestartCount, RTCM_UDP_PORT, ok, reason);
 }
 
-static void recoverRtcmWiFi(const char* reason) {
+static void recoverRtcmTransport(const char* reason) {
   const uint32_t now = millis();
-  if (now - lastRtcmWifiRecoverMs < RTCM_WIFI_RECOVER_MS) return;
-  lastRtcmWifiRecoverMs = now;
+  if (now - lastRtcmTransportRecoverMs < RTCM_TRANSPORT_RECOVER_MS) return;
+  lastRtcmTransportRecoverMs = now;
   Serial.printf("WARN rover RTCM transport recover reason=%s age=%lums\n", reason,
                 (unsigned long)(lastRtcmMs == 0 ? 0 : now - lastRtcmMs));
   if (ENABLE_RTCM_TCP_FALLBACK) {
@@ -901,6 +923,15 @@ static void recoverRtcmWiFi(const char* reason) {
   }
   lastRtcmTcpAttemptMs = 0;
   restartRtcmUdp(reason);
+}
+
+static void recoverRtcmWiFi(const char* reason) {
+  const uint32_t now = millis();
+  if (now - lastRtcmWifiRecoverMs < RTCM_WIFI_RECOVER_MS) return;
+  lastRtcmWifiRecoverMs = now;
+  recoverRtcmTransport(reason);
+  Serial.printf("WARN rover RTCM WiFi hard recover reason=%s age=%lums\n", reason,
+                (unsigned long)(lastRtcmMs == 0 ? 0 : now - lastRtcmMs));
   connectWiFi(true);
 }
 
@@ -927,6 +958,9 @@ static void checkRtcmWatchdog() {
       rtcmTcpClient.stop();
       lastRtcmTcpAttemptMs = 0;
     }
+  }
+  if (watchdogAge > RTCM_TRANSPORT_RECOVER_AGE_MS) {
+    recoverRtcmTransport("rtcm-stale");
   }
   if (lastRtcmMs != 0 && watchdogAge > RTCM_WIFI_RECOVER_AGE_MS) {
     recoverRtcmWiFi("rtcm-stale");
@@ -1007,9 +1041,10 @@ static void broadcastGps() {
 
 static void connectWiFi(bool force) {
   if (!ROUTER_MODE) return;
+  const uint32_t now = millis();
+  if (!force && wifiStartAllowedMs != 0 && now < wifiStartAllowedMs) return;
   if (!force && WiFi.status() == WL_CONNECTED) return;
 
-  const uint32_t now = millis();
   if (!force && lastWiFiAttemptMs != 0 &&
       now - lastWiFiAttemptMs < WIFI_RETRY_MS) {
     return;
@@ -1019,7 +1054,7 @@ static void connectWiFi(bool force) {
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_15dBm);
+  WiFi.setTxPower(ROVER_WIFI_TX_POWER);
   WiFi.setAutoReconnect(true);
   WiFi.config(ROVER_STA_IP, ROUTER_GATEWAY, ROUTER_SUBNET);
   if (force) {
@@ -1027,10 +1062,11 @@ static void connectWiFi(bool force) {
     WiFi.disconnect(false);
     delay(50);
   }
-  WiFi.begin(ROUTER_WIFI_SSID, ROUTER_WIFI_PASS);
-  Serial.printf("WiFi STA reconnect #%lu to %s, static IP %s\n",
+  Serial.printf("WiFi STA reconnect #%lu to %s, static IP %s, tx=2dBm\n",
                 (unsigned long)wifiReconnectCount, ROUTER_WIFI_SSID,
                 ROVER_STA_IP.toString().c_str());
+  Serial.flush();
+  WiFi.begin(ROUTER_WIFI_SSID, ROUTER_WIFI_PASS);
 }
 
 static void checkWiFiWatchdog() {
@@ -1046,6 +1082,7 @@ static void checkWiFiWatchdog() {
       restartRtcmUdp("wifi-connected");
       ws.closeAll();
     }
+    startNetworkServices();
     wifiDisconnectedSinceMs = 0;
     wasWiFiConnected = true;
     return;
@@ -1053,6 +1090,7 @@ static void checkWiFiWatchdog() {
 
   if (wifiDisconnectedSinceMs == 0) wifiDisconnectedSinceMs = now;
   wasWiFiConnected = false;
+  rtcmUdpActive = false;
 
   if (now - wifiDisconnectedSinceMs >= WIFI_RETRY_MS &&
       (lastWiFiAttemptMs == 0 || now - lastWiFiAttemptMs >= WIFI_RETRY_MS)) {
@@ -1405,6 +1443,7 @@ static void navUpdate() {
 }
 
 static void motorsSetTarget(int left, int right) {
+  startMotorTask();
   motorTargetLeft =
       clampI16(left / INPUT_DIV, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   motorTargetRight =
@@ -1689,10 +1728,18 @@ static void imuUpdate() {
         imuValue.sensorId != SH2_ROTATION_VECTOR) {
       continue;
     }
-    const float qw = imuValue.un.rotationVector.real;
-    const float qx = imuValue.un.rotationVector.i;
-    const float qy = imuValue.un.rotationVector.j;
-    const float qz = imuValue.un.rotationVector.k;
+    const float qw = imuValue.sensorId == SH2_GAME_ROTATION_VECTOR
+                         ? imuValue.un.gameRotationVector.real
+                         : imuValue.un.rotationVector.real;
+    const float qx = imuValue.sensorId == SH2_GAME_ROTATION_VECTOR
+                         ? imuValue.un.gameRotationVector.i
+                         : imuValue.un.rotationVector.i;
+    const float qy = imuValue.sensorId == SH2_GAME_ROTATION_VECTOR
+                         ? imuValue.un.gameRotationVector.j
+                         : imuValue.un.rotationVector.j;
+    const float qz = imuValue.sensorId == SH2_GAME_ROTATION_VECTOR
+                         ? imuValue.un.gameRotationVector.k
+                         : imuValue.un.rotationVector.k;
     float yaw = atan2(2.0f * (qw * qz + qx * qy),
                       1.0f - 2.0f * (qy * qy + qz * qz)) *
                 180.0f / PI;
@@ -1734,8 +1781,9 @@ static void broadcastImu() {
 
 static void setupWeb() {
   if (ROUTER_MODE) {
-    connectWiFi();
-    Serial.printf("Router mode: WebSocket will be ws://%s:%u/ws\n",
+    wifiStartAllowedMs = millis() + WIFI_STARTUP_DELAY_MS;
+    Serial.printf("Router mode: deferred WiFi %lums, WebSocket ws://%s:%u/ws\n",
+                  (unsigned long)WIFI_STARTUP_DELAY_MS,
                   ROVER_STA_IP.toString().c_str(), WS_PORT);
   } else {
     WiFi.mode(WIFI_AP);
@@ -1881,10 +1929,10 @@ static void setupWeb() {
   server.on("/ping", HTTP_GET, [](AsyncWebServerRequest* req) {
     req->send(200, "text/plain", "OK");
   });
-  server.begin();
 }
 
 static void setupOta() {
+  if (otaCallbacksConfigured) return;
   ArduinoOTA.setHostname("rtk-rover");
   ArduinoOTA.onStart([]() {
     motorsStop("OTA start");
@@ -1894,8 +1942,17 @@ static void setupOta() {
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("OTA: error %u\n", (unsigned)error);
   });
+  otaCallbacksConfigured = true;
+  Serial.println("OTA: callbacks configured");
+}
+
+static void startNetworkServices() {
+  if (networkServicesStarted) return;
+  server.begin();
+  Serial.println("WEB: HTTP/WebSocket server started");
   ArduinoOTA.begin();
   Serial.println("OTA: enabled hostname=rtk-rover");
+  networkServicesStarted = true;
 }
 
 static void printStatus() {
@@ -1964,21 +2021,28 @@ static void printStatus() {
 
 void setup() {
   Serial.begin(115200);
+  setCpuFrequencyMhz(80);
   delay(300);
   Serial.println();
   Serial.println("ESP32 ZED-F9P RTK ROVER");
 
   motorsInit();
   autoDetectGpsBaud();
-  imuInit();
   setupWeb();
   setupOta();
+  if (!ROUTER_MODE) {
+    startNetworkServices();
+  }
   restartRtcmUdp("setup");
+  delay(300);
+  imuInit();
   startMotorTask();
 }
 
 void loop() {
-  ArduinoOTA.handle();
+  if (networkServicesStarted) {
+    ArduinoOTA.handle();
+  }
   checkWiFiWatchdog();
   connectRtcmTcp();
   imuUpdate();

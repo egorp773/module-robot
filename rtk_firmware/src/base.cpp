@@ -50,7 +50,8 @@ static constexpr uint32_t BASE_RECONFIG_MS = 15000;
 static constexpr uint8_t UDP_FAIL_RECONNECT_LIMIT = 10;
 static constexpr uint32_t UDP_RECONNECT_COOLDOWN_MS = 10000;
 static constexpr uint32_t WIFI_AFTER_CONNECT_GRACE_MS = 5000;
-static constexpr uint32_t RTCM_TCP_WRITE_TIMEOUT_MS = 25;
+static constexpr uint32_t RTCM_TCP_WRITE_TIMEOUT_MS = 50;
+static constexpr uint8_t RTCM_UDP_BACKUP_EVERY_N = 5;
 static constexpr uint8_t RTCM_BROADCAST_EVERY_N = 10;
 
 // u-blox configuration keys for VALSET.
@@ -630,9 +631,11 @@ static void sendRtcmFrame() {
   const bool tcpOk = sendRtcmTcp();
   bool unicastOk = false;
   bool broadcastOk = false;
-  if (!tcpOk) {
+  if (!tcpOk || (rtcmFramesSeen % RTCM_UDP_BACKUP_EVERY_N) == 0) {
     unicastOk =
         sendRtcmUdpTo(ROVER_IP, "unicast", &udpSendOk, &udpSendFail);
+  }
+  if (!tcpOk) {
     if ((rtcmFramesSeen % RTCM_BROADCAST_EVERY_N) == 0) {
       broadcastOk = sendRtcmUdpTo(RTCM_BROADCAST_IP, "broadcast",
                                   &udpBroadcastOk, &udpBroadcastFail);
