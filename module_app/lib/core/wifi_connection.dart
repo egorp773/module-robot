@@ -223,7 +223,7 @@ class WifiPingCheckNotifier extends StateNotifier<bool> {
   static const String _key = 'wifi_ping_check_enabled';
   bool _initialized = false;
 
-  WifiPingCheckNotifier() : super(true) {
+  WifiPingCheckNotifier() : super(false) {
     _init();
   }
 
@@ -237,13 +237,13 @@ class WifiPingCheckNotifier extends StateNotifier<bool> {
         state = value;
         debugPrint('DEBUG: Set wifi ping check state to: $value');
       } else {
-        debugPrint('DEBUG: No saved value, using default: true');
+        debugPrint('DEBUG: No saved value, using default: false');
       }
       _initialized = true;
     } catch (e) {
       debugPrint('DEBUG: Error loading wifi ping check: $e');
       _initialized = true;
-      // Оставляем значение по умолчанию (true)
+      // Оставляем значение по умолчанию (false)
     }
   }
 
@@ -365,10 +365,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
     _log("→ Connectivity changed: $results (Wi-Fi: $hasWifi)");
 
-    if (!hasWifi && state.isConnected) {
-      _log("× Wi-Fi disconnected, disconnecting...");
-      unawaited(_handleConnectionLost("Wi-Fi отключен"));
-    } else if (hasWifi && _autoReconnectEnabled && !state.isConnected) {
+    if (hasWifi && _autoReconnectEnabled && !state.isConnected) {
       _scheduleReconnect("Wi-Fi вернулся");
     }
   }
@@ -388,7 +385,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     return msg.startsWith("GPS,") ||
         msg.startsWith("GPSDBG,") ||
         msg.startsWith("RTCM,") ||
-        msg.startsWith("IMU,");
+        msg.startsWith("IMU,") ||
+        msg.startsWith("TEL,") ||
+        msg == "OK M";
   }
 
   void _logIncoming(String msg) {
@@ -430,7 +429,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       if (lastRx == null) return;
       final silence = DateTime.now().difference(lastRx);
 
-      if (silence.inSeconds >= 6) {
+      if (silence.inSeconds >= 8) {
         final ch = _channel;
         if (ch != null) {
           try {
@@ -443,7 +442,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         }
       }
 
-      if (silence.inSeconds >= 12) {
+      if (silence.inSeconds >= 20) {
         unawaited(
           _handleConnectionLost(
             "Нет данных от ровера ${silence.inSeconds} секунд",
@@ -499,78 +498,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     _channel = null;
   }
 
-  /// Минимальная проверка Wi-Fi: пробуем подключиться к WebSocket
-  /// Если WebSocket подключается - значит Wi-Fi есть
-  Future<bool> _testWebSocketConnection() async {
-    WebSocketChannel? testChannel;
-    StreamSubscription? testSub;
-    try {
-      _log("→ Testing WebSocket connection to $_wsUri");
-      testChannel = WebSocketChannel.connect(_wsUri);
-
-      final testCompleter = Completer<bool>();
-      bool gotMessage = false;
-
-      testSub = testChannel.stream.listen(
-        (msg) {
-          if (!gotMessage) {
-            gotMessage = true;
-            _log("← Test received: ${msg.toString().trim()}");
-            if (!testCompleter.isCompleted) {
-              testCompleter.complete(true);
-            }
-          }
-        },
-        onError: (e) {
-          _log("× Test WebSocket error: $e");
-          if (!testCompleter.isCompleted) {
-            testCompleter.complete(false);
-          }
-        },
-        onDone: () {
-          _log("× Test WebSocket closed");
-          if (!testCompleter.isCompleted) {
-            testCompleter.complete(false);
-          }
-        },
-        cancelOnError: false,
-      );
-
-      // Ждем либо первого сообщения, либо ошибки (максимум 3 секунды для теста)
-      final success = await testCompleter.future.timeout(
-        const Duration(seconds: 3),
-        onTimeout: () {
-          _log("× Test WebSocket timeout");
-          return false;
-        },
-      );
-
-      // Закрываем тестовое соединение
-      await testSub.cancel();
-      testSub = null;
-      try {
-        testChannel.sink.close();
-      } catch (_) {}
-      testChannel = null;
-
-      if (success) {
-        _log("✓ WebSocket test: connection successful");
-      } else {
-        _log("× WebSocket test: connection failed");
-      }
-      return success;
-    } catch (e) {
-      _log("× WebSocket test error: $e");
-      try {
-        await testSub?.cancel();
-        testChannel?.sink.close();
-      } catch (_) {}
-      return false;
-    }
-  }
-
   Future<void> connect({bool skipPreflight = false}) async {
     if (state.isConnecting || state.isConnected) return;
+    final _ = skipPreflight;
 
     _autoReconnectEnabled = true;
     _lastTelemetryLogAt = null;
@@ -581,40 +511,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     _log("=== CONNECT START ===");
     await _ref.read(wifiRobotHostProvider.notifier).ensureInitialized();
 
-    final bool pingCheckEnabled;
-    if (skipPreflight) {
-      pingCheckEnabled = false;
-      _log("→ Fast connect: Wi-Fi preflight skipped");
-    } else {
-      // Проверяем настройку проверки Wi-Fi
-      // Убеждаемся, что настройка загружена
-      final notifier = _ref.read(wifiPingCheckProvider.notifier);
-      await notifier.ensureInitialized();
-
-      // Читаем актуальное значение после инициализации
-      pingCheckEnabled = _ref.read(wifiPingCheckProvider);
-      _log("→ Wi-Fi check setting: $pingCheckEnabled");
-    }
-
-    if (pingCheckEnabled) {
-      // Проверка включена - выполняем минимальную проверку WebSocket
-      _log("→ Wi-Fi check enabled, testing WebSocket connection...");
-      final wsTestOk = await _testWebSocketConnection();
-      if (!wsTestOk) {
-        state = state.copyWith(
-          isConnecting: false,
-          isConnected: false,
-          error:
-              "Не вижу робота по Wi-Fi. Проверь что iPhone/Android подключён к сети Robot.",
-        );
-        _log("=== CONNECT FAIL: WebSocket test failed ===");
-        _scheduleReconnect("WebSocket preflight failed");
-        return;
-      }
-      _log("✓ WebSocket test passed, Wi-Fi is available");
-    } else {
-      _log("→ Wi-Fi preflight disabled, connecting WebSocket directly...");
-    }
+    _log("WebSocket preflight disabled");
 
     try {
       _log("→ WS connect $_wsUri");
@@ -644,6 +541,48 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
           final msgStr = msg.toString().trim();
           _logIncoming(msgStr);
           final upperMsg = msgStr.toUpperCase();
+
+          if (msgStr.startsWith("TEL,")) {
+            try {
+              final parts = msgStr.split(",");
+              if (parts.length >= 19) {
+                final lat = double.tryParse(parts[1]);
+                final lon = double.tryParse(parts[2]);
+                if (lat != null && lon != null) {
+                  final now = DateTime.now();
+                  _lastGpsDebugAt = now;
+                  final imuYaw = double.tryParse(parts[16]);
+                  state = state.copyWith(
+                    gpsLat: lat,
+                    gpsLon: lon,
+                    gpsHeightM: double.tryParse(parts[3]),
+                    gpsHeading: double.tryParse(parts[4]),
+                    gpsFixType: int.tryParse(parts[5]),
+                    gpsCarrier:
+                        parts[6].trim().isEmpty ? null : parts[6].trim(),
+                    gpsDiff: parts[7].trim() == '1',
+                    gpsSatellites: int.tryParse(parts[8]),
+                    gpsAccuracy: int.tryParse(parts[9]),
+                    gpsVAccuracy: int.tryParse(parts[10]),
+                    gpsSpeedMps: double.tryParse(parts[11]),
+                    gpsPDop: double.tryParse(parts[12]),
+                    gpsAgeMs: int.tryParse(parts[13]),
+                    gpsReceivedAt: now,
+                    rtcmBytes: int.tryParse(parts[14]),
+                    rtcmAgeMs: int.tryParse(parts[15]),
+                    imuYaw: imuYaw,
+                    imuAgeMs: int.tryParse(parts[17]),
+                    imuFresh: parts[18].trim() == '1',
+                    imuReceivedAt: imuYaw == null ? null : now,
+                  );
+                  _maybeLogTelemetrySummary();
+                }
+              }
+            } catch (e) {
+              _log("× Failed to parse TEL: $e");
+            }
+            return;
+          }
 
           // Парсинг BAT_PCT,<int>
           if (msgStr.startsWith("BAT_PCT,")) {
@@ -937,14 +876,14 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     super.dispose();
   }
 
-  void sendRaw(String text) {
+  void sendRaw(String text, {bool log = true}) {
     final ch = _channel;
     if (ch == null) {
       _log("× sendRaw failed: channel is null");
       return;
     }
     try {
-      _log("→ $text");
+      if (log) _log("→ $text");
       ch.sink.add(text);
     } catch (e) {
       _log("× sendRaw error: $e");
@@ -957,12 +896,12 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     if (!state.isConnected) return;
     left = left.clamp(-100, 100);
     right = right.clamp(-100, 100);
-    sendRaw("M,$left,$right");
+    sendRaw("M,$left,$right", log: false);
   }
 
   void sendStop() {
     if (!state.isConnected) return;
-    sendRaw("STOP");
+    sendRaw("STOP", log: false);
   }
 
   /// Отправка команды для насадки (attachment)

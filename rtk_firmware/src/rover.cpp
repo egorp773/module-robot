@@ -52,8 +52,10 @@ static constexpr uint16_t WS_PORT = 81;
 static constexpr uint16_t RTCM_UDP_PORT = 2101;
 static constexpr uint16_t RTCM_TCP_PORT = 2102;
 static constexpr uint32_t GPS_BROADCAST_MS = 200;
-static constexpr uint32_t STATUS_MS = 1000;
+static constexpr uint32_t LEGACY_BROADCAST_MS = 1000;
+static constexpr uint32_t STATUS_MS = 3000;
 static constexpr uint32_t WIFI_RETRY_MS = 5000;
+static constexpr uint32_t RTCM_TCP_CONNECT_TIMEOUT_MS = 250;
 static constexpr uint32_t RTCM_WARN_AGE_MS = 5000;
 static constexpr uint32_t RTCM_RESTART_AGE_MS = 5000;
 static constexpr uint32_t RTCM_WIFI_RECOVER_AGE_MS = 30000;
@@ -63,7 +65,7 @@ static constexpr int PIN_MOTOR_TX = 17;
 static constexpr int PIN_IMU_SDA = 21;
 static constexpr int PIN_IMU_SCL = 22;
 static constexpr uint32_t MOTOR_BAUD = 115200;
-static constexpr uint32_t IMU_BROADCAST_MS = 200;
+static constexpr uint32_t IMU_BROADCAST_MS = 1000;
 static constexpr uint32_t MOTOR_SEND_MS = 20;
 static constexpr uint32_t MOTOR_RAMP_MS = 20;
 static constexpr uint32_t MOTOR_CMD_TIMEOUT_MS = 400;
@@ -125,6 +127,7 @@ static uint32_t udpRestartCount = 0;
 static uint32_t lastRtcmWarnMs = 0;
 static uint32_t lastRtcmUdpRestartMs = 0;
 static uint32_t lastRtcmWifiRecoverMs = 0;
+static uint32_t lastLegacyBroadcastMs = 0;
 static uint32_t lastRtcmTcpAttemptMs = 0;
 static uint32_t lastRtcmTcpMs = 0;
 static uint32_t rtcmTcpReconnectCount = 0;
@@ -663,7 +666,9 @@ static void connectRtcmTcp() {
   Serial.printf("RTCM TCP connect #%lu to %s:%u\n",
                 (unsigned long)rtcmTcpReconnectCount,
                 BASE_STA_IP.toString().c_str(), RTCM_TCP_PORT);
-  if (rtcmTcpClient.connect(BASE_STA_IP, RTCM_TCP_PORT)) {
+  rtcmTcpClient.setTimeout(RTCM_TCP_CONNECT_TIMEOUT_MS);
+  if (rtcmTcpClient.connect(BASE_STA_IP, RTCM_TCP_PORT,
+                            RTCM_TCP_CONNECT_TIMEOUT_MS)) {
     rtcmTcpClient.setNoDelay(true);
     Serial.println("RTCM TCP connected");
   } else {
@@ -757,6 +762,22 @@ static void broadcastGps() {
 
   const uint32_t gpsAgeMs = gps.lastMs == 0 ? 0 : now - gps.lastMs;
   const uint32_t rtcmAgeMs = lastRtcmMs == 0 ? 0 : now - lastRtcmMs;
+  const uint32_t imuAgeMs = lastImuMs == 0 ? 0 : now - lastImuMs;
+  const bool freshImu = imuFresh(now);
+
+  char tel[256];
+  snprintf(tel, sizeof(tel),
+           "TEL,%.8f,%.8f,%.3f,%.2f,%u,%s,%u,%u,%lu,%lu,%.3f,%.2f,%lu,%lu,%lu,%.2f,%lu,%u",
+           gps.lat, gps.lon, gps.heightM, gps.heading, gps.fixType,
+           carrierName(gps.carrier), gps.diff ? 1 : 0, gps.numSv,
+           (unsigned long)gps.hAccMm, (unsigned long)gps.vAccMm,
+           gps.speedMps, gps.pDop, (unsigned long)gpsAgeMs,
+           (unsigned long)rtcmBytesRx, (unsigned long)rtcmAgeMs,
+           imuYaw, (unsigned long)imuAgeMs, freshImu ? 1 : 0);
+  ws.textAll(tel);
+
+  if (now - lastLegacyBroadcastMs < LEGACY_BROADCAST_MS) return;
+  lastLegacyBroadcastMs = now;
 
   char msg[192];
   snprintf(msg, sizeof(msg), "GPS,%.8f,%.8f,%.2f,%u,%lu",
@@ -1128,7 +1149,6 @@ static void setupWeb() {
       int right = 0;
       if (parseMoveCommand(msg, &left, &right)) {
         motorsSetTarget(left, right);
-        client->text("OK M");
       } else {
         client->text("ERR,UNKNOWN");
       }
