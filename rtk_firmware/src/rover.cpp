@@ -84,10 +84,20 @@ static constexpr uint32_t NAV_LOOP_MS = 100;
 static constexpr uint32_t NAV_BROADCAST_MS = 500;
 static constexpr uint32_t NAV_MAX_GPS_AGE_MS = 5000;
 static constexpr uint32_t NAV_MAX_RTCM_AGE_MS = 20000;
-static constexpr uint32_t NAV_HEADING_HOLD_MS = 8000;
+static constexpr uint32_t NAV_MAX_IMU_AGE_MS = 1000;
 static constexpr uint32_t NAV_MAX_HACC_MM = 80;
 static constexpr float NAV_ARRIVED_M = 0.45f;
+static constexpr float NAV_PASS_WP_M = 0.85f;
 static constexpr float NAV_PIVOT_ERROR_DEG = 75.0f;
+static constexpr float NAV_LOOKAHEAD_MIN_M = 0.80f;
+static constexpr float NAV_LOOKAHEAD_MAX_M = 2.40f;
+static constexpr float NAV_MOTION_SAMPLE_M = 0.30f;
+static constexpr float NAV_BAD_MOTION_DEG = 115.0f;
+static constexpr float NAV_CROSSTRACK_SLOW_M = 0.80f;
+static constexpr float NAV_CLOSE_SLOW_M = 1.40f;
+static constexpr uint32_t NAV_PROGRESS_CHECK_MS = 3000;
+static constexpr uint32_t NAV_RECOVERY_MS = 1800;
+static constexpr float NAV_MIN_PROGRESS_M = 0.08f;
 
 static constexpr uint32_t CFG_UART1INPROT_UBX = 0x10730001;
 static constexpr uint32_t CFG_UART1INPROT_NMEA = 0x10730002;
@@ -121,6 +131,14 @@ struct GpsFix {
 struct NavWaypoint {
   double lat = 0.0;
   double lon = 0.0;
+};
+
+struct NavLegMetrics {
+  float lengthM = 0.0f;
+  float alongM = 0.0f;
+  float crossTrackM = 0.0f;
+  float remainingM = 0.0f;
+  float aimBearing = 0.0f;
 };
 
 static HardwareSerial GpsSerial(1);
@@ -194,13 +212,29 @@ static bool navRouteReady = false;
 static bool navRunning = false;
 static bool navPaused = false;
 static uint8_t navWpIndex = 0;
+static NavWaypoint navStartPoint;
+static bool navStartPointValid = false;
 static uint32_t lastNavLoopMs = 0;
 static uint32_t lastNavBroadcastMs = 0;
-static uint32_t lastNavGoodHeadingMs = 0;
 static float navLastHeading = 0.0f;
 static float navLastDistanceM = 0.0f;
 static float navLastBearing = 0.0f;
 static float navLastHeadingError = 0.0f;
+static float navLastCrossTrackM = 0.0f;
+static float navLastAlongTrackM = 0.0f;
+static float navLastMotionBearing = 0.0f;
+static float navLastMotionError = 0.0f;
+static bool navMotionValid = false;
+static bool navMotionSeeded = false;
+static NavWaypoint navMotionSamplePoint;
+static uint32_t navLastMotionMs = 0;
+static uint32_t navProgressCheckMs = 0;
+static float navProgressCheckDistanceM = 0.0f;
+static float navBestDistanceM = 9999.0f;
+static uint8_t navStallCount = 0;
+static uint8_t navBadMotionCount = 0;
+static uint32_t navRecoveryUntilMs = 0;
+static int8_t navRecoveryDir = 1;
 static int16_t navForwardPercent = 22;
 static int16_t navTurnPercent = 18;
 static bool navInvertForward = false;
@@ -215,8 +249,13 @@ static sh2_SensorValue_t imuValue;
 static bool imuDetected = false;
 static bool imuValid = false;
 static float imuYaw = 0.0f;
+static float imuRotationYaw = 0.0f;
+static float imuGameYaw = 0.0f;
 static uint32_t lastImuMs = 0;
+static uint32_t lastImuRotationMs = 0;
+static uint32_t lastImuGameMs = 0;
 static uint32_t lastImuRecoverMs = 0;
+static const char* imuYawSource = "none";
 
 static bool imuFresh(uint32_t now) {
   return imuDetected && imuValid && lastImuMs != 0 && now - lastImuMs <= 5000;
@@ -293,6 +332,18 @@ static float headingErrorDeg(float current, float target) {
 
 static float degToRad(float deg) {
   return deg * PI / 180.0f;
+}
+
+static void localMeters(double originLat, double originLon, double lat,
+                        double lon, float* eastM, float* northM) {
+  const double latRad = originLat * PI / 180.0;
+  const double metersPerDegLat = 111132.92 -
+                                 559.82 * cos(2.0 * latRad) +
+                                 1.175 * cos(4.0 * latRad);
+  const double metersPerDegLon = 111412.84 * cos(latRad) -
+                                 93.5 * cos(3.0 * latRad);
+  *eastM = (float)((lon - originLon) * metersPerDegLon);
+  *northM = (float)((lat - originLat) * metersPerDegLat);
 }
 
 static float distanceMeters(double lat1, double lon1, double lat2, double lon2) {
@@ -997,6 +1048,9 @@ static void navStop(const char* reason) {
   navPaused = false;
   navState = "IDLE";
   navReason = reason == nullptr ? "stop" : reason;
+  navMotionSeeded = false;
+  navMotionValid = false;
+  navRecoveryUntilMs = 0;
   motorsStop(reason);
 }
 
@@ -1013,66 +1067,209 @@ static bool navRtkUsable(uint32_t now) {
 }
 
 static bool navCurrentHeading(uint32_t now, float* heading) {
-  if (imuFresh(now)) {
-    const float yaw = navInvertYaw ? -imuYaw : imuYaw;
-    navLastHeading = normalizeDeg(yaw + navHeadingOffsetDeg);
-    lastNavGoodHeadingMs = now;
-    *heading = navLastHeading;
-    return true;
+  if (!imuDetected || !imuValid || lastImuMs == 0 ||
+      now - lastImuMs > NAV_MAX_IMU_AGE_MS) {
+    return false;
   }
-  if (gps.speedMps >= 0.35f) {
-    navLastHeading = normalizeDeg(gps.heading);
-    lastNavGoodHeadingMs = now;
-    *heading = navLastHeading;
-    return true;
-  }
-  if (lastNavGoodHeadingMs != 0 && now - lastNavGoodHeadingMs <= NAV_HEADING_HOLD_MS) {
-    *heading = navLastHeading;
-    return true;
-  }
-  return false;
+  const float yaw = navInvertYaw ? -imuYaw : imuYaw;
+  navLastHeading = normalizeDeg(yaw + navHeadingOffsetDeg);
+  *heading = navLastHeading;
+  return true;
 }
 
-static void navSetMotor(float errorDeg, float distanceM) {
-  const int16_t maxForward = clampI16(navForwardPercent, 0, 45);
-  const int16_t maxTurn = clampI16(navTurnPercent, 0, 40);
-  const float absError = fabs(errorDeg);
+static void navResetGuidanceState() {
+  navMotionSeeded = false;
+  navMotionValid = false;
+  navLastMotionBearing = 0.0f;
+  navLastMotionError = 0.0f;
+  navProgressCheckMs = 0;
+  navProgressCheckDistanceM = 0.0f;
+  navBestDistanceM = 9999.0f;
+  navStallCount = 0;
+  navBadMotionCount = 0;
+  navRecoveryUntilMs = 0;
+  navRecoveryDir = 1;
+}
 
-  if (absError >= NAV_PIVOT_ERROR_DEG) {
-    const int16_t turn = maxTurn * (navInvertSteering ? -1 : 1);
-    if (errorDeg > 0.0f) {
-      motorsSetTarget(turn, -turn);
-    } else {
-      motorsSetTarget(-turn, turn);
-    }
+static NavWaypoint navCurrentLegStart() {
+  if (navWpIndex == 0) {
+    return navStartPointValid ? navStartPoint : navRoute[0];
+  }
+  return navRoute[navWpIndex - 1];
+}
+
+static NavLegMetrics navComputeLegMetrics(const NavWaypoint& start,
+                                          const NavWaypoint& target) {
+  NavLegMetrics m;
+  float segX = 0.0f;
+  float segY = 0.0f;
+  float curX = 0.0f;
+  float curY = 0.0f;
+  localMeters(start.lat, start.lon, target.lat, target.lon, &segX, &segY);
+  localMeters(start.lat, start.lon, gps.lat, gps.lon, &curX, &curY);
+
+  m.lengthM = sqrtf(segX * segX + segY * segY);
+  if (m.lengthM < 0.10f) {
+    m.alongM = 0.0f;
+    m.crossTrackM = 0.0f;
+    m.remainingM = navLastDistanceM;
+    m.aimBearing = navLastBearing;
+    return m;
+  }
+
+  const float ux = segX / m.lengthM;
+  const float uy = segY / m.lengthM;
+  m.alongM = curX * ux + curY * uy;
+  m.crossTrackM = ux * curY - uy * curX;
+  m.remainingM = m.lengthM - m.alongM;
+
+  const float lookahead = fminf(
+      NAV_LOOKAHEAD_MAX_M,
+      fmaxf(NAV_LOOKAHEAD_MIN_M, 0.75f + fabsf(m.crossTrackM) * 0.55f));
+  float targetAlong = m.alongM + lookahead;
+  if (targetAlong < lookahead) targetAlong = lookahead;
+  if (targetAlong > m.lengthM) targetAlong = m.lengthM;
+
+  const float aimX = ux * targetAlong;
+  const float aimY = uy * targetAlong;
+  const float dx = aimX - curX;
+  const float dy = aimY - curY;
+  if (sqrtf(dx * dx + dy * dy) < 0.20f) {
+    m.aimBearing = navLastBearing;
+  } else {
+    m.aimBearing = normalizeDeg((float)(atan2(dx, dy) * 180.0 / PI));
+  }
+  return m;
+}
+
+static void navUpdateMotion(uint32_t now, float desiredBearing) {
+  if (!navMotionSeeded) {
+    navMotionSamplePoint.lat = gps.lat;
+    navMotionSamplePoint.lon = gps.lon;
+    navMotionSeeded = true;
+    navMotionValid = false;
+    navLastMotionMs = now;
     return;
   }
 
-  const float distanceScale =
-      distanceM < 1.2f ? (0.45f + distanceM / 1.2f * 0.55f) : 1.0f;
-  const float errorScale = absError > 35.0f ? 0.55f : 1.0f;
-  int16_t baseMag = (int16_t)roundf((float)maxForward * distanceScale * errorScale);
+  const float moved = distanceMeters(navMotionSamplePoint.lat,
+                                     navMotionSamplePoint.lon, gps.lat, gps.lon);
+  if (moved >= NAV_MOTION_SAMPLE_M) {
+    navLastMotionBearing = bearingDeg(navMotionSamplePoint.lat,
+                                      navMotionSamplePoint.lon, gps.lat, gps.lon);
+    navLastMotionError = headingErrorDeg(navLastMotionBearing, desiredBearing);
+    navMotionValid = true;
+    navLastMotionMs = now;
+    navMotionSamplePoint.lat = gps.lat;
+    navMotionSamplePoint.lon = gps.lon;
+    if (fabsf(navLastMotionError) > NAV_BAD_MOTION_DEG &&
+        navLastDistanceM > NAV_PASS_WP_M) {
+      if (navBadMotionCount < 5) navBadMotionCount++;
+    } else if (navBadMotionCount > 0) {
+      navBadMotionCount--;
+    }
+  } else if (now - navLastMotionMs > 5000) {
+    navMotionValid = false;
+  }
+}
+
+static void navUpdateProgress(uint32_t now) {
+  if (navLastDistanceM < navBestDistanceM) navBestDistanceM = navLastDistanceM;
+  if (navProgressCheckMs == 0) {
+    navProgressCheckMs = now;
+    navProgressCheckDistanceM = navLastDistanceM;
+    navBestDistanceM = navLastDistanceM;
+    return;
+  }
+  if (now - navProgressCheckMs < NAV_PROGRESS_CHECK_MS) return;
+
+  const float progress = navProgressCheckDistanceM - navBestDistanceM;
+  if (navLastDistanceM > NAV_PASS_WP_M &&
+      fabsf(navLastHeadingError) < 65.0f &&
+      progress < NAV_MIN_PROGRESS_M) {
+    if (navStallCount < 5) navStallCount++;
+  } else {
+    navStallCount = 0;
+  }
+  navProgressCheckMs = now;
+  navProgressCheckDistanceM = navLastDistanceM;
+  navBestDistanceM = navLastDistanceM;
+}
+
+static void navMaybeEnterRecovery(uint32_t now) {
+  if (now < navRecoveryUntilMs) return;
+  if (navBadMotionCount >= 2 || navStallCount >= 2) {
+    navRecoveryDir = navLastHeadingError >= 0.0f ? 1 : -1;
+    navRecoveryUntilMs = now + NAV_RECOVERY_MS;
+    navReason = navBadMotionCount >= 2 ? "recover-motion" : "recover-stall";
+    navBadMotionCount = 0;
+    navStallCount = 0;
+  }
+}
+
+static void navSetMotor(uint32_t now, float errorDeg, float distanceM,
+                        float crossTrackM) {
+  const int16_t maxForward = clampI16(navForwardPercent, 0, 45);
+  const int16_t maxTurn = clampI16(navTurnPercent, 0, 40);
+  const int16_t safeTurn = maxTurn > 0 ? maxTurn : 12;
+  const float absError = fabs(errorDeg);
+
+  if (now < navRecoveryUntilMs) {
+    const int16_t turn =
+        (int16_t)(safeTurn * navRecoveryDir) * (navInvertSteering ? -1 : 1);
+    motorsSetTarget(turn, -turn);
+    return;
+  }
+
+  if (absError >= NAV_PIVOT_ERROR_DEG) {
+    const int16_t turn =
+        (int16_t)(safeTurn * (errorDeg > 0.0f ? 1 : -1)) *
+        (navInvertSteering ? -1 : 1);
+    motorsSetTarget(turn, -turn);
+    return;
+  }
+
+  float forwardScale = 1.0f;
+  if (distanceM < NAV_CLOSE_SLOW_M) {
+    forwardScale *= 0.35f + distanceM / NAV_CLOSE_SLOW_M * 0.65f;
+  }
+  if (absError > 55.0f) {
+    forwardScale *= 0.25f;
+  } else if (absError > 35.0f) {
+    forwardScale *= 0.55f;
+  }
+  const float absCross = fabsf(crossTrackM);
+  if (absCross > NAV_CROSSTRACK_SLOW_M) {
+    forwardScale *= fmaxf(0.35f, 1.0f - (absCross - NAV_CROSSTRACK_SLOW_M) * 0.25f);
+  }
+  if (navMotionValid && fabsf(navLastMotionError) > 75.0f) {
+    forwardScale *= 0.55f;
+  }
+
+  int16_t baseMag = (int16_t)roundf((float)maxForward * forwardScale);
   if (maxForward > 0 && baseMag < 6) baseMag = 6;
   if (baseMag > maxForward) baseMag = maxForward;
   const int16_t base = baseMag * (navInvertForward ? -1 : 1);
 
-  int16_t steerMag =
-      (int16_t)roundf((float)maxTurn * fminf(absError / 45.0f, 1.0f));
-  int16_t steer = steerMag * (errorDeg > 0.0f ? 1 : -1);
+  float steer = (float)maxTurn * fminf(absError / 45.0f, 1.0f) *
+                (errorDeg > 0.0f ? 1.0f : -1.0f);
+  steer += fmaxf(-(float)maxTurn * 0.35f,
+                 fminf((float)maxTurn * 0.35f, crossTrackM * 5.0f));
   if (navInvertSteering) steer = -steer;
 
-  motorsSetTarget(clampI16(base + steer, -100, 100),
-                  clampI16(base - steer, -100, 100));
+  motorsSetTarget(clampI16(base + (int16_t)roundf(steer), -100, 100),
+                  clampI16(base - (int16_t)roundf(steer), -100, 100));
 }
 
 static void navBroadcast(bool force = false) {
   const uint32_t now = millis();
   if (!force && now - lastNavBroadcastMs < NAV_BROADCAST_MS) return;
   lastNavBroadcastMs = now;
-  char msg[96];
-  snprintf(msg, sizeof(msg), "NAV,%s,%u,%u,%.2f,%.1f,%.1f",
+  char msg[160];
+  snprintf(msg, sizeof(msg), "NAV,%s,%u,%u,%.2f,%.1f,%.1f,%.2f,%.1f,%s",
            navState, navWpIndex, navRouteCount, navLastDistanceM,
-           navLastHeadingError, navLastBearing);
+           navLastHeadingError, navLastBearing, navLastCrossTrackM,
+           navMotionValid ? navLastMotionError : 0.0f, navReason);
   broadcastTelemetry(msg);
 }
 
@@ -1107,23 +1304,36 @@ static void navUpdate() {
 
   float heading = 0.0f;
   if (!navCurrentHeading(now, &heading)) {
-    motorsStop("nav heading wait");
-    navState = "WAIT_HEADING";
-    navReason = "heading";
+    motorsStop("nav imu wait");
+    navState = "WAIT_IMU";
+    navReason = "imu";
     navBroadcast(true);
     return;
+  }
+
+  if (!navStartPointValid) {
+    navStartPoint.lat = gps.lat;
+    navStartPoint.lon = gps.lon;
+    navStartPointValid = true;
   }
 
   const NavWaypoint& target = navRoute[navWpIndex];
   navLastDistanceM = distanceMeters(gps.lat, gps.lon, target.lat, target.lon);
   navLastBearing = bearingDeg(gps.lat, gps.lon, target.lat, target.lon);
-  navLastHeadingError = headingErrorDeg(heading, navLastBearing);
+  const NavWaypoint legStart = navCurrentLegStart();
+  const NavLegMetrics leg = navComputeLegMetrics(legStart, target);
+  navLastCrossTrackM = leg.crossTrackM;
+  navLastAlongTrackM = leg.alongM;
+  navLastHeadingError = headingErrorDeg(heading, leg.aimBearing);
 
-  if (navLastDistanceM <= NAV_ARRIVED_M) {
+  if (navLastDistanceM <= NAV_ARRIVED_M ||
+      (leg.lengthM > 0.10f && leg.alongM >= leg.lengthM - 0.10f &&
+       navLastDistanceM <= NAV_PASS_WP_M)) {
     char wpMsg[32];
     snprintf(wpMsg, sizeof(wpMsg), "NAV_WP,%u", navWpIndex);
     broadcastTelemetry(wpMsg);
     navWpIndex++;
+    navResetGuidanceState();
     if (navWpIndex >= navRouteCount) {
       navRunning = false;
       navState = "DONE";
@@ -1132,11 +1342,19 @@ static void navUpdate() {
       navBroadcast(true);
       return;
     }
+    navBroadcast(true);
+    return;
   }
 
+  navUpdateMotion(now, leg.aimBearing);
+  navUpdateProgress(now);
+  navMaybeEnterRecovery(now);
+
   navState = "RUNNING";
-  navReason = "track";
-  navSetMotor(navLastHeadingError, navLastDistanceM);
+  if (now >= navRecoveryUntilMs) {
+    navReason = "track-imu";
+  }
+  navSetMotor(now, navLastHeadingError, navLastDistanceM, navLastCrossTrackM);
   navBroadcast(false);
 }
 
@@ -1275,6 +1493,8 @@ static bool handleRouteBegin(const String& msg) {
   navRouteCount = 0;
   navRouteReceivedCount = 0;
   navWpIndex = 0;
+  navStartPointValid = false;
+  navResetGuidanceState();
   for (uint8_t i = 0; i < NAV_MAX_WAYPOINTS; i++) {
     navRouteReceived[i] = false;
   }
@@ -1358,10 +1578,33 @@ static void imuReset(const char* reason) {
   imuDetected = false;
   imuValid = false;
   lastImuMs = 0;
+  lastImuRotationMs = 0;
+  lastImuGameMs = 0;
   lastImuRecoverMs = 0;
+  imuYawSource = "none";
   Wire.end();
   delay(80);
   imuInit();
+}
+
+static void imuStoreYaw(uint8_t sensorId, float yaw, uint32_t now) {
+  if (sensorId == SH2_ROTATION_VECTOR) {
+    imuRotationYaw = yaw;
+    lastImuRotationMs = now;
+  } else {
+    imuGameYaw = yaw;
+    lastImuGameMs = now;
+  }
+
+  if (lastImuRotationMs != 0 && now - lastImuRotationMs <= 250) {
+    imuYaw = imuRotationYaw;
+    lastImuMs = lastImuRotationMs;
+    imuYawSource = "rot";
+  } else if (lastImuGameMs != 0) {
+    imuYaw = imuGameYaw;
+    lastImuMs = lastImuGameMs;
+    imuYawSource = "game";
+  }
 }
 
 static void imuUpdate() {
@@ -1385,9 +1628,8 @@ static void imuUpdate() {
                       1.0f - 2.0f * (qy * qy + qz * qz)) *
                 180.0f / PI;
     if (yaw < 0) yaw += 360.0f;
-    imuYaw = yaw;
     imuValid = true;
-    lastImuMs = millis();
+    imuStoreYaw(imuValue.sensorId, yaw, millis());
   }
 
   const uint32_t now = millis();
@@ -1416,9 +1658,9 @@ static void broadcastImu() {
   lastImuBroadcastMs = now;
   if (!imuFresh(now)) return;
   const uint32_t imuAgeMs = now - lastImuMs;
-  char msg[48];
-  snprintf(msg, sizeof(msg), "IMU,%.2f,%lu,1", imuYaw,
-           (unsigned long)imuAgeMs);
+  char msg[64];
+  snprintf(msg, sizeof(msg), "IMU,%.2f,%lu,1,%s", imuYaw,
+           (unsigned long)imuAgeMs, imuYawSource);
   broadcastTelemetry(msg);
 }
 
@@ -1468,16 +1710,17 @@ static void setupWeb() {
       client->text("OK IMU_RESET");
       imuReset("ws IMU_RESET");
     } else if (msg == "IMU_STATUS") {
-      char status[96];
+      char status[128];
       const uint32_t now = millis();
       const uint32_t imuAgeMs = lastImuMs == 0 ? 0 : now - lastImuMs;
       snprintf(status, sizeof(status),
-               "IMU_STATUS,detected=%d,valid=%d,fresh=%d,age=%lu,yaw=%.2f",
+               "IMU_STATUS,detected=%d,valid=%d,fresh=%d,age=%lu,yaw=%.2f,src=%s",
                imuDetected ? 1 : 0,
                imuValid ? 1 : 0,
                imuFresh(now) ? 1 : 0,
                (unsigned long)imuAgeMs,
-               imuYaw);
+               imuYaw,
+               imuYawSource);
       client->text(status);
     } else if (msg == "STATUS") {
       char status[192];
@@ -1515,6 +1758,10 @@ static void setupWeb() {
         navRunning = true;
         navPaused = false;
         navWpIndex = 0;
+        navStartPoint.lat = gps.valid ? gps.lat : navRoute[0].lat;
+        navStartPoint.lon = gps.valid ? gps.lon : navRoute[0].lon;
+        navStartPointValid = gps.valid;
+        navResetGuidanceState();
         navState = "RUNNING";
         navReason = "start";
         navBroadcast(true);
@@ -1534,6 +1781,12 @@ static void setupWeb() {
       if (navRouteReady && navRouteCount > 0) {
         navRunning = true;
         navPaused = false;
+        if (!navStartPointValid && gps.valid) {
+          navStartPoint.lat = gps.lat;
+          navStartPoint.lon = gps.lon;
+          navStartPointValid = true;
+        }
+        navResetGuidanceState();
         navState = "RUNNING";
         navBroadcast(true);
       }
@@ -1587,7 +1840,7 @@ static void printStatus() {
   const uint32_t f9pRtcmAgeMs =
       f9pLastRtcmMs == 0 ? 0 : now - f9pLastRtcmMs;
   const uint32_t imuAgeMs = lastImuMs == 0 ? 0 : now - lastImuMs;
-  Serial.printf("ROVER wifi=%s ip=%s wifiReconnect=%lu udpRestart=%lu tcpReconnect=%lu tcpBytes=%lu tcpReads=%lu port=%s baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu rtcmSrc=%s rtcm=%lubytes/%lupkts age=%lums from=%s size=%u f9pRtcm=%lu crcFail=%lu lastType=%u age=%lums imu=%s yaw=%.2f age=%lums motorTarget=%d/%d motorCur=%d/%d motorCmd=%d/%d motorCount=%lu stopCount=%lu\n",
+  Serial.printf("ROVER wifi=%s ip=%s wifiReconnect=%lu udpRestart=%lu tcpReconnect=%lu tcpBytes=%lu tcpReads=%lu port=%s baud=%lu src=%s parsed=%lu clients=%u fix=%u carrier=%s diff=%u sv=%u hAcc=%lumm gpsAge=%lums raw=%lu rtcmSrc=%s rtcm=%lubytes/%lupkts age=%lums from=%s size=%u f9pRtcm=%lu crcFail=%lu lastType=%u age=%lums imu=%s yaw=%.2f src=%s age=%lums nav=%s wp=%u/%u dist=%.2f err=%.1f xt=%.2f moveErr=%.1f reason=%s motorTarget=%d/%d motorCur=%d/%d motorCmd=%d/%d motorCount=%lu stopCount=%lu\n",
                 WiFi.status() == WL_CONNECTED ? "connected" : "not_connected",
                 WiFi.localIP().toString().c_str(),
                 (unsigned long)wifiReconnectCount,
@@ -1621,7 +1874,16 @@ static void printStatus() {
                      ? "not_found"
                      : (imuFresh(now) ? "ok" : "stale")),
                 imuYaw,
+                imuYawSource,
                 (unsigned long)imuAgeMs,
+                navState,
+                navWpIndex,
+                navRouteCount,
+                navLastDistanceM,
+                navLastHeadingError,
+                navLastCrossTrackM,
+                navMotionValid ? navLastMotionError : 0.0f,
+                navReason,
                 motorTargetLeft,
                 motorTargetRight,
                 motorCurrentLeft,
