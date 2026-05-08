@@ -56,7 +56,6 @@ static const IPAddress SUBNET(255, 255, 255, 0);
 
 // Сеть
 static constexpr uint16_t WS_PORT = 81;
-static constexpr uint16_t RTCM_TCP_PORT = 2102;
 static constexpr uint16_t RTCM_UDP_PORT = 2101;
 
 // GPS
@@ -121,7 +120,6 @@ static uint32_t lastImuMs = 0;
 static bool imuFresh = false;
 
 // RTCM
-static WiFiClient rtcmTcp;
 static WiFiUDP rtcmUdp;
 static uint32_t rtcmBytes = 0;
 static uint32_t rtcmMsgs = 0;
@@ -165,6 +163,7 @@ static uint32_t lastMotorCmdMs = 0;
 static AsyncWebServer server(WS_PORT);
 static AsyncWebSocket ws("/ws");
 static bool wifiConnected = false;
+static bool serverStarted = false;
 static uint32_t lastStatusMs = 0;
 static uint32_t connectAttempts = 0;
 
@@ -257,45 +256,24 @@ static void feedGpsByte(uint8_t b) {
 
 // ============== RTCM ==============
 
-static WiFiClient rtcmTcpConnect() {
-  WiFiClient client;
-  client.setTimeout(2000);
-  if (client.connect(BASE_IP, RTCM_TCP_PORT)) {
-    client.setNoDelay(true);
-    Serial.println("RTCM: TCP connected");
-    return client;
-  }
-  Serial.println("RTCM: TCP connect failed");
-  return client;
-}
-
 static void relayRtcm() {
-  // TCP
-  if (rtcmTcp.connected()) {
-    while (rtcmTcp.available()) {
-      uint8_t buf[256];
-      int len = rtcmTcp.read(buf, sizeof(buf));
-      if (len > 0) {
-        GpsSerial.write(buf, len);
-        rtcmBytes += len;
-        rtcmMsgs++;
-        lastRtcmMs = millis();
-      }
-    }
-  } else if (wifiConnected && millis() - lastRtcmMs > 5000) {
-    // Попытка переподключения
-    rtcmTcp.stop();
-    rtcmTcp = rtcmTcpConnect();
-  }
-
-  // UDP backup
+  // UDP приём от базы
   int pktSize = rtcmUdp.parsePacket();
   if (pktSize > 0) {
     uint8_t buf[512];
     int len = rtcmUdp.read(buf, sizeof(buf));
-    if (len > 0 && !rtcmTcp.connected()) {
+    if (len > 0) {
       GpsSerial.write(buf, len);
+      rtcmBytes += len;
+      rtcmMsgs++;
+      lastRtcmMs = millis();
+      rtcmFresh = true;
     }
+  }
+
+  // Timeout RTK
+  if (lastRtcmMs > 0 && millis() - lastRtcmMs > RTK_TIMEOUT_MS) {
+    rtcmFresh = false;
   }
 }
 
@@ -768,15 +746,16 @@ static void connectWiFi() {
       wifiConnected = true;
       Serial.printf("WIFI: connected IP=%s\n", WiFi.localIP().toString().c_str());
 
-      // Подключение к базе за RTCM
-      rtcmTcp = rtcmTcpConnect();
-
-      // UDP
+      // UDP для RTCM
       rtcmUdp.begin(RTCM_UDP_PORT);
+      Serial.println("RTCM: UDP listening on port 2101");
 
-      // WebSocket
-      server.begin();
-      Serial.printf("WEB: server port %u\n", WS_PORT);
+      // WebSocket - только один раз
+      if (!serverStarted) {
+        server.begin();
+        serverStarted = true;
+        Serial.printf("WEB: server port %u\n", WS_PORT);
+      }
     }
     return;
   }
@@ -877,6 +856,15 @@ void loop() {
     uint8_t b = GpsSerial.read();
     gpsRawBytes++;
     feedGpsByte(b);
+  }
+
+  // GPS status debug (каждые 5 сек)
+  static uint32_t lastGpsDebug = 0;
+  if (now - lastGpsDebug > 5000) {
+    lastGpsDebug = now;
+    Serial.printf("GPS: fix=%u carrier=%u valid=%u hAcc=%.0f rtcm=%u\n",
+      gps.fixType, gps.carrier, gps.valid, gps.hAcc / 1000.0,
+      rtcmFresh ? 1 : 0);
   }
 
   // IMU update
