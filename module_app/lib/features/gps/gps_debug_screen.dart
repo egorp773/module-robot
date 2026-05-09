@@ -91,6 +91,13 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     ref.listen<WifiConnectionState>(wifiConnectionProvider, (_, next) {
       _appendTrail(next);
       _maybeLogNavigation(next);
+      // Sync _navActive with rover state
+      if (next.navState == 'ARRIVED' && _navActive) {
+        setState(() {
+          _navActive = false;
+          _notice = 'Робот прибыл к цели!';
+        });
+      }
     });
 
     if (!_hostFocus.hasFocus && _hostCtrl.text != robotHost) {
@@ -212,7 +219,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                         const SizedBox(height: 8),
                         _CoordLine(label: 'Lat', value: wifi.gpsLat?.toStringAsFixed(8) ?? '-'),
                         _CoordLine(label: 'Lon', value: wifi.gpsLon?.toStringAsFixed(8) ?? '-'),
-                        _CoordLine(label: 'Курс', value: wifi.gpsHeading == null ? '-' : '${wifi.gpsHeading!.toStringAsFixed(1)}°'),
+                        _CoordLine(label: 'Курс', value: _headingValue(wifi)),
                       ],
                     ),
                   ),
@@ -492,8 +499,9 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     final bearing = GpsDisplayGeometry.bearingDegrees(current.lat, current.lon, _savedTarget!.lat, _savedTarget!.lon);
 
     double? error;
-    if (wifi.gpsHeading != null) {
-      error = GpsDisplayGeometry.headingErrorDegrees(wifi.gpsHeading!, bearing);
+    final heading = _getHeading(wifi);
+    if (heading != null) {
+      error = GpsDisplayGeometry.headingErrorDegrees(heading, bearing);
     }
 
     return _NavResult(
@@ -555,6 +563,16 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     setState(() => _notice = 'IMU калиброван на ${nav.bearing!.toStringAsFixed(1)}°');
   }
 
+  // Use IMU yaw if fresh, otherwise GPS heading
+  double? _getHeading(WifiConnectionState wifi) {
+    return wifi.imuFresh == true ? wifi.imuYaw : wifi.gpsHeading;
+  }
+
+  String _headingValue(WifiConnectionState wifi) {
+    final h = _getHeading(wifi);
+    return h == null ? '-' : '${h.toStringAsFixed(1)}°';
+  }
+
   void _clearTarget() {
     ref.read(wifiConnectionProvider.notifier).sendNavStop();
     setState(() {
@@ -568,7 +586,9 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     final lat = wifi.gpsLat;
     final lon = wifi.gpsLon;
     if (lat == null || lon == null) return null;
+    // Invalid GPS: both coordinates near zero (uninitialized) or outside valid range
     if (lat.abs() < 0.000001 && lon.abs() < 0.000001) return null;
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
     return GpsPerimeterPoint(lat: lat, lon: lon, hAccM: wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0, at: DateTime.now());
   }
 

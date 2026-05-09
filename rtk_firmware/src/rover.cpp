@@ -661,6 +661,7 @@ static void updateEstimator() {
     }
     float dt = (g_est.lastUpdateMs > 0) ? (now - g_est.lastUpdateMs) / 1000.0f : 0.05f;
     if (dt > 0.5f) dt = 0.05f;
+    if (dt < 0.001f) dt = 0.05f;  // Prevent division by near-zero
 
     g_est.vel.x = (local.x - g_est.pos.x) / dt;
     g_est.vel.y = (local.y - g_est.pos.y) / dt;
@@ -1165,6 +1166,7 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         // Build a simple 2-point route: current position -> target
         g_routeCount = 2;
         g_routeIndex = 0;
+        memset(g_routeReceived, 0, sizeof(g_routeReceived));
         g_routeReceived[0] = true;
         g_routeReceived[1] = true;
         g_route[0].pos = g_est.pos;  // Current position
