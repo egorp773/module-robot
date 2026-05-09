@@ -694,11 +694,13 @@ static void updateEstimator() {
     g_est.rtkFixed = (g_gps.carrier == 2);
     g_deadReckoning = false;
 
-    // Update heading: IMU if fresh, else GPS
-    if (g_imuFresh) {
-      g_est.heading = g_imuYaw;
-    } else if (g_gps.speed > 0.1f) {
+    // Update heading: prefer GPS when moving (it's calibrated to geographic north)
+    // Use GPS heading > 0 as indicator of valid movement-based heading
+    if (g_gps.speed > 0.3f && g_gps.heading >= 0 && g_gps.heading < 360) {
       g_est.heading = g_gps.heading;
+    } else if (g_imuFresh) {
+      // Fallback to IMU when stationary or GPS heading invalid
+      g_est.heading = g_imuYaw;
     }
   } else if (qual == QUAL_GPS_HOLD_SHORT) {
     // Dead reckoning
@@ -1048,16 +1050,6 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   }
   if (cmd == "START" || cmd == "NAV_START") {
     if (routeReady() && g_routeIndex < g_routeCount) {
-      // Auto-calibrate IMU to point at first waypoint
-      if (g_imuFresh && g_routeCount > g_routeIndex) {
-        float targetBearing = atan2f(g_route[g_routeIndex].pos.x - g_est.pos.x,
-                                     g_route[g_routeIndex].pos.y - g_est.pos.y) * 180.0f / PI;
-        if (targetBearing < 0) targetBearing += 360.0f;
-        g_imuCalibrationOffset = normalizeAngle(targetBearing - g_imuYaw);
-        saveNavPrefs();
-        Serial.printf("IMU auto-calib: yaw=%.1f target=%.1f offset=%.1f\n",
-          g_imuYaw, targetBearing, g_imuCalibrationOffset);
-      }
       g_navState = STATE_RUNNING;
       g_navReason = "started";
       g_manualActive = false;
@@ -1206,16 +1198,6 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         g_routeReceived[1] = true;
         g_route[0].pos = g_est.pos;  // Current position
         g_route[1].pos = g_singleTarget;  // Target
-
-        // Auto-calibrate IMU: set offset so current heading = bearing to target
-        if (g_imuFresh) {
-          float targetBearing = atan2f(g_singleTarget.x - g_est.pos.x, g_singleTarget.y - g_est.pos.y) * 180.0f / PI;
-          if (targetBearing < 0) targetBearing += 360.0f;
-          g_imuCalibrationOffset = normalizeAngle(targetBearing - g_imuYaw);
-          saveNavPrefs();
-          Serial.printf("IMU auto-calib: yaw=%.1f target=%.1f offset=%.1f\n",
-            g_imuYaw, targetBearing, g_imuCalibrationOffset);
-        }
 
         g_navState = STATE_RUNNING;
         g_navReason = "go_to";
