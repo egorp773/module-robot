@@ -722,6 +722,11 @@ static uint8_t g_areaCount = 0;
 static float g_areaLineStep = 0.42f;
 static bool g_areaReady = false;
 
+// Simple single-target navigation
+static bool g_singleTargetActive = false;
+static LocalCoords g_singleTarget = {0, 0};
+static bool g_singleTargetSet = false;
+
 static NavState g_navState = STATE_IDLE;
 static const char* g_navReason = "idle";
 
@@ -961,6 +966,19 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   cmd.trim();
 
   if (cmd == "PING") { client->text("PONG"); return; }
+  // FREE: stop sending motor commands (release hoverboard from lock)
+  if (cmd == "FREE") {
+    g_motorTargetL = g_motorTargetR = 0;
+    g_motorCurrentL = g_motorCurrentR = 0;
+    g_hoverCmdSpeed = g_hoverCmdSteer = 0;
+    g_navState = STATE_IDLE;
+    g_navReason = "idle";
+    g_manualActive = false;
+    g_lastManualCmdMs = 0;
+    client->text("OK FREE");
+    Serial.println("MOTOR: free/idle");
+    return;
+  }
   if (cmd.startsWith("M,")) {
     int comma1 = cmd.indexOf(',', 2);
     if (comma1 > 2) {
@@ -1123,6 +1141,44 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     } else {
       client->text("ERR,PLAN_FAILED");
     }
+    return;
+  }
+  // Simple single-target navigation: GO_TO,lat,lon
+  // Robot saves the target and starts navigation to it
+  if (cmd.startsWith("GO_TO,")) {
+    int comma = cmd.indexOf(',', 6);
+    if (comma > 6) {
+      double lat = cmd.substring(6, comma).toDouble();
+      double lon = cmd.substring(comma + 1).toDouble();
+      if (lat != 0 && lon != 0) {
+        // Set origin from current GPS if not set
+        if (!g_origin.valid && g_gps.valid) {
+          setOrigin(g_gps.lat, g_gps.lon);
+        }
+        if (!g_origin.valid) {
+          client->text("ERR,NO_ORIGIN");
+          return;
+        }
+        g_singleTarget = toLocal(lat, lon);
+        g_singleTargetSet = true;
+        g_singleTargetActive = true;
+        // Build a simple 2-point route: current position -> target
+        g_routeCount = 2;
+        g_routeIndex = 0;
+        g_routeReceived[0] = true;
+        g_routeReceived[1] = true;
+        g_route[0].pos = g_est.pos;  // Current position
+        g_route[1].pos = g_singleTarget;  // Target
+        g_navState = STATE_RUNNING;
+        g_navReason = "go_to";
+        g_manualActive = false;
+        client->text("OK");
+        Serial.printf("GO_TO: target lat=%.8f lon=%.8f -> (%.2f, %.2f) m\n",
+          lat, lon, g_singleTarget.x, g_singleTarget.y);
+        return;
+      }
+    }
+    client->text("ERR,GO_TO");
     return;
   }
   // STATUS request
@@ -1290,7 +1346,9 @@ static void broadcastTelemetry() {
 static void navUpdate() {
   if (g_navState != STATE_RUNNING) {
     if (g_manualActive) return;
-    g_motorTargetL = g_motorTargetR = 0;
+    // Keep motors alive with minimal signal to prevent hoverboard beeping
+    // Without this, hoverboard enters error state and beeps when motors are at 0
+    g_motorTargetL = g_motorTargetR = 1;  // Minimum alive signal
     return;
   }
 

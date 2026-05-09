@@ -8,7 +8,6 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/gps_display_math.dart';
 import '../../core/gps_perimeter_storage.dart';
-import '../../core/gps_projection.dart';
 import '../../core/wifi_connection.dart';
 
 @visibleForTesting
@@ -41,32 +40,28 @@ class GpsDebugScreen extends ConsumerStatefulWidget {
 }
 
 class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
-  static const double _autoPointMinDistanceM = 0.20;
-  static const double _trailMinDistanceM = 0.10;
-  static const int _trailMaxPoints = 900;
   static const int _maxRtcmAgeMs = 10000;
-  static const Duration _maxGpsAge = Duration(seconds: 30);
 
-  final List<GpsPerimeterPoint> _points = [];
   final List<GpsPerimeterPoint> _trail = [];
-  GpsPerimeter? _activeSaved;
-  GpsPerimeterPoint? _navigationOrigin;
-  GpsPerimeterPoint? _navigationTarget;
-  int? _navigationTargetIndex;
-  String? _lastRoverNavState;
+  static const int _trailMaxPoints = 500;
+  static const double _trailMinDistanceM = 0.15;
+
+  // Navigation state
+  GpsPerimeterPoint? _savedTarget;
   DateTime? _lastNavigationLogAt;
-  bool _routeRunning = false;
-  double? _lastStableHeadingDegrees;
-  DateTime? _lastStableHeadingAt;
-  double? _smoothedHeadingDegrees;
-  DateTime? _lastHeadingSampleAt;
-  final TextEditingController _nameCtrl = TextEditingController();
+  bool _navActive = false;
+
+  // UI state
   final TextEditingController _hostCtrl = TextEditingController();
   final FocusNode _hostFocus = FocusNode();
-  Timer? _recordTimer;
-  bool _recording = false;
   String? _notice;
   Future<List<GpsPerimeter>>? _savedFuture;
+  static const double _autoPointMinDistanceM = 0.20;
+  final List<GpsPerimeterPoint> _points = [];
+  final TextEditingController _nameCtrl = TextEditingController();
+  bool _recording = false;
+  Timer? _recordTimer;
+  GpsPerimeter? _activeSaved;
 
   @override
   void initState() {
@@ -74,8 +69,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     _savedFuture = GpsPerimeterStorage.list();
     _hostCtrl.text = WifiRobotHostNotifier.defaultHost;
     final stamp = DateTime.now();
-    _nameCtrl.text =
-        'GPS ${stamp.year}-${_two(stamp.month)}-${_two(stamp.day)} ${_two(stamp.hour)}-${_two(stamp.minute)}';
+    _nameCtrl.text = 'GPS ${stamp.year}-${_two(stamp.month)}-${_two(stamp.day)} ${_two(stamp.hour)}-${_two(stamp.minute)}';
   }
 
   @override
@@ -92,59 +86,33 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     final wifi = ref.watch(wifiConnectionProvider);
     final robotHost = ref.watch(wifiRobotHostProvider);
     final ctrl = ref.read(wifiConnectionProvider.notifier);
-    final fixOk = _fixOk(wifi);
-    final rtkOk = _rtkOk(wifi);
-    final precisionOk = _precisionOk(wifi);
-    final rtcmText = _rtcmStatusText(wifi.rtcmAgeMs);
-    final rtcmFresh = _rtcmFresh(wifi.rtcmAgeMs);
-    final accM = wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0;
-    final currentPoint = _currentPoint(wifi);
-    final openedPoints = _activeSaved?.points ?? const <GpsPerimeterPoint>[];
-    final visibleMapPoints = gpsDebugVisibleMapPoints(
-      currentPerimeter: _points,
-      openedPerimeter: openedPoints,
-      track: _trail,
-      currentPosition: currentPoint,
-    );
-    final navigationPoints = _points.isNotEmpty ? _points : openedPoints;
-    final navigationOrigin =
-        _navigationOrigin ?? currentPoint ?? _firstPoint(navigationPoints);
-    final rawNavigationHeading =
-        _hasFreshImu(wifi) ? wifi.imuYaw : wifi.gpsHeading;
-    final navigationHeading = _navigationHeadingFor(wifi);
-    final navigationHeadingSource = _navigationHeadingSourceFor(wifi);
-    final navigation = _debugNavigationResult(
-      current: currentPoint,
-      target: _navigationTarget,
-      origin: navigationOrigin,
-      headingDegrees: navigationHeading,
-    );
-    final movementBearing = _movementBearing();
-    final movementTargetError =
-        movementBearing == null || navigation.bearingDegrees == null
-            ? null
-            : GpsDisplayGeometry.headingErrorDegrees(
-                movementBearing,
-                navigation.bearingDegrees!,
-              );
-    final routeLabel = _navigationTargetIndex == null
-        ? 'ручная цель'
-        : 'точка ${_navigationTargetIndex! + 1}/${navigationPoints.length}';
-    final mapSpanM = _mapSpanM(currentPoint);
+
+    // Check for nav state changes
     ref.listen<WifiConnectionState>(wifiConnectionProvider, (_, next) {
       _appendTrail(next);
       _maybeLogNavigation(next);
-      _syncRoverNavigation(next);
     });
+
     if (!_hostFocus.hasFocus && _hostCtrl.text != robotHost) {
       _hostCtrl.text = robotHost;
     }
+
+    // GPS data
+    final fixOk = (wifi.gpsFixType ?? 0) >= 3;
+    final rtkOk = wifi.gpsCarrier == 'fixed';
+    final rtcmFresh = wifi.rtcmAgeMs != null && wifi.rtcmAgeMs! <= _maxRtcmAgeMs;
+    final currentPoint = _currentPoint(wifi);
+    final accM = wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0;
+
+    // Navigation calculations
+    final navResult = _calcNav(wifi);
 
     return Scaffold(
       backgroundColor: const Color(0xFF050608),
       body: SafeArea(
         child: Column(
           children: [
+            // Header
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
               child: Row(
@@ -156,17 +124,12 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                   const SizedBox(width: 10),
                   const Expanded(
                     child: Text(
-                      'ZED-F9P GPS Отладка',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w900,
-                      ),
+                      'GPS Отладка',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
                     ),
                   ),
                   _IconButton(
-                    icon: wifi.isConnected
-                        ? Icons.link_off_rounded
-                        : Icons.wifi_rounded,
+                    icon: wifi.isConnected ? Icons.link_off_rounded : Icons.wifi_rounded,
                     onTap: wifi.isConnecting
                         ? null
                         : () {
@@ -184,20 +147,22 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
               child: ListView(
                 padding: const EdgeInsets.fromLTRB(12, 0, 12, 14),
                 children: [
+                  // Notice
                   if (_notice != null)
-                    _Notice(
-                      text: _notice!,
-                      onClose: () => setState(() => _notice = null),
-                    ),
+                    _Notice(text: _notice!, onClose: () => setState(() => _notice = null)),
+
+                  // Status pills
                   _StatusStrip(
                     connected: wifi.isConnected,
                     connecting: wifi.isConnecting,
                     fixOk: fixOk,
                     rtkOk: rtkOk,
                     carrier: wifi.gpsCarrier,
-                    rtcmText: rtcmText,
+                    rtcmFresh: rtcmFresh,
                   ),
                   const SizedBox(height: 10),
+
+                  // Connection IP
                   _Panel(
                     child: Row(
                       children: [
@@ -209,9 +174,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                             decoration: InputDecoration(
                               labelText: 'IP ровера',
                               hintText: WifiRobotHostNotifier.defaultHost,
-                              border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(8),
-                              ),
+                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
                               isDense: true,
                             ),
                             onSubmitted: _saveRobotHost,
@@ -226,220 +189,151 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                     ),
                   ),
                   const SizedBox(height: 10),
+
+                  // GPS metrics
                   _Panel(
                     child: Column(
                       children: [
                         Row(
                           children: [
-                            Expanded(
-                              child: _Metric(
-                                label: 'Фикс',
-                                value: _fixLabel(wifi.gpsFixType),
-                                good: fixOk,
-                              ),
-                            ),
-                            Expanded(
-                              child: _Metric(
-                                label: 'RTK',
-                                value: _carrierLabel(wifi.gpsCarrier),
-                                good: rtkOk,
-                              ),
-                            ),
-                            Expanded(
-                              child: _Metric(
-                                label: 'Спутн.',
-                                value: wifi.gpsSatellites?.toString() ?? '-',
-                                good: (wifi.gpsSatellites ?? 0) >= 12,
-                              ),
-                            ),
+                            Expanded(child: _Metric(label: 'Фикс', value: _fixLabel(wifi.gpsFixType), good: fixOk)),
+                            Expanded(child: _Metric(label: 'RTK', value: _carrierLabel(wifi.gpsCarrier), good: rtkOk)),
+                            Expanded(child: _Metric(label: 'Спутн.', value: wifi.gpsSatellites?.toString() ?? '-', good: (wifi.gpsSatellites ?? 0) >= 12)),
                           ],
                         ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(child: _Metric(label: 'Точность', value: accM == null ? '-' : '${accM.toStringAsFixed(2)} м', good: accM != null && accM <= 0.03)),
+                            Expanded(child: _Metric(label: 'RTCM age', value: wifi.rtcmAgeMs == null ? '-' : '${wifi.rtcmAgeMs}ms', good: rtcmFresh)),
+                            Expanded(child: _Metric(label: 'IMU yaw', value: wifi.imuYaw == null ? '-' : '${wifi.imuYaw!.toStringAsFixed(1)}°', good: wifi.imuFresh == true)),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        _CoordLine(label: 'Lat', value: wifi.gpsLat?.toStringAsFixed(8) ?? '-'),
+                        _CoordLine(label: 'Lon', value: wifi.gpsLon?.toStringAsFixed(8) ?? '-'),
+                        _CoordLine(label: 'Курс', value: wifi.gpsHeading == null ? '-' : '${wifi.gpsHeading!.toStringAsFixed(1)}°'),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+
+                  // Simple Navigation Panel
+                  _Panel(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text('Простая навигация', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900)),
+                        const SizedBox(height: 8),
+                        Text(
+                          _savedTarget == null
+                              ? 'Цель не установлена'
+                              : 'Цель: ${_savedTarget!.lat.toStringAsFixed(8)}, ${_savedTarget!.lon.toStringAsFixed(8)}',
+                          style: TextStyle(color: _savedTarget == null ? Colors.white.withValues(alpha: 0.5) : const Color(0xFF38F6A7), fontWeight: FontWeight.w800),
+                        ),
+                        const SizedBox(height: 8),
+                        // Navigation info
+                        Row(
+                          children: [
+                            Expanded(child: _Metric(label: 'Дистанция', value: navResult.distanceText, good: navResult.arrived)),
+                            Expanded(child: _Metric(label: 'Азимут', value: navResult.bearingText)),
+                            Expanded(child: _Metric(label: 'Ошибка курса', value: navResult.errorText, good: navResult.errorGood)),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        _CoordLine(label: 'Rover NAV', value: wifi.navState ?? '-'),
+                        _CoordLine(label: 'Скорость', value: wifi.navDistToWp == null ? '-' : '${wifi.navDistToWp!.toStringAsFixed(2)} м'),
                         const SizedBox(height: 10),
+                        // Buttons row 1: Save target / Go to target
                         Row(
                           children: [
                             Expanded(
-                              child: _Metric(
-                                label: 'Точн.',
-                                value: accM == null
-                                    ? '-'
-                                    : '${accM.toStringAsFixed(2)} m',
-                                good: accM != null && accM <= 0.03,
+                              child: _BigButton(
+                                icon: Icons.bookmark_add_rounded,
+                                label: 'Сохранить\nцель',
+                                color: const Color(0xFF7AA2FF),
+                                enabled: currentPoint != null,
+                                onTap: () => _saveTarget(wifi),
                               ),
                             ),
+                            const SizedBox(width: 8),
                             Expanded(
-                              child: _Metric(
-                                label: 'Скор.',
-                                value: wifi.gpsSpeedMps == null
-                                    ? '-'
-                                    : '${wifi.gpsSpeedMps!.toStringAsFixed(2)} m/s',
+                              child: _BigButton(
+                                icon: Icons.play_arrow_rounded,
+                                label: 'Ехать\nк цели',
+                                color: const Color(0xFF38F6A7),
+                                enabled: _savedTarget != null && wifi.isConnected,
+                                onTap: () => _goToTarget(wifi),
                               ),
                             ),
+                            const SizedBox(width: 8),
                             Expanded(
-                              child: _Metric(
-                                label: 'PDOP',
-                                value: wifi.gpsPDop?.toStringAsFixed(2) ?? '-',
-                                good: wifi.gpsPDop != null &&
-                                    wifi.gpsPDop! <= 2.0,
+                              child: _BigButton(
+                                icon: Icons.stop_rounded,
+                                label: 'Стоп',
+                                color: const Color(0xFFFF4D6D),
+                                enabled: _navActive,
+                                onTap: _stopNav,
                               ),
                             ),
                           ],
                         ),
-                        const SizedBox(height: 10),
+                        const SizedBox(height: 8),
+                        // Buttons row 2: Calibrate IMU / Clear target
                         Row(
                           children: [
                             Expanded(
-                              child: _Metric(
-                                label: '2 см режим',
-                                value: precisionOk ? 'готов' : 'ждем fixed',
-                                good: precisionOk,
+                              child: _BigButton(
+                                icon: Icons.explore_rounded,
+                                label: 'Калибровать\nIMU',
+                                color: const Color(0xFFFFD166),
+                                enabled: _savedTarget != null && wifi.imuFresh == true,
+                                onTap: () => _calibrateImu(wifi),
                               ),
                             ),
+                            const SizedBox(width: 8),
                             Expanded(
-                              child: _Metric(
-                                label: 'hAcc',
-                                value: wifi.gpsAccuracy == null
-                                    ? '-'
-                                    : '${wifi.gpsAccuracy} mm',
-                                good: wifi.gpsAccuracy != null &&
-                                    wifi.gpsAccuracy! <= 30,
+                              child: _BigButton(
+                                icon: Icons.clear_rounded,
+                                label: 'Очистить\nцель',
+                                color: Colors.white54,
+                                enabled: _savedTarget != null,
+                                onTap: _clearTarget,
                               ),
                             ),
                           ],
                         ),
-                        const SizedBox(height: 10),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: _Metric(
-                                label: 'RTCM',
-                                value: wifi.rtcmBytes == null
-                                    ? '-'
-                                    : '${wifi.rtcmBytes} B',
-                                good: (wifi.rtcmBytes ?? 0) > 0 && rtcmFresh,
-                              ),
-                            ),
-                            Expanded(
-                              child: _Metric(
-                                label: 'RTCM возраст',
-                                value: _rtcmMetricValue(wifi.rtcmAgeMs),
-                                good: rtcmFresh,
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 12),
-                        _CoordLine(
-                          label: 'Lat',
-                          value: wifi.gpsLat?.toStringAsFixed(8) ?? '-',
-                        ),
-                        _CoordLine(
-                          label: 'Lon',
-                          value: wifi.gpsLon?.toStringAsFixed(8) ?? '-',
-                        ),
-                        _CoordLine(
-                          label: 'Высота',
-                          value: wifi.gpsHeightM == null
-                              ? '-'
-                              : '${wifi.gpsHeightM!.toStringAsFixed(2)} m',
-                        ),
-                        _CoordLine(
-                          label: 'Курс',
-                          value: wifi.gpsHeading == null
-                              ? '-'
-                              : '${wifi.gpsHeading!.toStringAsFixed(1)} град',
+                        const SizedBox(height: 8),
+                        Text(
+                          '1. Сохрани цель (当前位置). 2. Отнеси робота. 3. Нажми "Ехать". Робот сам вычисляет путь.',
+                          style: TextStyle(color: Colors.white.withValues(alpha: 0.5), fontSize: 11),
                         ),
                       ],
                     ),
                   ),
                   const SizedBox(height: 10),
-                  _Panel(
-                    child: _NavigationPanel(
-                      current: currentPoint,
-                      origin: navigationOrigin,
-                      target: _navigationTarget,
-                      targetIndex: _navigationTargetIndex,
-                      routeLabel: routeLabel,
-                      routePoints: navigationPoints,
-                      result: navigation,
-                      routeRunning: _routeRunning,
-                      roverNavState: wifi.navState,
-                      roverNavWpIndex: wifi.navWpIndex,
-                      roverNavWpTotal: wifi.navWpTotal,
-                      roverNavDistToWp: wifi.navDistToWp,
-                      rawHeadingDegrees: rawNavigationHeading,
-                      headingDegrees: navigationHeading,
-                      headingSource: navigationHeadingSource,
-                      movementBearingDegrees: movementBearing,
-                      movementTargetErrorDegrees: movementTargetError,
-                      onStartRoute: navigationPoints.isEmpty
-                          ? null
-                          : () => _startRoute(navigationPoints),
-                      onPauseRoute: _pauseRoute,
-                      onCalibrateHeading: _navigationTarget == null ||
-                              navigation.bearingDegrees == null
-                          ? null
-                          : () => _calibrateHeadingToTarget(wifi),
-                      onResetImu:
-                          wifi.isConnected ? _resetImuCalibration : null,
-                      onSetCurrentTarget: currentPoint == null
-                          ? null
-                          : () => _setNavigationTargetToCurrent(wifi),
-                      onSelectRoutePoint: navigationPoints.isEmpty
-                          ? null
-                          : _setNavigationTargetByIndex,
-                      onNextRoutePoint: navigationPoints.isEmpty
-                          ? null
-                          : _setNextNavigationTarget,
-                      onClearTarget: _navigationTarget == null
-                          ? null
-                          : _clearNavigationTarget,
-                    ),
-                  ),
-                  const SizedBox(height: 10),
+
+                  // Map with trail
                   _Panel(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         Row(
                           children: [
-                            const Expanded(
-                              child: Text(
-                                'Карта участка',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w900,
-                                ),
-                              ),
-                            ),
-                            Text(
-                              mapSpanM == null
-                                  ? 'нет позиции'
-                                  : '~${mapSpanM.toStringAsFixed(0)} м',
-                              style: TextStyle(
-                                color: Colors.white.withValues(alpha: 0.68),
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
+                            const Expanded(child: Text('Карта', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900))),
+                            Text('${_trail.length} точек', style: TextStyle(color: Colors.white.withValues(alpha: 0.6), fontWeight: FontWeight.w800)),
                           ],
                         ),
                         const SizedBox(height: 10),
-                        _MapDebugInfo(
-                          currentPoints: _points.length,
-                          openedPoints: openedPoints.length,
-                          trackPoints: _trail.length,
-                          currentPosition: currentPoint,
-                        ),
-                        const SizedBox(height: 10),
                         SizedBox(
-                          height: 300,
+                          height: 250,
                           child: ClipRRect(
                             borderRadius: BorderRadius.circular(8),
                             child: CustomPaint(
-                              painter: _SiteMapPainter(
-                                points: visibleMapPoints,
+                              painter: _TrailPainter(
+                                trail: _trail,
                                 current: currentPoint,
-                                target: _navigationTarget,
-                                targetIndex: _navigationTargetIndex,
+                                target: _savedTarget,
                               ),
                               child: const SizedBox.expand(),
                             ),
@@ -452,18 +346,14 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                           children: [
                             _Action(
                               icon: Icons.my_location_rounded,
-                              label: 'Я',
+                              label: 'Точка',
                               color: const Color(0xFF7AA2FF),
-                              onTap: currentPoint == null
-                                  ? null
-                                  : () => _appendTrail(wifi, force: true),
+                              onTap: currentPoint == null ? null : () => _appendTrail(wifi, force: true),
                             ),
                             _Action(
                               icon: Icons.delete_sweep_rounded,
-                              label: 'Стереть след',
-                              onTap: _trail.isEmpty
-                                  ? null
-                                  : () => setState(() => _trail.clear()),
+                              label: 'Стереть',
+                              onTap: _trail.isEmpty ? null : () => setState(() => _trail.clear()),
                             ),
                           ],
                         ),
@@ -471,33 +361,21 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                     ),
                   ),
                   const SizedBox(height: 10),
+
+                  // Perimeter recording (simplified)
                   _Panel(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         Row(
                           children: [
-                            const Expanded(
-                              child: Text(
-                                'Запись периметра',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w900,
-                                ),
-                              ),
-                            ),
-                            Text(
-                              '${_points.length} точек',
-                              style: TextStyle(
-                                color: Colors.white.withValues(alpha: 0.70),
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
+                            const Expanded(child: Text('Периметр', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900))),
+                            Text('${_points.length} точек', style: TextStyle(color: Colors.white.withValues(alpha: 0.6), fontWeight: FontWeight.w800)),
                           ],
                         ),
                         const SizedBox(height: 10),
                         SizedBox(
-                          height: 230,
+                          height: 180,
                           child: ClipRRect(
                             borderRadius: BorderRadius.circular(8),
                             child: CustomPaint(
@@ -507,29 +385,14 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                           ),
                         ),
                         const SizedBox(height: 10),
-                        TextField(
-                          controller: _nameCtrl,
-                          decoration: InputDecoration(
-                            labelText: 'Имя записи',
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            isDense: true,
-                          ),
-                        ),
-                        const SizedBox(height: 10),
                         Wrap(
                           spacing: 8,
                           runSpacing: 8,
                           children: [
                             _Action(
-                              icon: _recording
-                                  ? Icons.pause_rounded
-                                  : Icons.fiber_manual_record_rounded,
+                              icon: _recording ? Icons.pause_rounded : Icons.fiber_manual_record_rounded,
                               label: _recording ? 'Пауза' : 'Запись',
-                              color: _recording
-                                  ? const Color(0xFFFFD166)
-                                  : const Color(0xFFFF4D6D),
+                              color: _recording ? const Color(0xFFFFD166) : const Color(0xFFFF4D6D),
                               onTap: () => _toggleRecording(wifi),
                             ),
                             _Action(
@@ -540,19 +403,12 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                             _Action(
                               icon: Icons.undo_rounded,
                               label: 'Назад',
-                              onTap: _points.isEmpty
-                                  ? null
-                                  : () => setState(() => _points.removeLast()),
+                              onTap: _points.isEmpty ? null : () => setState(() => _points.removeLast()),
                             ),
                             _Action(
                               icon: Icons.save_rounded,
                               label: 'Сохранить',
                               onTap: _save,
-                            ),
-                            _Action(
-                              icon: Icons.copy_rounded,
-                              label: 'JSON',
-                              onTap: _points.isEmpty ? null : _copyJson,
                             ),
                             _Action(
                               icon: Icons.delete_outline_rounded,
@@ -561,87 +417,53 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                             ),
                           ],
                         ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Кнопка "Точка" добавляет вручную. Автозапись добавляет точку каждые ${_autoPointMinDistanceM.toStringAsFixed(1)} м, когда координаты идут с ровера.',
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.58),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
                       ],
                     ),
                   ),
                   const SizedBox(height: 10),
+
+                  // Saved perimeters
                   _Panel(
                     child: FutureBuilder<List<GpsPerimeter>>(
                       future: _savedFuture,
                       builder: (context, snapshot) {
-                        final saved = snapshot.data ?? const <GpsPerimeter>[];
+                        final saved = snapshot.data ?? const [];
                         return Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            const Text(
-                              'Сохраненные периметры',
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.w900,
-                              ),
-                            ),
+                            const Text('Сохраненные', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900)),
                             const SizedBox(height: 8),
                             if (saved.isEmpty)
-                              Text(
-                                'Сохраненных GPS-периметров пока нет.',
-                                style: TextStyle(
-                                  color: Colors.white.withValues(alpha: 0.58),
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              )
+                              Text('Нет сохраненных периметров', style: TextStyle(color: Colors.white.withValues(alpha: 0.5)))
                             else
-                              ...saved.map(
-                                (p) => _SavedPerimeterCard(
-                                  perimeter: p,
-                                  selected: _activeSaved?.id == p.id,
-                                  onOpen: _openSaved,
-                                  onCopyJson: _copySavedJson,
-                                  onDelete: _deleteSaved,
-                                ),
-                              ),
+                              ...saved.map((p) => _SavedPerimeterCard(
+                                perimeter: p,
+                                selected: _activeSaved?.id == p.id,
+                                onOpen: _openSaved,
+                                onDelete: _deleteSaved,
+                              )),
                           ],
                         );
                       },
                     ),
                   ),
                   const SizedBox(height: 10),
+
+                  // Log
                   _Panel(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        const Text(
-                          'Журнал приема',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w900,
-                          ),
-                        ),
+                        const Text('Журнал', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900)),
                         const SizedBox(height: 8),
                         SizedBox(
-                          height: 140,
+                          height: 120,
                           child: ListView(
                             reverse: true,
-                            children: wifi.rxLog.reversed
-                                .take(40)
-                                .map(
-                                  (line) => Text(
-                                    line,
-                                    style: const TextStyle(
-                                      fontFamily: 'monospace',
-                                      fontSize: 11,
-                                    ),
-                                  ),
-                                )
-                                .toList(),
+                            children: wifi.rxLog.reversed.take(30).map((line) => Text(
+                              line,
+                              style: const TextStyle(fontFamily: 'monospace', fontSize: 10),
+                            )).toList(),
                           ),
                         ),
                       ],
@@ -656,21 +478,101 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     );
   }
 
+  // Navigation calculations
+  _NavResult _calcNav(WifiConnectionState wifi) {
+    if (_savedTarget == null) {
+      return const _NavResult(distanceText: '-', bearingText: '-', errorText: '-', arrived: false);
+    }
+    final current = _currentPoint(wifi);
+    if (current == null) {
+      return const _NavResult(distanceText: '-', bearingText: '-', errorText: '-', arrived: false);
+    }
+
+    final dist = GpsDisplayGeometry.distanceMeters(current.lat, current.lon, _savedTarget!.lat, _savedTarget!.lon);
+    final bearing = GpsDisplayGeometry.bearingDegrees(current.lat, current.lon, _savedTarget!.lat, _savedTarget!.lon);
+
+    double? error;
+    if (wifi.gpsHeading != null) {
+      error = GpsDisplayGeometry.headingErrorDegrees(wifi.gpsHeading!, bearing);
+    }
+
+    return _NavResult(
+      distanceText: '${dist.toStringAsFixed(2)} м',
+      bearingText: '${bearing.toStringAsFixed(1)}°',
+      bearing: bearing,
+      errorText: error == null ? '-' : '${error >= 0 ? '+' : ''}${error.toStringAsFixed(1)}°',
+      errorGood: error != null && error.abs() <= 20,
+      arrived: dist < 0.3,
+    );
+  }
+
+  void _saveTarget(WifiConnectionState wifi) {
+    final point = _currentPoint(wifi);
+    if (point == null) {
+      setState(() => _notice = 'Нет GPS позиции');
+      return;
+    }
+    setState(() {
+      _savedTarget = point;
+      _notice = 'Цель сохранена';
+    });
+  }
+
+  void _goToTarget(WifiConnectionState wifi) {
+    if (_savedTarget == null) {
+      setState(() => _notice = 'Сначала сохрани цель');
+      return;
+    }
+    if (!wifi.isConnected) {
+      setState(() => _notice = 'Нет связи с роботом');
+      return;
+    }
+    // Calibrate IMU first
+    final nav = _calcNav(wifi);
+    if (nav.bearingText != '-') {
+      ref.read(wifiConnectionProvider.notifier).sendRaw('CAL_IMU,${nav.bearing ?? 0}');
+    }
+    // Send GO_TO command
+    ref.read(wifiConnectionProvider.notifier).sendGoToTarget(_savedTarget!.lat, _savedTarget!.lon);
+    setState(() {
+      _navActive = true;
+      _notice = 'Отправляю команду GO_TO...';
+    });
+  }
+
+  void _stopNav() {
+    ref.read(wifiConnectionProvider.notifier).sendNavStop();
+    setState(() {
+      _navActive = false;
+      _notice = 'Стоп отправлен';
+    });
+  }
+
+  void _calibrateImu(WifiConnectionState wifi) {
+    final nav = _calcNav(wifi);
+    if (nav.bearing == null) return;
+    ref.read(wifiConnectionProvider.notifier).sendRaw('CAL_IMU,${nav.bearing!.toStringAsFixed(1)}');
+    setState(() => _notice = 'IMU калиброван на ${nav.bearing!.toStringAsFixed(1)}°');
+  }
+
+  void _clearTarget() {
+    ref.read(wifiConnectionProvider.notifier).sendNavStop();
+    setState(() {
+      _savedTarget = null;
+      _navActive = false;
+      _notice = 'Цель очищена';
+    });
+  }
+
   GpsPerimeterPoint? _currentPoint(WifiConnectionState wifi) {
     final lat = wifi.gpsLat;
     final lon = wifi.gpsLon;
     if (lat == null || lon == null) return null;
     if (lat.abs() < 0.000001 && lon.abs() < 0.000001) return null;
-    return GpsPerimeterPoint(
-      lat: lat,
-      lon: lon,
-      hAccM: wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0,
-      at: DateTime.now(),
-    );
+    return GpsPerimeterPoint(lat: lat, lon: lon, hAccM: wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0, at: DateTime.now());
   }
 
   void _appendTrail(WifiConnectionState wifi, {bool force = false}) {
-    if (!_hasUsableGps(wifi)) return;
     final point = _currentPoint(wifi);
     if (point == null) return;
 
@@ -689,347 +591,18 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     });
   }
 
-  double? _mapSpanM(GpsPerimeterPoint? current) {
-    final all = <GpsPerimeterPoint>[..._trail, ..._points];
-    if (current != null) all.add(current);
-    if (all.isEmpty) return null;
-    if (all.length == 1) return 10.0;
-
-    final lat0 = all.map((p) => p.lat).reduce((a, b) => a + b) / all.length;
-    final lon0 = all.map((p) => p.lon).reduce((a, b) => a + b) / all.length;
-    const latScale = 111320.0;
-    final lonScale = 111320.0 * math.cos(lat0 * math.pi / 180.0);
-
-    double minX = double.infinity;
-    double maxX = -double.infinity;
-    double minY = double.infinity;
-    double maxY = -double.infinity;
-    for (final p in all) {
-      final x = (p.lon - lon0) * lonScale;
-      final y = (p.lat - lat0) * latScale;
-      minX = math.min(minX, x);
-      maxX = math.max(maxX, x);
-      minY = math.min(minY, y);
-      maxY = math.max(maxY, y);
-    }
-    return math.max(10.0, math.max(maxX - minX, maxY - minY));
-  }
-
-  static GpsPerimeterPoint? _firstPoint(List<GpsPerimeterPoint> points) {
-    return points.isEmpty ? null : points.first;
-  }
-
-  void _setNavigationTargetToCurrent(WifiConnectionState wifi) {
-    final point = _currentPoint(wifi);
-    if (point == null) {
-      setState(() => _notice = 'Нет текущей GPS-позиции для цели.');
-      return;
-    }
-    setState(() {
-      _navigationOrigin ??= point;
-      _navigationTarget = point;
-      _navigationTargetIndex = null;
-      _notice = 'Цель навигации: текущая позиция.';
-    });
-    _maybeLogNavigation(wifi, force: true);
-  }
-
-  void _setNavigationTargetByIndex(int index) {
-    final routePoints =
-        _points.isNotEmpty ? _points : (_activeSaved?.points ?? const []);
-    if (index < 0 || index >= routePoints.length) return;
-    final current = _currentPoint(ref.read(wifiConnectionProvider));
-    setState(() {
-      _navigationOrigin ??= current ?? routePoints.first;
-      _navigationTarget = routePoints[index];
-      _navigationTargetIndex = index;
-      _notice = 'Цель навигации: точка ${index + 1}.';
-    });
-    _maybeLogNavigation(ref.read(wifiConnectionProvider), force: true);
-  }
-
-  void _setNextNavigationTarget() {
-    final routePoints =
-        _points.isNotEmpty ? _points : (_activeSaved?.points ?? const []);
-    if (routePoints.isEmpty) return;
-    final nextIndex = _navigationTargetIndex == null
-        ? 0
-        : (_navigationTargetIndex! + 1) % routePoints.length;
-    _setNavigationTargetByIndex(nextIndex);
-  }
-
-  double? _movementBearing() {
-    if (_trail.length < 2) return null;
-    for (var i = _trail.length - 2; i >= 0; i--) {
-      final from = _trail[i];
-      final to = _trail.last;
-      final distance =
-          GpsDisplayGeometry.distanceMeters(from.lat, from.lon, to.lat, to.lon);
-      if (distance >= 0.35) {
-        return GpsDisplayGeometry.bearingDegrees(
-          from.lat,
-          from.lon,
-          to.lat,
-          to.lon,
-        );
-      }
-    }
-    return null;
-  }
-
-  double? _targetBearing(WifiConnectionState wifi) {
-    final target = _navigationTarget;
-    final lat = wifi.gpsLat;
-    final lon = wifi.gpsLon;
-    if (target == null || lat == null || lon == null) return null;
-    return GpsDisplayGeometry.bearingDegrees(lat, lon, target.lat, target.lon);
-  }
-
-  _DebugNavigationResult _debugNavigationResult({
-    required GpsPerimeterPoint? current,
-    required GpsPerimeterPoint? target,
-    required GpsPerimeterPoint? origin,
-    required double? headingDegrees,
-  }) {
-    if (current == null || target == null) {
-      return const _DebugNavigationResult(reason: 'monitor only');
-    }
-
-    LocalPointMeters? currentLocal;
-    LocalPointMeters? targetLocal;
-    if (origin != null) {
-      final geometry = GpsDisplayGeometry(
-        originLat: origin.lat,
-        originLon: origin.lon,
-      );
-      currentLocal = geometry.toLocal(current.lat, current.lon);
-      targetLocal = geometry.toLocal(target.lat, target.lon);
-    }
-
-    final distance = GpsDisplayGeometry.distanceMeters(
-      current.lat,
-      current.lon,
-      target.lat,
-      target.lon,
-    );
-    final bearing = GpsDisplayGeometry.bearingDegrees(
-      current.lat,
-      current.lon,
-      target.lat,
-      target.lon,
-    );
-    final headingError = headingDegrees == null
-        ? null
-        : GpsDisplayGeometry.headingErrorDegrees(headingDegrees, bearing);
-
-    return _DebugNavigationResult(
-      reason: 'rover owns navigation',
-      currentLocal: currentLocal,
-      targetLocal: targetLocal,
-      distanceMeters: distance,
-      bearingDegrees: bearing,
-      headingErrorDegrees: headingError,
-      arrived: distance < 0.3,
-    );
-  }
-
-  void _calibrateHeadingToTarget(WifiConnectionState wifi) {
-    final targetBearing = _targetBearing(wifi);
-    if (targetBearing == null) {
-      setState(() => _notice = 'No target for CAL_IMU.');
-      return;
-    }
-    ref
-        .read(wifiConnectionProvider.notifier)
-        .sendRaw('CAL_IMU,${targetBearing.toStringAsFixed(1)}');
-    setState(() => _notice =
-        'CAL_IMU sent to rover: ${targetBearing.toStringAsFixed(1)} deg.');
-  }
-
-  static bool _hasFreshImu(WifiConnectionState wifi) {
-    final receivedAt = wifi.imuReceivedAt;
-    final roverFresh = wifi.imuFresh ?? true;
-    final roverAge = wifi.imuAgeMs;
-    return wifi.imuYaw != null &&
-        roverFresh &&
-        (roverAge == null || roverAge < 5000) &&
-        receivedAt != null &&
-        DateTime.now().difference(receivedAt).inMilliseconds < 6000;
-  }
-
-  double? _navigationHeadingFor(WifiConnectionState wifi) {
-    double? heading;
-    if (_hasFreshImu(wifi)) {
-      heading = wifi.imuYaw;
-    }
-    final speed = wifi.gpsSpeedMps;
-    if (heading == null &&
-        wifi.gpsHeading != null &&
-        speed != null &&
-        speed >= 0.35) {
-      heading = wifi.gpsHeading;
-    }
-    if (heading != null) {
-      heading = _smoothHeading(heading);
-      _lastStableHeadingDegrees = heading;
-      _lastStableHeadingAt = DateTime.now();
-      return heading;
-    }
-    final last = _lastStableHeadingAt;
-    if (last != null &&
-        DateTime.now().difference(last) < const Duration(seconds: 8)) {
-      return _lastStableHeadingDegrees;
-    }
-    return null;
-  }
-
-  double _smoothHeading(double rawDegrees) {
-    final now = DateTime.now();
-    final previous = _smoothedHeadingDegrees;
-    final previousAt = _lastHeadingSampleAt;
-    _lastHeadingSampleAt = now;
-    if (previous == null ||
-        previousAt == null ||
-        now.difference(previousAt) > const Duration(seconds: 3)) {
-      _smoothedHeadingDegrees = rawDegrees;
-      return rawDegrees;
-    }
-
-    final error = GpsDisplayGeometry.headingErrorDegrees(previous, rawDegrees);
-    final gain = error.abs() > 45 ? 0.30 : 0.45;
-    final next = GpsDisplayGeometry.normalizeDegrees(previous + error * gain);
-    _smoothedHeadingDegrees = next;
-    return next;
-  }
-
-  String _navigationHeadingSourceFor(WifiConnectionState wifi) {
-    if (_hasFreshImu(wifi)) return 'BNO085 rover';
-    final speed = wifi.gpsSpeedMps;
-    if (wifi.gpsHeading != null && speed != null && speed >= 0.35) {
-      return 'GPS fallback';
-    }
-    final last = _lastStableHeadingAt;
-    if (last != null &&
-        DateTime.now().difference(last) < const Duration(seconds: 8)) {
-      return 'heading hold';
-    }
-    return 'no fresh heading';
-  }
-
-  void _resetImuCalibration() {
-    ref.read(wifiConnectionProvider.notifier).sendRaw('IMU_RESET');
-    setState(() => _notice = 'IMU reset requested on rover.');
-  }
-
-  void _startRoute(List<GpsPerimeterPoint> routePoints) {
-    if (routePoints.length < 3) {
-      setState(() => _notice = 'Need at least 3 perimeter points.');
-      return;
-    }
-    if (routePoints.length > 32) {
-      setState(() => _notice = 'Onboard planner accepts up to 32 points.');
-      return;
-    }
-    final wifi = ref.read(wifiConnectionProvider);
-    if (!wifi.isConnected) {
-      setState(() => _notice = 'No WebSocket connection to rover.');
-      return;
-    }
-
-    final notifier = ref.read(wifiConnectionProvider.notifier);
-    final origin = routePoints.first;
-    final projection = GpsProjection(refLat: origin.lat, refLon: origin.lon);
-    notifier.sendNavStop();
-    notifier.sendAreaBegin(
-      routePoints.length,
-      originLat: origin.lat,
-      originLon: origin.lon,
-      lineStepMeters: 0.42,
-    );
-    for (var i = 0; i < routePoints.length; i++) {
-      final local = projection.toLocal(routePoints[i].lat, routePoints[i].lon);
-      notifier.sendAreaPoint(i, local.dx, local.dy);
-    }
-    notifier.sendAreaEnd();
-    notifier.sendNavStart();
-
-    setState(() {
-      _navigationOrigin = origin;
-      _navigationTarget = routePoints.first;
-      _navigationTargetIndex = 0;
-      _routeRunning = true;
-      _lastRoverNavState = null;
-      _notice = 'Perimeter sent to rover. Rover builds the route.';
-    });
-    _maybeLogNavigation(wifi, force: true);
-  }
-
-  void _syncRoverNavigation(WifiConnectionState wifi) {
-    final navState = wifi.navState;
-    if (navState == null || navState == _lastRoverNavState) return;
-    _lastRoverNavState = navState;
-    if (!mounted) return;
-    setState(() {
-      _notice = 'Rover NAV: $navState';
-      if (navState == 'ARRIVED' ||
-          navState == 'DONE' ||
-          navState == 'ERROR' ||
-          navState == 'IDLE') {
-        _routeRunning = false;
-      }
-    });
-  }
-
-  void _pauseRoute() {
-    _sendStopIfConnected();
-    setState(() {
-      _routeRunning = false;
-      _notice = 'Stop command sent to rover.';
-    });
-  }
-
-  void _sendStopIfConnected() {
-    if (ref.read(wifiConnectionProvider).isConnected) {
-      final notifier = ref.read(wifiConnectionProvider.notifier);
-      notifier.sendNavStop();
-      notifier.sendStop();
-    }
-  }
-
-  void _clearNavigationTarget() {
-    _sendStopIfConnected();
-    setState(() {
-      _routeRunning = false;
-      _navigationTarget = null;
-      _navigationTargetIndex = null;
-      _notice = 'Navigation target cleared.';
-    });
-  }
-
-  void _maybeLogNavigation(WifiConnectionState wifi, {bool force = false}) {
-    final target = _navigationTarget;
+  void _maybeLogNavigation(WifiConnectionState wifi) {
+    final target = _savedTarget;
     if (target == null) return;
-    final current = _currentPoint(wifi);
-    final origin = _navigationOrigin ?? current ?? target;
-    final result = _debugNavigationResult(
-      current: current,
-      target: target,
-      origin: origin,
-      headingDegrees: _navigationHeadingFor(wifi),
-    );
-
     final now = DateTime.now();
     final last = _lastNavigationLogAt;
-    final due =
-        last == null || now.difference(last) >= const Duration(seconds: 2);
-    if (!force && !due) return;
-
+    if (last != null && now.difference(last).inSeconds < 3) return;
     _lastNavigationLogAt = now;
-    final distance = result.distanceMeters?.toStringAsFixed(2) ?? '-';
-    final error = result.headingErrorDegrees?.toStringAsFixed(1) ?? '-';
+
+    final nav = _calcNav(wifi);
     ref.read(wifiConnectionProvider.notifier).addLocalLog(
-          'NAV monitor dist=${distance}m err=${error}deg; rover owns motors',
-        );
+      'NAV: dist=${nav.distanceText} err=${nav.errorText} rover=${wifi.navState ?? "-"}',
+    );
   }
 
   void _toggleRecording(WifiConnectionState wifi) {
@@ -1039,12 +612,10 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       setState(() => _recording = false);
       return;
     }
-
-    if (!_precisionOk(wifi)) {
-      setState(() => _notice = _precisionBlockedReason(wifi));
+    if (wifi.gpsCarrier != 'fixed') {
+      setState(() => _notice = 'Нужен RTK FIXED для записи');
       return;
     }
-
     _addCurrentPoint(wifi, force: true);
     _recordTimer = Timer.periodic(const Duration(milliseconds: 700), (_) {
       _addCurrentPoint(ref.read(wifiConnectionProvider));
@@ -1052,30 +623,13 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     setState(() => _recording = true);
   }
 
-  Future<void> _saveRobotHost(String value) async {
-    await ref.read(wifiRobotHostProvider.notifier).setHost(value);
-    if (mounted) {
-      final saved = ref.read(wifiRobotHostProvider);
-      _hostCtrl.text = saved;
-      FocusScope.of(context).unfocus();
-      setState(() => _notice = 'IP ровера сохранен: $saved');
-    }
-  }
-
   void _addCurrentPoint(WifiConnectionState wifi, {bool force = false}) {
+    if (wifi.gpsCarrier != 'fixed') return;
     final lat = wifi.gpsLat;
     final lon = wifi.gpsLon;
-    if (!_precisionOk(wifi) || lat == null || lon == null) {
-      setState(() => _notice = _precisionBlockedReason(wifi));
-      return;
-    }
+    if (lat == null || lon == null) return;
 
-    final point = GpsPerimeterPoint(
-      lat: lat,
-      lon: lon,
-      hAccM: wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0,
-      at: DateTime.now(),
-    );
+    final point = GpsPerimeterPoint(lat: lat, lon: lon, hAccM: wifi.gpsAccuracy == null ? null : wifi.gpsAccuracy! / 1000.0, at: DateTime.now());
 
     if (!force && _points.isNotEmpty) {
       final last = _points.last;
@@ -1086,258 +640,125 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
     setState(() {
       _points.add(point);
       _activeSaved = null;
-      _notice = 'Точка добавлена: ${_points.length}.';
     });
+  }
+
+  void _clearPoints() {
+    _recordTimer?.cancel();
+    _recordTimer = null;
+    setState(() {
+      _recording = false;
+      _points.clear();
+      _activeSaved = null;
+    });
+  }
+
+  Future<void> _saveRobotHost(String value) async {
+    await ref.read(wifiRobotHostProvider.notifier).setHost(value);
+    if (mounted) {
+      final saved = ref.read(wifiRobotHostProvider);
+      _hostCtrl.text = saved;
+      FocusScope.of(context).unfocus();
+      setState(() => _notice = 'IP сохранен: $saved');
+    }
   }
 
   Future<void> _save() async {
     if (_points.length < 3) {
-      const message = 'Нужно минимум 3 точки, чтобы сохранить периметр.';
-      setState(() => _notice = message);
-      _showSnack(message);
+      setState(() => _notice = 'Нужно минимум 3 точки');
       return;
     }
-
     try {
       final saved = await GpsPerimeterStorage.save(_nameCtrl.text, _points);
       if (!mounted) return;
       setState(() {
         _activeSaved = saved;
         _savedFuture = GpsPerimeterStorage.list();
-        _notice = 'Периметр сохранён: ${saved.points.length} точек';
+        _notice = 'Сохранено: ${saved.points.length} точек';
       });
-      _showSnack('Периметр сохранён: ${saved.points.length} точек');
-    } catch (error) {
-      if (!mounted) return;
-      final message = 'Ошибка сохранения периметра: $error';
-      setState(() => _notice = message);
-      _showSnack(message);
+    } catch (e) {
+      setState(() => _notice = 'Ошибка: $e');
     }
   }
 
-  Future<void> _copyJson() async {
-    await Clipboard.setData(
-      ClipboardData(text: GpsPerimeterStorage.toExportJson(_points)),
-    );
-    setState(() => _notice = 'JSON периметра скопирован.');
-  }
-
-  void _clearPoints() {
-    _recordTimer?.cancel();
-    _recordTimer = null;
-    _sendStopIfConnected();
-    setState(() {
-      _recording = false;
-      _routeRunning = false;
-      _points.clear();
-      _activeSaved = null;
-      _navigationTarget = null;
-      _navigationTargetIndex = null;
-      _notice = 'Текущий периметр очищен.';
-    });
-  }
-
-  Future<void> _openSaved(GpsPerimeter perimeter) async {
+  Future<void> _openSaved(GpsPerimeter p) async {
     try {
-      final loaded = await GpsPerimeterStorage.load(perimeter.id);
-      if (!mounted) return;
-      final selected = loaded ?? perimeter;
+      final loaded = await GpsPerimeterStorage.load(p.id);
+      if (!mounted || loaded == null) return;
       setState(() {
-        _points
-          ..clear()
-          ..addAll(selected.points);
-        _activeSaved = selected;
-        _nameCtrl.text = selected.name;
-        _notice = 'Открыт периметр: ${selected.points.length} точек.';
+        _points..clear()..addAll(loaded.points);
+        _activeSaved = loaded;
+        _nameCtrl.text = loaded.name;
+        _notice = 'Открыт: ${loaded.points.length} точек';
       });
-      _showSnack('Открыт периметр: ${selected.points.length} точек');
-    } catch (error) {
-      if (!mounted) return;
-      final message = 'Ошибка открытия периметра: $error';
-      setState(() => _notice = message);
-      _showSnack(message);
+    } catch (e) {
+      setState(() => _notice = 'Ошибка: $e');
     }
   }
 
-  Future<void> _copySavedJson(GpsPerimeter perimeter) async {
+  Future<void> _deleteSaved(GpsPerimeter p) async {
     try {
-      final loaded = await GpsPerimeterStorage.load(perimeter.id);
-      final selected = loaded ?? perimeter;
-      await Clipboard.setData(
-        ClipboardData(
-            text: GpsPerimeterStorage.perimeterToExportJson(selected)),
-      );
-      if (!mounted) return;
-      setState(() => _notice = 'JSON сохраненного периметра скопирован.');
-      _showSnack('JSON сохраненного периметра скопирован');
-    } catch (error) {
-      if (!mounted) return;
-      final message = 'Ошибка экспорта JSON: $error';
-      setState(() => _notice = message);
-      _showSnack(message);
-    }
-  }
-
-  Future<void> _deleteSaved(GpsPerimeter perimeter) async {
-    try {
-      await GpsPerimeterStorage.delete(perimeter.id);
+      await GpsPerimeterStorage.delete(p.id);
       if (!mounted) return;
       setState(() {
-        if (_activeSaved?.id == perimeter.id) {
-          _activeSaved = null;
-        }
+        if (_activeSaved?.id == p.id) _activeSaved = null;
         _savedFuture = GpsPerimeterStorage.list();
-        _notice = 'Периметр удален: ${perimeter.name}.';
       });
-      _showSnack('Периметр удален');
-    } catch (error) {
-      if (!mounted) return;
-      final message = 'Ошибка удаления периметра: $error';
-      setState(() => _notice = message);
-      _showSnack(message);
+    } catch (e) {
+      setState(() => _notice = 'Ошибка: $e');
     }
-  }
-
-  void _showSnack(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
-  }
-
-  static bool _fixOk(WifiConnectionState wifi) {
-    return (wifi.gpsFixType ?? 0) >= 3 &&
-        wifi.gpsLat != null &&
-        wifi.gpsLon != null;
-  }
-
-  static bool _rtkOk(WifiConnectionState wifi) {
-    final accurateDiff =
-        (wifi.gpsDiff ?? false) && (wifi.gpsAccuracy ?? 999999) <= 50;
-    return (wifi.gpsCarrier == 'fixed' || accurateDiff) &&
-        _rtcmFresh(wifi.rtcmAgeMs);
-  }
-
-  static bool _precisionOk(WifiConnectionState wifi) {
-    return _hasUsableGps(wifi) &&
-        _rtkOk(wifi) &&
-        wifi.gpsAccuracy != null &&
-        wifi.gpsAccuracy! <= 30;
-  }
-
-  static bool _rtcmFresh(int? ageMs) {
-    return ageMs != null && ageMs <= _maxRtcmAgeMs;
-  }
-
-  static String _rtcmStatusText(int? ageMs) {
-    if (ageMs == null) return 'RTCM нет';
-    if (ageMs > 10000) return 'RTCM потерян';
-    if (ageMs > _maxRtcmAgeMs) return 'RTCM stale';
-    return 'RTCM свежий';
-  }
-
-  static String _rtcmMetricValue(int? ageMs) {
-    if (ageMs == null) return 'нет данных';
-    if (ageMs > 10000) return '$ageMs ms\nпотерян';
-    if (ageMs > _maxRtcmAgeMs) {
-      return '$ageMs ms\nstale';
-    }
-    return '$ageMs ms\nсвежий';
-  }
-
-  static bool _hasUsableGps(WifiConnectionState wifi) {
-    final lat = wifi.gpsLat;
-    final lon = wifi.gpsLon;
-    if (lat == null || lon == null) return false;
-    if (lat.abs() < 0.000001 && lon.abs() < 0.000001) return false;
-
-    final receivedAt = wifi.gpsReceivedAt;
-    if (receivedAt == null) return true;
-    return DateTime.now().difference(receivedAt) < _maxGpsAge;
-  }
-
-  static String _gpsBlockedReason(WifiConnectionState wifi) {
-    if (!wifi.isConnected) return 'Нет связи с ровером.';
-    if (wifi.gpsLat == null || wifi.gpsLon == null) {
-      return 'Нет координат от ровера.';
-    }
-    final receivedAt = wifi.gpsReceivedAt;
-    if (receivedAt != null &&
-        DateTime.now().difference(receivedAt) >= _maxGpsAge) {
-      return 'GPS-данные устарели, подожди новое сообщение от ровера.';
-    }
-    return 'Координаты пока не готовы.';
-  }
-
-  static String _precisionBlockedReason(WifiConnectionState wifi) {
-    final usableReason = _gpsBlockedReason(wifi);
-    if (!_hasUsableGps(wifi)) return usableReason;
-    if (wifi.gpsCarrier != 'fixed') {
-      return 'Для 2 см нужна RTK FIXED. Сейчас: ${_carrierLabel(wifi.gpsCarrier)}.';
-    }
-    if (!_rtcmFresh(wifi.rtcmAgeMs)) {
-      return 'RTCM не свежий: ${_rtcmStatusText(wifi.rtcmAgeMs)}.';
-    }
-    final hAcc = wifi.gpsAccuracy;
-    if (hAcc == null) return 'Нет hAcc от ровера.';
-    if (hAcc > 30) {
-      return 'Точность пока $hAcc мм. Для записи нужно 30 мм или лучше.';
-    }
-    return 'Ждем точный RTK FIXED.';
   }
 
   static String _fixLabel(int? fixType) {
     switch (fixType) {
-      case 0:
-        return 'нет';
-      case 2:
-        return '2D';
-      case 3:
-        return '3D';
-      case 4:
-        return 'GNSS+DR';
-      case 5:
-        return 'время';
-      default:
-        return fixType?.toString() ?? '-';
+      case 0: return 'нет';
+      case 2: return '2D';
+      case 3: return '3D';
+      default: return fixType?.toString() ?? '-';
     }
   }
 
-  static String _carrierLabel(String? carrier) {
-    switch (carrier) {
-      case 'fixed':
-        return 'fixed';
-      case 'float':
-        return 'float';
-      case 'none':
-        return 'нет';
-      default:
-        return carrier ?? 'нет';
-    }
+  static String _carrierLabel(String? c) {
+    if (c == 'fixed') return 'FIXED';
+    if (c == 'float') return 'FLOAT';
+    return 'нет';
   }
 
-  static double _distanceM(
-    double lat1,
-    double lon1,
-    double lat2,
-    double lon2,
-  ) {
+  static double _distanceM(double lat1, double lon1, double lat2, double lon2) {
     const r = 6371000.0;
     final p1 = lat1 * math.pi / 180.0;
     final p2 = lat2 * math.pi / 180.0;
     final dp = (lat2 - lat1) * math.pi / 180.0;
     final dl = (lon2 - lon1) * math.pi / 180.0;
-    final a = math.sin(dp / 2) * math.sin(dp / 2) +
-        math.cos(p1) * math.cos(p2) * math.sin(dl / 2) * math.sin(dl / 2);
+    final a = math.sin(dp / 2) * math.sin(dp / 2) + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) * math.sin(dl / 2);
     return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
   }
 
   static String _two(int v) => v.toString().padLeft(2, '0');
 }
 
+class _NavResult {
+  final String distanceText;
+  final String bearingText;
+  final double? bearing;
+  final String errorText;
+  final bool errorGood;
+  final bool arrived;
+
+  const _NavResult({
+    required this.distanceText,
+    required this.bearingText,
+    this.bearing,
+    required this.errorText,
+    this.errorGood = false,
+    required this.arrived,
+  });
+}
+
+// Widgets
+
 class _Panel extends StatelessWidget {
   final Widget child;
-
   const _Panel({required this.child});
 
   @override
@@ -1355,52 +776,23 @@ class _Panel extends StatelessWidget {
 }
 
 class _StatusStrip extends StatelessWidget {
-  final bool connected;
-  final bool connecting;
-  final bool fixOk;
-  final bool rtkOk;
+  final bool connected, connecting, fixOk, rtkOk, rtcmFresh;
   final String? carrier;
-  final String rtcmText;
 
   const _StatusStrip({
-    required this.connected,
-    required this.connecting,
-    required this.fixOk,
-    required this.rtkOk,
-    required this.carrier,
-    required this.rtcmText,
+    required this.connected, required this.connecting, required this.fixOk,
+    required this.rtkOk, required this.carrier, required this.rtcmFresh,
   });
 
   @override
   Widget build(BuildContext context) {
     return Row(
       children: [
-        Expanded(
-          child: _Pill(
-            icon: connected ? Icons.wifi_rounded : Icons.wifi_off_rounded,
-            text: connecting
-                ? 'Подключение'
-                : (connected ? 'Связь есть' : 'Нет связи'),
-            color:
-                connected ? const Color(0xFF38F6A7) : const Color(0xFFFF4D6D),
-          ),
-        ),
-        const SizedBox(width: 8),
-        Expanded(
-          child: _Pill(
-            icon: Icons.gps_fixed_rounded,
-            text: fixOk ? 'Фикс есть' : 'Нет фикса',
-            color: fixOk ? const Color(0xFF38F6A7) : const Color(0xFFFFD166),
-          ),
-        ),
-        const SizedBox(width: 8),
-        Expanded(
-          child: _Pill(
-            icon: Icons.satellite_alt_rounded,
-            text: '${_GpsDebugScreenState._carrierLabel(carrier)} / $rtcmText',
-            color: rtkOk ? const Color(0xFF38F6A7) : const Color(0xFFFFD166),
-          ),
-        ),
+        Expanded(child: _Pill(icon: connected ? Icons.wifi_rounded : Icons.wifi_off_rounded, text: connected ? 'Связь' : 'Нет связи', color: connected ? const Color(0xFF38F6A7) : const Color(0xFFFF4D6D))),
+        const SizedBox(width: 6),
+        Expanded(child: _Pill(icon: Icons.gps_fixed_rounded, text: fixOk ? 'Фикс' : 'Нет', color: fixOk ? const Color(0xFF38F6A7) : const Color(0xFFFFD166))),
+        const SizedBox(width: 6),
+        Expanded(child: _Pill(icon: Icons.satellite_alt_rounded, text: carrier ?? 'нет', color: rtkOk ? const Color(0xFF38F6A7) : const Color(0xFFFFD166))),
       ],
     );
   }
@@ -1417,27 +809,19 @@ class _Pill extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       height: 42,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 8),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.13),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: color.withValues(alpha: 0.30)),
       ),
       child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(icon, size: 18, color: color),
-          const SizedBox(width: 7),
-          Expanded(
-            child: Text(
-              text,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: color,
-                fontWeight: FontWeight.w900,
-                fontSize: 12,
-              ),
-            ),
+          Icon(icon, size: 16, color: color),
+          const SizedBox(width: 5),
+          Flexible(
+            child: Text(text, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: color, fontWeight: FontWeight.w900, fontSize: 12)),
           ),
         ],
       ),
@@ -1446,47 +830,27 @@ class _Pill extends StatelessWidget {
 }
 
 class _Metric extends StatelessWidget {
-  final String label;
-  final String value;
+  final String label, value;
   final bool? good;
 
   const _Metric({required this.label, required this.value, this.good});
 
   @override
   Widget build(BuildContext context) {
-    final color = good == null
-        ? Colors.white
-        : (good! ? const Color(0xFF38F6A7) : const Color(0xFFFFD166));
+    final color = good == null ? Colors.white : (good! ? const Color(0xFF38F6A7) : const Color(0xFFFFD166));
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 3),
-      padding: const EdgeInsets.all(10),
+      margin: const EdgeInsets.symmetric(horizontal: 2),
+      padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.20),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(6),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            label,
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.56),
-              fontWeight: FontWeight.w800,
-              fontSize: 11,
-            ),
-          ),
-          const SizedBox(height: 5),
-          Text(
-            value,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: color,
-              fontWeight: FontWeight.w900,
-              fontSize: 14,
-              height: 1.12,
-            ),
-          ),
+          Text(label, style: TextStyle(color: Colors.white.withValues(alpha: 0.5), fontSize: 10, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 2),
+          FittedBox(fit: BoxFit.scaleDown, child: Text(value, style: TextStyle(color: color, fontSize: 13, fontWeight: FontWeight.w900))),
         ],
       ),
     );
@@ -1494,541 +858,53 @@ class _Metric extends StatelessWidget {
 }
 
 class _CoordLine extends StatelessWidget {
-  final String label;
-  final String value;
-
+  final String label, value;
   const _CoordLine({required this.label, required this.value});
 
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3),
+      padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
         children: [
-          SizedBox(
-            width: 76,
-            child: Text(
-              label,
-              style: TextStyle(
-                color: Colors.white.withValues(alpha: 0.56),
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
-          Expanded(
-            child: Text(
-              value,
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
+          SizedBox(width: 60, child: Text(label, style: TextStyle(color: Colors.white.withValues(alpha: 0.5), fontSize: 11))),
+          Expanded(child: Text(value, style: const TextStyle(fontFamily: 'monospace', fontWeight: FontWeight.w800, fontSize: 11))),
         ],
       ),
     );
   }
 }
 
-class _SavedPerimeterCard extends StatelessWidget {
-  final GpsPerimeter perimeter;
-  final bool selected;
-  final Future<void> Function(GpsPerimeter perimeter) onOpen;
-  final Future<void> Function(GpsPerimeter perimeter) onCopyJson;
-  final Future<void> Function(GpsPerimeter perimeter) onDelete;
+class _BigButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final bool enabled;
+  final VoidCallback onTap;
 
-  const _SavedPerimeterCard({
-    required this.perimeter,
-    required this.selected,
-    required this.onOpen,
-    required this.onCopyJson,
-    required this.onDelete,
-  });
+  const _BigButton({required this.icon, required this.label, required this.color, required this.enabled, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
-    final accent = selected ? const Color(0xFFFFD166) : Colors.white;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: accent.withValues(alpha: selected ? 0.10 : 0.045),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(
-          color: accent.withValues(alpha: selected ? 0.35 : 0.10),
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              Icon(Icons.route_rounded, size: 18, color: accent),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  perimeter.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontWeight: FontWeight.w900),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                '${perimeter.points.length} точек',
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.66),
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              _Action(
-                icon: Icons.folder_open_rounded,
-                label: 'Открыть',
-                color: const Color(0xFF38F6A7),
-                onTap: () {
-                  unawaited(onOpen(perimeter));
-                },
-              ),
-              _Action(
-                icon: Icons.copy_rounded,
-                label: 'JSON',
-                color: const Color(0xFF7AA2FF),
-                onTap: () {
-                  unawaited(onCopyJson(perimeter));
-                },
-              ),
-              _Action(
-                icon: Icons.delete_outline_rounded,
-                label: 'Удалить',
-                color: const Color(0xFFFF4D6D),
-                onTap: () {
-                  unawaited(onDelete(perimeter));
-                },
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _MapDebugInfo extends StatelessWidget {
-  final int currentPoints;
-  final int openedPoints;
-  final int trackPoints;
-  final GpsPerimeterPoint? currentPosition;
-
-  const _MapDebugInfo({
-    required this.currentPoints,
-    required this.openedPoints,
-    required this.trackPoints,
-    required this.currentPosition,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final position = currentPosition == null
-        ? 'none'
-        : '${currentPosition!.lat.toStringAsFixed(8)}, '
-            '${currentPosition!.lon.toStringAsFixed(8)}';
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.055),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
-      ),
-      child: DefaultTextStyle(
-        style: TextStyle(
-          color: Colors.white.withValues(alpha: 0.76),
-          fontSize: 12,
-          fontWeight: FontWeight.w800,
+    final c = enabled ? color : Colors.white.withValues(alpha: 0.25);
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: enabled ? onTap : null,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        decoration: BoxDecoration(
+          color: c.withValues(alpha: enabled ? 0.15 : 0.05),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: c.withValues(alpha: enabled ? 0.35 : 0.15)),
         ),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Text('current points: $currentPoints'),
-            Text('saved/opened perimeter points: $openedPoints'),
-            Text('track points: $trackPoints'),
-            Text('current position: $position'),
+            Icon(icon, size: 24, color: c),
+            const SizedBox(height: 4),
+            Text(label, textAlign: TextAlign.center, style: TextStyle(color: c, fontSize: 11, fontWeight: FontWeight.w900)),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _DebugNavigationResult {
-  final String reason;
-  final LocalPointMeters? currentLocal;
-  final LocalPointMeters? targetLocal;
-  final double? distanceMeters;
-  final double? bearingDegrees;
-  final double? headingErrorDegrees;
-  final bool arrived;
-
-  const _DebugNavigationResult({
-    required this.reason,
-    this.currentLocal,
-    this.targetLocal,
-    this.distanceMeters,
-    this.bearingDegrees,
-    this.headingErrorDegrees,
-    this.arrived = false,
-  });
-}
-
-class _NavigationPanel extends StatelessWidget {
-  final GpsPerimeterPoint? current;
-  final GpsPerimeterPoint? origin;
-  final GpsPerimeterPoint? target;
-  final int? targetIndex;
-  final String routeLabel;
-  final List<GpsPerimeterPoint> routePoints;
-  final _DebugNavigationResult result;
-  final bool routeRunning;
-  final String? roverNavState;
-  final int? roverNavWpIndex;
-  final int? roverNavWpTotal;
-  final double? roverNavDistToWp;
-  final double? rawHeadingDegrees;
-  final double? headingDegrees;
-  final String headingSource;
-  final double? movementBearingDegrees;
-  final double? movementTargetErrorDegrees;
-  final VoidCallback? onStartRoute;
-  final VoidCallback onPauseRoute;
-  final VoidCallback? onCalibrateHeading;
-  final VoidCallback? onResetImu;
-  final VoidCallback? onSetCurrentTarget;
-  final ValueChanged<int>? onSelectRoutePoint;
-  final VoidCallback? onNextRoutePoint;
-  final VoidCallback? onClearTarget;
-
-  const _NavigationPanel({
-    required this.current,
-    required this.origin,
-    required this.target,
-    required this.targetIndex,
-    required this.routeLabel,
-    required this.routePoints,
-    required this.result,
-    required this.routeRunning,
-    required this.roverNavState,
-    required this.roverNavWpIndex,
-    required this.roverNavWpTotal,
-    required this.roverNavDistToWp,
-    required this.rawHeadingDegrees,
-    required this.headingDegrees,
-    required this.headingSource,
-    required this.movementBearingDegrees,
-    required this.movementTargetErrorDegrees,
-    required this.onStartRoute,
-    required this.onPauseRoute,
-    required this.onCalibrateHeading,
-    required this.onResetImu,
-    required this.onSetCurrentTarget,
-    required this.onSelectRoutePoint,
-    required this.onNextRoutePoint,
-    required this.onClearTarget,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final selectedIndex = targetIndex != null &&
-            targetIndex! >= 0 &&
-            targetIndex! < routePoints.length
-        ? targetIndex
-        : null;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        const Text(
-          'Rover navigation monitor',
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
-        ),
-        const SizedBox(height: 10),
-        _RouteHeader(
-          routeLabel: routeLabel,
-          targetIndex: targetIndex,
-          total: routePoints.length,
-          routeRunning: routeRunning,
-          motorsEnabled: roverNavState == 'RUNNING',
-        ),
-        if (roverNavState != null)
-          _CoordLine(
-            label: 'Rover NAV',
-            value:
-                '$roverNavState wp=${roverNavWpIndex ?? '-'}/${roverNavWpTotal ?? '-'} dist=${_meters(roverNavDistToWp)}',
-          ),
-        const SizedBox(height: 10),
-        Row(
-          children: [
-            Expanded(
-              child: _Metric(
-                label: 'Distance',
-                value: _meters(result.distanceMeters),
-                good: result.arrived,
-              ),
-            ),
-            Expanded(
-              child: _Metric(
-                label: 'Bearing',
-                value: _degrees(result.bearingDegrees),
-              ),
-            ),
-            Expanded(
-              child: _Metric(
-                label: 'Heading err',
-                value: _signedDegrees(result.headingErrorDegrees),
-                good: result.headingErrorDegrees != null &&
-                    result.headingErrorDegrees!.abs() <= 20,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 10),
-        _CoordLine(label: 'Mode', value: result.reason),
-        _CoordLine(
-          label: 'Heading',
-          value: headingDegrees == null
-              ? '-'
-              : '${headingDegrees!.toStringAsFixed(1)} deg ($headingSource)',
-        ),
-        _CoordLine(
-          label: 'Raw IMU',
-          value: rawHeadingDegrees == null
-              ? '-'
-              : '${rawHeadingDegrees!.toStringAsFixed(1)} deg',
-        ),
-        _CoordLine(
-          label: 'GPS move',
-          value: movementBearingDegrees == null
-              ? '-'
-              : '${movementBearingDegrees!.toStringAsFixed(1)} deg',
-        ),
-        _CoordLine(
-          label: 'Move error',
-          value: _signedDegrees(movementTargetErrorDegrees),
-        ),
-        _CoordLine(label: 'Current', value: _latLon(current)),
-        _CoordLine(label: 'Current X/Y', value: _xy(result.currentLocal)),
-        _CoordLine(label: 'Target', value: _latLon(target)),
-        _CoordLine(label: 'Target X/Y', value: _xy(result.targetLocal)),
-        _CoordLine(label: 'Origin', value: _latLon(origin)),
-        const SizedBox(height: 10),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            _Action(
-              icon: Icons.route_rounded,
-              label: 'Send to rover',
-              color: const Color(0xFF7AA2FF),
-              onTap: onStartRoute,
-            ),
-            _Action(
-              icon: Icons.stop_circle_rounded,
-              label: 'Stop rover',
-              color: const Color(0xFFFFD166),
-              onTap: onPauseRoute,
-            ),
-            _Action(
-              icon: Icons.explore_rounded,
-              label: 'CAL_IMU on rover',
-              color: const Color(0xFF38F6A7),
-              onTap: onCalibrateHeading,
-            ),
-            _Action(
-              icon: Icons.restart_alt_rounded,
-              label: 'Reset IMU',
-              color: const Color(0xFFFFD166),
-              onTap: onResetImu,
-            ),
-            _Action(
-              icon: Icons.my_location_rounded,
-              label: 'Target = me',
-              color: const Color(0xFF7AA2FF),
-              onTap: onSetCurrentTarget,
-            ),
-            _Action(
-              icon: Icons.skip_next_rounded,
-              label: 'Next point',
-              color: const Color(0xFF38F6A7),
-              onTap: onNextRoutePoint,
-            ),
-            _Action(
-              icon: Icons.close_rounded,
-              label: 'Clear',
-              color: const Color(0xFFFFD166),
-              onTap: onClearTarget,
-            ),
-            if (routePoints.isNotEmpty && onSelectRoutePoint != null)
-              Container(
-                height: 42,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.07),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.14),
-                  ),
-                ),
-                child: DropdownButtonHideUnderline(
-                  child: DropdownButton<int>(
-                    value: selectedIndex,
-                    dropdownColor: const Color(0xFF191D24),
-                    hint: const Text('Perimeter point'),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w900,
-                    ),
-                    iconEnabledColor: Colors.white,
-                    items: [
-                      for (var i = 0; i < routePoints.length; i++)
-                        DropdownMenuItem<int>(
-                          value: i,
-                          child: Text('Point ${i + 1}'),
-                        ),
-                    ],
-                    onChanged: (value) {
-                      if (value != null) onSelectRoutePoint!(value);
-                    },
-                  ),
-                ),
-              ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        Text(
-          'The app only records/sends geometry and monitor data. Rover firmware owns IMU offset, route following, and motor commands.',
-          style: TextStyle(
-            color: Colors.white.withValues(alpha: 0.58),
-            fontSize: 12,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-      ],
-    );
-  }
-
-  static String _latLon(GpsPerimeterPoint? point) {
-    if (point == null) return '-';
-    return '${point.lat.toStringAsFixed(8)}, ${point.lon.toStringAsFixed(8)}';
-  }
-
-  static String _xy(LocalPointMeters? point) {
-    if (point == null) return '-';
-    return 'X ${point.x.toStringAsFixed(2)} m, Y ${point.y.toStringAsFixed(2)} m';
-  }
-
-  static String _meters(double? value) {
-    if (value == null) return '-';
-    return '${value.toStringAsFixed(2)} m';
-  }
-
-  static String _degrees(double? value) {
-    if (value == null) return '-';
-    return '${value.toStringAsFixed(1)} deg';
-  }
-
-  static String _signedDegrees(double? value) {
-    if (value == null) return '-';
-    final sign = value > 0 ? '+' : '';
-    return '$sign${value.toStringAsFixed(1)} deg';
-  }
-}
-
-class _RouteHeader extends StatelessWidget {
-  final String routeLabel;
-  final int? targetIndex;
-  final int total;
-  final bool routeRunning;
-  final bool motorsEnabled;
-
-  const _RouteHeader({
-    required this.routeLabel,
-    required this.targetIndex,
-    required this.total,
-    required this.routeRunning,
-    required this.motorsEnabled,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final progress = targetIndex == null || total == 0
-        ? 0.0
-        : ((targetIndex! + 1) / total).clamp(0.0, 1.0);
-    return Container(
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.06),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              Icon(
-                motorsEnabled
-                    ? Icons.play_circle_fill_rounded
-                    : Icons.pause_circle_filled_rounded,
-                color: motorsEnabled
-                    ? const Color(0xFF38F6A7)
-                    : const Color(0xFFFFD166),
-                size: 20,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  routeRunning
-                      ? 'Едет к цели: $routeLabel'
-                      : 'Цель: $routeLabel',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w900,
-                    fontSize: 14,
-                  ),
-                ),
-              ),
-              Text(
-                total == 0 ? '0/0' : '${(targetIndex ?? -1) + 1}/$total',
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.70),
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: LinearProgressIndicator(
-              minHeight: 8,
-              value: total == 0 ? 0 : progress,
-              backgroundColor: Colors.black.withValues(alpha: 0.30),
-              valueColor: AlwaysStoppedAnimation<Color>(
-                motorsEnabled
-                    ? const Color(0xFF38F6A7)
-                    : const Color(0xFF7AA2FF),
-              ),
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -2037,15 +913,10 @@ class _RouteHeader extends StatelessWidget {
 class _Action extends StatelessWidget {
   final IconData icon;
   final String label;
-  final VoidCallback? onTap;
   final Color color;
+  final VoidCallback? onTap;
 
-  const _Action({
-    required this.icon,
-    required this.label,
-    this.onTap,
-    this.color = Colors.white,
-  });
+  const _Action({required this.icon, required this.label, this.color = Colors.white, this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -2055,21 +926,18 @@ class _Action extends StatelessWidget {
       borderRadius: BorderRadius.circular(8),
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: BoxDecoration(
-          color: c.withValues(alpha: enabled ? 0.12 : 0.05),
+          color: c.withValues(alpha: enabled ? 0.10 : 0.03),
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: c.withValues(alpha: enabled ? 0.30 : 0.10)),
+          border: Border.all(color: c.withValues(alpha: enabled ? 0.25 : 0.10)),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, size: 18, color: c),
-            const SizedBox(width: 7),
-            Text(
-              label,
-              style: TextStyle(color: c, fontWeight: FontWeight.w900),
-            ),
+            Icon(icon, size: 16, color: c),
+            const SizedBox(width: 5),
+            Text(label, style: TextStyle(color: c, fontSize: 12, fontWeight: FontWeight.w900)),
           ],
         ),
       ),
@@ -2080,7 +948,6 @@ class _Action extends StatelessWidget {
 class _IconButton extends StatelessWidget {
   final IconData icon;
   final VoidCallback? onTap;
-
   const _IconButton({required this.icon, this.onTap});
 
   @override
@@ -2105,260 +972,181 @@ class _IconButton extends StatelessWidget {
 class _Notice extends StatelessWidget {
   final String text;
   final VoidCallback onClose;
-
   const _Notice({required this.text, required this.onClose});
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Container(
-        padding: const EdgeInsets.all(10),
-        decoration: BoxDecoration(
-          color: const Color(0xFF7AA2FF).withValues(alpha: 0.14),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-              color: const Color(0xFF7AA2FF).withValues(alpha: 0.30)),
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                text,
-                style: const TextStyle(fontWeight: FontWeight.w800),
-              ),
-            ),
-            IconButton(
-              onPressed: onClose,
-              icon: const Icon(Icons.close_rounded),
-              iconSize: 18,
-            ),
-          ],
-        ),
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF7AA2FF).withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFF7AA2FF).withValues(alpha: 0.30)),
+      ),
+      child: Row(
+        children: [
+          Expanded(child: Text(text, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12))),
+          IconButton(icon: const Icon(Icons.close_rounded, size: 18), onPressed: onClose),
+        ],
       ),
     );
   }
 }
 
-class _SiteMapPainter extends CustomPainter {
-  final List<GpsPerimeterPoint> points;
+class _SavedPerimeterCard extends StatelessWidget {
+  final GpsPerimeter perimeter;
+  final bool selected;
+  final Future<void> Function(GpsPerimeter) onOpen;
+  final Future<void> Function(GpsPerimeter) onDelete;
+
+  const _SavedPerimeterCard({required this.perimeter, required this.selected, required this.onOpen, required this.onDelete});
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = selected ? const Color(0xFFFFD166) : Colors.white;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: selected ? 0.10 : 0.045),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: accent.withValues(alpha: selected ? 0.30 : 0.10)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.route_rounded, size: 18, color: accent),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(perimeter.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13)),
+                Text('${perimeter.points.length} точек', style: TextStyle(color: Colors.white.withValues(alpha: 0.6), fontSize: 11)),
+              ],
+            ),
+          ),
+          _Action(icon: Icons.folder_open_rounded, label: 'Открыть', color: const Color(0xFF38F6A7), onTap: () => unawaited(onOpen(perimeter))),
+          const SizedBox(width: 6),
+          _Action(icon: Icons.delete_outline_rounded, label: 'Удалить', color: const Color(0xFFFF4D6D), onTap: () => unawaited(onDelete(perimeter))),
+        ],
+      ),
+    );
+  }
+}
+
+// Painters
+
+class _TrailPainter extends CustomPainter {
+  final List<GpsPerimeterPoint> trail;
   final GpsPerimeterPoint? current;
   final GpsPerimeterPoint? target;
-  final int? targetIndex;
 
-  const _SiteMapPainter({
-    required this.points,
-    required this.current,
-    required this.target,
-    required this.targetIndex,
-  });
+  _TrailPainter({required this.trail, this.current, this.target});
 
   @override
   void paint(Canvas canvas, Size size) {
-    final background = Paint()..color = const Color(0xFF2B2F36);
-    canvas.drawRect(Offset.zero & size, background);
-    _drawGrid(canvas, size);
+    canvas.drawRect(Offset.zero & size, Paint()..color = const Color(0xFF1A1F24));
 
-    final display = List<GpsPerimeterPoint>.from(points);
-    final currentPoint = current;
-    if (display.isEmpty && currentPoint != null) {
-      display.add(currentPoint);
-    }
+    // Grid
+    final gridPaint = Paint()..color = Colors.white.withValues(alpha: 0.05)..strokeWidth = 1;
+    for (double x = 0; x <= size.width; x += 32) canvas.drawLine(Offset(x, 0), Offset(x, size.height), gridPaint);
+    for (double y = 0; y <= size.height; y += 32) canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
 
-    if (display.isEmpty) {
-      _drawCenterText(canvas, size, 'Нет точек');
+    if (trail.isEmpty && current == null && target == null) {
+      _drawCenterText(canvas, size, 'Нет данных');
       return;
     }
 
-    final projectionSource = <GpsPerimeterPoint>[...display];
-    final currentPointIndex =
-        currentPoint == null ? null : projectionSource.length;
-    if (currentPoint != null) projectionSource.add(currentPoint);
-    final targetPoint = target;
-    final targetPointIndex =
-        targetPoint == null ? null : projectionSource.length;
-    if (targetPoint != null) projectionSource.add(targetPoint);
+    final all = <GpsPerimeterPoint>[];
+    if (trail.isNotEmpty) all.addAll(trail);
+    if (current != null) all.add(current!);
+    if (target != null && !all.any((p) => p.lat == target!.lat && p.lon == target!.lon)) all.add(target!);
 
-    final projectedAll = _projectSimple(projectionSource, size);
-    final projected = projectedAll.take(display.length).toList();
+    if (all.isEmpty) return;
 
-    if (projected.length >= 2) {
-      _drawPath(
-        canvas,
-        projected,
-        Colors.white,
-        close: projected.length >= 3,
-        width: 3.0,
-      );
+    final projected = _project(all, size);
+
+    // Trail path
+    if (trail.length >= 2) {
+      final trailPaint = Paint()
+        ..color = Colors.white.withValues(alpha: 0.4)
+        ..strokeWidth = 2
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round;
+      final path = Path()..moveTo(projected[0].dx, projected[0].dy);
+      for (int i = 1; i < trail.length; i++) path.lineTo(projected[i].dx, projected[i].dy);
+      canvas.drawPath(path, trailPaint);
     }
 
-    final outlinePaint = Paint()..color = Colors.black;
-    final pointPaint = Paint()..color = Colors.white;
-    for (var i = 0; i < projected.length; i++) {
+    // Trail dots
+    for (int i = 0; i < trail.length; i++) {
       final p = projected[i];
-      canvas.drawCircle(p, 10, outlinePaint);
-      canvas.drawCircle(p, 8, pointPaint);
-      _drawLabel(
-        canvas,
-        p + const Offset(11, -22),
-        '${i + 1}',
-        Colors.white,
-        14,
-      );
+      canvas.drawCircle(p, 3, Paint()..color = Colors.white.withValues(alpha: 0.6));
     }
 
-    if (currentPoint != null) {
-      final currentOffset = projectedAll[currentPointIndex!];
-      canvas.drawCircle(currentOffset, 13, Paint()..color = Colors.red);
-      canvas.drawCircle(currentOffset, 8, Paint()..color = Colors.white);
+    // Current position (red)
+    if (current != null) {
+      final idx = trail.length;
+      if (idx < projected.length) {
+        canvas.drawCircle(projected[idx], 8, Paint()..color = const Color(0xFFFF4D6D));
+        canvas.drawCircle(projected[idx], 5, Paint()..color = Colors.white);
+      }
     }
 
-    if (targetPoint != null) {
-      final targetOffset = projectedAll[targetPointIndex!];
-      canvas.drawCircle(
-        targetOffset,
-        16,
-        Paint()..color = const Color(0xFF38F6A7),
-      );
-      canvas.drawCircle(targetOffset, 10, Paint()..color = Colors.black);
-      canvas.drawCircle(
-        targetOffset,
-        7,
-        Paint()..color = const Color(0xFF38F6A7),
-      );
-      _drawLabel(
-        canvas,
-        targetOffset + const Offset(14, 12),
-        targetIndex == null ? 'TARGET' : 'TARGET ${targetIndex! + 1}',
-        const Color(0xFF38F6A7),
-        13,
-      );
+    // Target (green)
+    if (target != null) {
+      final idx = all.indexWhere((p) => p.lat == target!.lat && p.lon == target!.lon);
+      if (idx >= 0 && idx < projected.length) {
+        canvas.drawCircle(projected[idx], 12, Paint()..color = const Color(0xFF38F6A7));
+        canvas.drawCircle(projected[idx], 7, Paint()..color = Colors.black);
+        canvas.drawCircle(projected[idx], 4, Paint()..color = const Color(0xFF38F6A7));
+      }
     }
 
-    _drawLabel(
-      canvas,
-      const Offset(10, 10),
-      'points: ${display.length}',
-      Colors.white,
-      12,
-    );
+    _drawLabel(canvas, const Offset(8, 8), '${trail.length} pts', Colors.white, 11);
   }
 
-  List<Offset> _projectSimple(List<GpsPerimeterPoint> src, Size size) {
-    double minLat = src.first.lat;
-    double maxLat = src.first.lat;
-    double minLon = src.first.lon;
-    double maxLon = src.first.lon;
+  List<Offset> _project(List<GpsPerimeterPoint> src, Size size) {
+    if (src.isEmpty) return [];
 
+    double minLat = src.first.lat, maxLat = src.first.lat, minLon = src.first.lon, maxLon = src.first.lon;
     for (final p in src) {
-      minLat = math.min(minLat, p.lat);
-      maxLat = math.max(maxLat, p.lat);
-      minLon = math.min(minLon, p.lon);
-      maxLon = math.max(maxLon, p.lon);
+      minLat = math.min(minLat, p.lat); maxLat = math.max(maxLat, p.lat);
+      minLon = math.min(minLon, p.lon); maxLon = math.max(maxLon, p.lon);
     }
 
-    const minRange = 0.00001;
-    if ((maxLat - minLat).abs() < minRange) {
-      final center = (minLat + maxLat) / 2;
-      minLat = center - minRange / 2;
-      maxLat = center + minRange / 2;
-    }
-    if ((maxLon - minLon).abs() < minRange) {
-      final center = (minLon + maxLon) / 2;
-      minLon = center - minRange / 2;
-      maxLon = center + minRange / 2;
-    }
+    const pad = 0.00001;
+    if ((maxLat - minLat).abs() < pad) { minLat -= pad; maxLat += pad; }
+    if ((maxLon - minLon).abs() < pad) { minLon -= pad; maxLon += pad; }
 
-    final latPad = (maxLat - minLat) * 0.20;
-    final lonPad = (maxLon - minLon) * 0.20;
-    minLat -= latPad;
-    maxLat += latPad;
-    minLon -= lonPad;
-    maxLon += lonPad;
+    final latPad = (maxLat - minLat) * 0.15;
+    final lonPad = (maxLon - minLon) * 0.15;
+    minLat -= latPad; maxLat += latPad;
+    minLon -= lonPad; maxLon += lonPad;
 
-    final drawW = math.max(1.0, size.width);
-    final drawH = math.max(1.0, size.height);
     return src.map((p) {
-      final x = ((p.lon - minLon) / (maxLon - minLon)) * drawW;
-      final y = drawH - ((p.lat - minLat) / (maxLat - minLat)) * drawH;
-      return Offset(x.clamp(12.0, drawW - 12.0), y.clamp(12.0, drawH - 12.0));
+      final x = ((p.lon - minLon) / (maxLon - minLon)) * size.width;
+      final y = size.height - ((p.lat - minLat) / (maxLat - minLat)) * size.height;
+      return Offset(x.clamp(8, size.width - 8), y.clamp(8, size.height - 8));
     }).toList();
   }
 
-  void _drawGrid(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = Colors.white.withValues(alpha: 0.055)
-      ..strokeWidth = 1;
-    for (double x = 0; x <= size.width; x += 32) {
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
-    }
-    for (double y = 0; y <= size.height; y += 32) {
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
-    }
-  }
-
-  void _drawPath(
-    Canvas canvas,
-    List<Offset> pts,
-    Color color, {
-    bool close = false,
-    double width = 2,
-  }) {
-    if (pts.length < 2) return;
-    final path = Path()..moveTo(pts.first.dx, pts.first.dy);
-    for (final p in pts.skip(1)) {
-      path.lineTo(p.dx, p.dy);
-    }
-    if (close) path.close();
-    canvas.drawPath(
-      path,
-      Paint()
-        ..color = color
-        ..strokeWidth = width
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round,
-    );
-  }
-
   void _drawCenterText(Canvas canvas, Size size, String text) {
-    _drawLabel(
-      canvas,
-      size.center(Offset.zero),
-      text,
-      Colors.white.withValues(alpha: 0.45),
-      14,
-      centered: true,
-    );
+    _drawLabel(canvas, size.center(Offset.zero), text, Colors.white.withValues(alpha: 0.4), 12, centered: true);
   }
 
-  void _drawLabel(
-    Canvas canvas,
-    Offset offset,
-    String text,
-    Color color,
-    double size, {
-    bool centered = false,
-  }) {
+  void _drawLabel(Canvas canvas, Offset offset, String text, Color color, double size, {bool centered = false}) {
     final painter = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: TextStyle(
-          color: color,
-          fontSize: size,
-          fontWeight: FontWeight.w800,
-        ),
-      ),
+      text: TextSpan(text: text, style: TextStyle(color: color, fontSize: size, fontWeight: FontWeight.w800)),
       textDirection: TextDirection.ltr,
     )..layout();
-    final pos = centered
-        ? offset - Offset(painter.width / 2, painter.height / 2)
-        : offset;
+    final pos = centered ? offset - Offset(painter.width / 2, painter.height / 2) : offset;
     painter.paint(canvas, pos);
   }
 
   @override
-  bool shouldRepaint(covariant _SiteMapPainter oldDelegate) => true;
+  bool shouldRepaint(covariant _TrailPainter old) => true;
 }
 
 class _PerimeterPainter extends CustomPainter {
@@ -2368,20 +1156,11 @@ class _PerimeterPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    canvas.drawRect(
-      Offset.zero & size,
-      Paint()..color = const Color(0xFF2B2F36),
-    );
+    canvas.drawRect(Offset.zero & size, Paint()..color = const Color(0xFF1A1F24));
 
-    final gridPaint = Paint()
-      ..color = Colors.white.withValues(alpha: 0.10)
-      ..strokeWidth = 1;
-    for (double x = 0; x <= size.width; x += 32) {
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), gridPaint);
-    }
-    for (double y = 0; y <= size.height; y += 32) {
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
-    }
+    final gridPaint = Paint()..color = Colors.white.withValues(alpha: 0.08)..strokeWidth = 1;
+    for (double x = 0; x <= size.width; x += 32) canvas.drawLine(Offset(x, 0), Offset(x, size.height), gridPaint);
+    for (double y = 0; y <= size.height; y += 32) canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
 
     if (points.isEmpty) {
       _drawCenterText(canvas, size, 'Нет точек');
@@ -2389,108 +1168,63 @@ class _PerimeterPainter extends CustomPainter {
     }
 
     final screen = _project(points, size);
-    final linePaint = Paint()
-      ..color = Colors.white
-      ..strokeWidth = 3.0
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round
-      ..strokeJoin = StrokeJoin.round;
 
+    // Path
     if (screen.length >= 2) {
       final path = Path()..moveTo(screen.first.dx, screen.first.dy);
-      for (final p in screen.skip(1)) {
-        path.lineTo(p.dx, p.dy);
-      }
+      for (final p in screen.skip(1)) path.lineTo(p.dx, p.dy);
       if (screen.length >= 3) path.close();
-      canvas.drawPath(path, linePaint);
+      canvas.drawPath(path, Paint()..color = Colors.white..strokeWidth = 2..style = PaintingStyle.stroke..strokeCap = StrokeCap.round);
     }
 
-    final outlinePaint = Paint()..color = Colors.black;
-    final pointPaint = Paint()..color = Colors.white;
-    for (var i = 0; i < screen.length; i++) {
-      final p = screen[i];
-      canvas.drawCircle(p, 9.5, outlinePaint);
-      canvas.drawCircle(p, 7.5, pointPaint);
-      _drawLabel(canvas, p + const Offset(10, -21), '${i + 1}');
+    // Points
+    for (int i = 0; i < screen.length; i++) {
+      canvas.drawCircle(screen[i], 6, Paint()..color = Colors.white);
+      _drawLabel(canvas, screen[i] + const Offset(8, -16), '${i + 1}', Colors.white, 11);
     }
   }
 
   List<Offset> _project(List<GpsPerimeterPoint> pts, Size size) {
-    double minLat = pts.first.lat;
-    double maxLat = pts.first.lat;
-    double minLon = pts.first.lon;
-    double maxLon = pts.first.lon;
+    if (pts.isEmpty) return [];
 
+    double minLat = pts.first.lat, maxLat = pts.first.lat, minLon = pts.first.lon, maxLon = pts.first.lon;
     for (final p in pts) {
-      minLat = math.min(minLat, p.lat);
-      maxLat = math.max(maxLat, p.lat);
-      minLon = math.min(minLon, p.lon);
-      maxLon = math.max(maxLon, p.lon);
+      minLat = math.min(minLat, p.lat); maxLat = math.max(maxLat, p.lat);
+      minLon = math.min(minLon, p.lon); maxLon = math.max(maxLon, p.lon);
     }
 
-    const minRange = 0.00001;
-    if ((maxLat - minLat).abs() < minRange) {
-      final center = (minLat + maxLat) / 2;
-      minLat = center - minRange / 2;
-      maxLat = center + minRange / 2;
-    }
-    if ((maxLon - minLon).abs() < minRange) {
-      final center = (minLon + maxLon) / 2;
-      minLon = center - minRange / 2;
-      maxLon = center + minRange / 2;
-    }
+    const pad = 0.00001;
+    if ((maxLat - minLat).abs() < pad) { minLat -= pad; maxLat += pad; }
+    if ((maxLon - minLon).abs() < pad) { minLon -= pad; maxLon += pad; }
 
-    final latPad = (maxLat - minLat) * 0.20;
-    final lonPad = (maxLon - minLon) * 0.20;
-    minLat -= latPad;
-    maxLat += latPad;
-    minLon -= lonPad;
-    maxLon += lonPad;
+    final latPad = (maxLat - minLat) * 0.15;
+    final lonPad = (maxLon - minLon) * 0.15;
+    minLat -= latPad; maxLat += latPad;
+    minLon -= lonPad; maxLon += lonPad;
 
-    final drawW = math.max(1.0, size.width);
-    final drawH = math.max(1.0, size.height);
     return pts.map((p) {
-      final x = ((p.lon - minLon) / (maxLon - minLon)) * drawW;
-      final y = drawH - ((p.lat - minLat) / (maxLat - minLat)) * drawH;
-      return Offset(x.clamp(12.0, drawW - 12.0), y.clamp(12.0, drawH - 12.0));
+      final x = ((p.lon - minLon) / (maxLon - minLon)) * size.width;
+      final y = size.height - ((p.lat - minLat) / (maxLat - minLat)) * size.height;
+      return Offset(x.clamp(12, size.width - 12), y.clamp(12, size.height - 12));
     }).toList();
   }
 
-  void _drawLabel(Canvas canvas, Offset offset, String text) {
+  void _drawLabel(Canvas canvas, Offset offset, String text, Color color, double size) {
     final painter = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: const TextStyle(
-          color: Colors.white,
-          fontSize: 13,
-          fontWeight: FontWeight.w900,
-        ),
-      ),
+      text: TextSpan(text: text, style: TextStyle(color: color, fontSize: size, fontWeight: FontWeight.w900)),
       textDirection: TextDirection.ltr,
     )..layout();
     painter.paint(canvas, offset);
   }
 
   void _drawCenterText(Canvas canvas, Size size, String text) {
-    final span = TextSpan(
-      text: text,
-      style: TextStyle(
-        color: Colors.white.withValues(alpha: 0.45),
-        fontWeight: FontWeight.w900,
-      ),
-    );
     final painter = TextPainter(
-      text: span,
+      text: TextSpan(text: text, style: TextStyle(color: Colors.white.withValues(alpha: 0.4), fontWeight: FontWeight.w900)),
       textDirection: TextDirection.ltr,
     )..layout();
-    painter.paint(
-      canvas,
-      size.center(Offset.zero) - Offset(painter.width / 2, painter.height / 2),
-    );
+    painter.paint(canvas, size.center(Offset.zero) - Offset(painter.width / 2, painter.height / 2));
   }
 
   @override
-  bool shouldRepaint(covariant _PerimeterPainter oldDelegate) {
-    return true;
-  }
+  bool shouldRepaint(covariant _PerimeterPainter old) => true;
 }

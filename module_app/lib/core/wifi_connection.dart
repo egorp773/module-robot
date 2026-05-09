@@ -1117,6 +1117,13 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     sendRaw("NAV_STOP");
   }
 
+  /// Simple Go-To navigation: sends single target coordinates
+  /// Robot computes local coords and navigates autonomously
+  void sendGoToTarget(double lat, double lon) {
+    if (!state.isConnected) return;
+    sendRaw("GO_TO,${lat.toStringAsFixed(8)},${lon.toStringAsFixed(8)}");
+  }
+
   void clearLog() {
     state = state.copyWith(rxLog: []);
   }
