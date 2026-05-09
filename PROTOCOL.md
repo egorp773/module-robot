@@ -149,35 +149,47 @@ ERR SOUND_RANGE
 
 ### Route upload
 
-Current route commands use GPS latitude/longitude, not local meters.
-This is a known mismatch with the roadmap. Future route planning should move to local x/y meters.
+RTK/autopilot route commands use local-meter coordinates. The app sends the
+GPS origin once, then sends each waypoint as local `x/y` meters relative to
+that origin.
 
 ```text
-ROUTE_BEGIN,<count>
+ROUTE_BEGIN,<count>,<originLat>,<originLon>
 ```
 
 ```text
-ROUTE_WP,<index>,<lat>,<lon>
+ROUTE_WP,<index>,<x_m>,<y_m>
 ```
 
 ```text
 ROUTE_END
 ```
 
+Example:
+
+```text
+ROUTE_BEGIN,4,55.12345678,37.12345678
+ROUTE_WP,0,0.000,0.000
+ROUTE_WP,1,2.500,0.000
+ROUTE_WP,2,2.500,1.000
+ROUTE_WP,3,0.000,1.000
+ROUTE_END
+```
+
 Firmware responses:
 
 ```text
-OK ROUTE_BEGIN
-OK ROUTE_WP
-ERR ROUTE_WP_FORMAT
-ERR ROUTE_WP_FULL
-OK ROUTE,<count>
+OK
+ERR,INVALID
+ERR,ROUTE_INCOMPLETE
 ```
 
-Known issue:
+Rules:
 
-- Route protocol currently stores `Waypoint { lat, lon }`.
-- Roadmap requires local-meter route planning in the future.
+- `count` must be `1..64`.
+- `originLat` and `originLon` must be non-zero.
+- waypoint indexes outside `0..count-1` are rejected.
+- `NAV_START` is accepted only after every waypoint has been received.
 
 ### NAV control
 
@@ -191,17 +203,17 @@ NAV_STOP
 Firmware responses:
 
 ```text
-OK NAV_START
-OK NAV_PAUSE
-OK NAV_RESUME
-OK NAV_STOP
+OK
+ERR,NO_ROUTE
 ```
 
 Safety status:
 
 - Compiles.
-- Not hardware-tested.
-- Do not treat autonomous movement as ready.
+- Rover autopilot code exists but is not a completed field test.
+- `NAV_START` can enter RUNNING with a valid route, but motor output remains
+  zero while rover quality is `ERROR` or `LOST_WAIT`.
+- Do not start motor tests until RTK/heading state is verified on hardware.
 
 ## ESP32 -> app messages
 
@@ -259,8 +271,7 @@ GPS status:
 
 ### GPS debug telemetry
 
-The separate `gps_test_firmware/` test firmware also sends an extended GPS
-message for field debugging:
+The RTK rover sends extended GPS status for field debugging:
 
 ```text
 GPSDBG,<lat>,<lon>,<heightM>,<heading>,<fixType>,<carrier>,<diff>,<numSV>,<hAccMm>,<vAccMm>,<speedMps>,<pDop>,<ageMs>
@@ -273,19 +284,28 @@ GPSDBG,55.12345678,37.12345678,184.250,90.00,3,fixed,1,22,14,22,0.020,0.85,41
 ```
 
 `carrier` is `none`, `float`, or `fixed`. The Flutter GPS debug screen can use
-both `GPS` and `GPSDBG`; the main robot firmware remains compatible with the
-short `GPS` message.
+both `GPS` and `GPSDBG`.
+
+### RTCM telemetry
+
+```text
+RTCM,<bytesTotal>,<ageMs>,<transportAgeMs>,<f9pAgeMs>,<source>,<f9pMessages>,<crcFail>,<lastType>
+```
+
+`source` is currently `udp` or `none` in the active RTK rover firmware.
+`f9pMessages` is the important proof that the rover F9P decoded RTCM internally
+through `UBX-RXM-RTCM`.
 
 ### IMU telemetry
 
 ```text
-IMU,<yaw>
+IMU,<yaw>,<ageMs>,<fresh>
 ```
 
 Example:
 
 ```text
-IMU,182.50
+IMU,182.50,12,1
 ```
 
 IMU status:

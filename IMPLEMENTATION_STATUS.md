@@ -110,7 +110,8 @@ Recent code-level hardening:
 - Verified changed file with `dart analyze lib/core/wifi_connection.dart`; no errors, existing `avoid_print` info remains.
 - Auto map screen now exposes a draft workflow: Build route, Send route, Start, Pause, Stop.
 - Auto map screen shows route point count, sent state, NAV mode, waypoint index/total, GPS status, lat/lon if telemetry is present, and workflow errors.
-- `NAV_START` from the auto map screen is blocked in the UI until the GPS route workflow is confirmed.
+- `NAV_START` from the auto map screen now sends the command after a route has been uploaded.
+- Route upload now uses `ROUTE_BEGIN,count,originLat,originLon` plus local-meter `ROUTE_WP,index,x,y`.
 - Verified changed auto map file with `dart analyze module_app/lib/features/auto/auto_map_screen.dart`; no errors, existing/deprecated style info remains.
 
 ### Route generation
@@ -146,10 +147,12 @@ Known files:
 
 Limits:
 
-- GPS has not been physically connected.
+- Rover GPS/F9P UART is physically producing position data.
+- Rover F9P now confirms RTCM decode through `UBX-RXM-RTCM` in hardware logs.
+- Rover reached `Carrier: 2 (FIXED)` / `RTK_FIXED` in the 2026-05-09 bench log after base raw RTCM forwarding was enabled.
 - Manual map recording is mostly conditional/simulated.
 - It is not a confirmed GPS perimeter recording workflow.
-- Displaying lat/lon in the app does not prove GPS wiring, fix quality, or field localization.
+- Displaying lat/lon in the app does not prove RTK fix quality or field localization.
 
 ## Known broken / must fix
 
@@ -163,7 +166,7 @@ Limits:
 Impact:
 
 - Compile blocker is resolved.
-- Runtime safety still cannot be trusted until hardware tests are run.
+- Runtime safety still cannot be trusted until controlled movement/failsafe hardware tests are run.
 
 ### Auto UI workflow gaps
 
@@ -185,10 +188,10 @@ Implemented in UI:
 
 Limits:
 
-- Route sending is still a draft protocol workflow.
+- Route sending is still a draft protocol workflow, but the active RTK/autopilot path is local-meter based.
 - Route upload is blocked unless the map is marked GPS-based and has `refLat/refLon`.
-- When a GPS origin exists, route upload converts local-meter points to lat/lon with `GpsProjection`.
-- Start control is visible, but the UI intentionally blocks `NAV_START` until GPS/local-meter route workflow is confirmed.
+- When a GPS origin exists, route upload sends local-meter route points directly with the GPS origin attached to `ROUTE_BEGIN`.
+- Start control sends `NAV_START` after route upload; the rover still suppresses motor output if GPS/RTK quality is not safe.
 - No real robot autonomous test has been run.
 - Do not mark autonomy or GPS route following as working from this UI change.
 

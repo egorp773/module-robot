@@ -448,10 +448,27 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     final rtcmF9p =
         state.rtcmF9pAgeMs == null ? '-' : '${state.rtcmF9pAgeMs}ms';
     final rtcmSource = state.rtcmSource ?? '-';
+    final rtcmType = state.rtcmLastType?.toString() ?? '-';
+    final imuYaw = state.imuYaw == null
+        ? '-'
+        : '${state.imuYaw!.toStringAsFixed(1)}deg';
+    final imuAge = state.imuAgeMs == null ? '-' : '${state.imuAgeMs}ms';
+    final imuFresh =
+        state.imuFresh == null ? '-' : (state.imuFresh! ? '1' : '0');
     final sv = state.gpsSatellites?.toString() ?? '-';
+    final fix = state.gpsFixType?.toString() ?? '-';
+    final nav = state.navState ?? '-';
+    final wp = state.navWpIndex == null || state.navWpTotal == null
+        ? '-'
+        : '${state.navWpIndex}/${state.navWpTotal}';
+    final dist = state.navDistToWp == null
+        ? '-'
+        : '${state.navDistToWp!.toStringAsFixed(2)}m';
     _log(
-      "← telemetry rtk=$carrier hAcc=$hAcc rtcm=$rtcmAge "
-      "transport=$rtcmTransport f9p=$rtcmF9p src=$rtcmSource sv=$sv",
+      "← telemetry fix=$fix rtk=$carrier hAcc=$hAcc sv=$sv "
+      "rtcm=$rtcmAge transport=$rtcmTransport f9p=$rtcmF9p "
+      "src=$rtcmSource type=$rtcmType imu=$imuYaw/$imuAge fresh=$imuFresh "
+      "nav=$nav wp=$wp dist=$dist",
     );
   }
 
@@ -989,15 +1006,22 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   }
 
   /// Route upload commands
-  void sendRouteBegin(int count) {
-    if (!state.isConnected) return;
-    sendRaw("ROUTE_BEGIN,$count");
-  }
-
-  void sendRouteWaypoint(int index, double lat, double lon) {
+  void sendRouteBegin(
+    int count, {
+    required double originLat,
+    required double originLon,
+  }) {
     if (!state.isConnected) return;
     sendRaw(
-        "ROUTE_WP,$index,${lat.toStringAsFixed(8)},${lon.toStringAsFixed(8)}");
+      "ROUTE_BEGIN,$count,${originLat.toStringAsFixed(8)},${originLon.toStringAsFixed(8)}",
+    );
+  }
+
+  void sendRouteWaypoint(int index, double xMeters, double yMeters) {
+    if (!state.isConnected) return;
+    sendRaw(
+      "ROUTE_WP,$index,${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
+    );
   }
 
   void sendRouteEnd() {

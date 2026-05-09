@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/gps_navigation.dart';
 import '../../core/gps_perimeter_storage.dart';
+import '../../core/gps_projection.dart';
 import '../../core/wifi_connection.dart';
 
 @visibleForTesting
@@ -1085,12 +1086,19 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
 
   void _startRoverNavigation(List<GpsPerimeterPoint> routePoints) {
     final notifier = ref.read(wifiConnectionProvider.notifier);
+    final origin = routePoints.first;
+    final projection = GpsProjection(refLat: origin.lat, refLon: origin.lon);
     notifier.sendNavStop();
     _sendRoverNavConfig();
-    notifier.sendRouteBegin(routePoints.length);
+    notifier.sendRouteBegin(
+      routePoints.length,
+      originLat: origin.lat,
+      originLon: origin.lon,
+    );
     for (var i = 0; i < routePoints.length; i++) {
       final point = routePoints[i];
-      notifier.sendRouteWaypoint(i, point.lat, point.lon);
+      final local = projection.toLocal(point.lat, point.lon);
+      notifier.sendRouteWaypoint(i, local.dx, local.dy);
     }
     notifier.sendRouteEnd();
     notifier.sendNavStart();

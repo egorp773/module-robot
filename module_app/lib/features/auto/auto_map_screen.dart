@@ -8,7 +8,6 @@ import 'package:go_router/go_router.dart';
 import '../../core/wifi_connection.dart';
 import '../../core/map_storage.dart';
 import '../../core/cleaning_route_planner.dart';
-import '../../core/gps_projection.dart';
 import '../manual/manual_control_screen.dart';
 import '../home/home_screen.dart' show batteryPercentProvider;
 
@@ -212,13 +211,15 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       return;
     }
 
-    final projection = GpsProjection(refLat: map.refLat!, refLon: map.refLon!);
     final ctrl = ref.read(wifiConnectionProvider.notifier);
-    ctrl.sendRouteBegin(_route.length);
+    ctrl.sendRouteBegin(
+      _route.length,
+      originLat: map.refLat!,
+      originLon: map.refLon!,
+    );
     for (var i = 0; i < _route.length; i++) {
       final p = _route[i];
-      final gps = projection.toGps(p);
-      ctrl.sendRouteWaypoint(i, gps.$1, gps.$2);
+      ctrl.sendRouteWaypoint(i, p.dx, p.dy);
     }
     ctrl.sendRouteEnd();
 
@@ -230,7 +231,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     _showNotice(
       ref,
       title: 'Маршрут отправлен',
-      message: 'Draft route sent as GPS waypoints from local origin.',
+      message: 'Draft route sent as local-meter waypoints from GPS origin.',
       kind: NoticeKind.info,
     );
   }
@@ -255,13 +256,13 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       );
       return;
     }
-    const msg = 'NAV_START blocked until GPS route workflow is confirmed.';
-    setState(() => _routeWorkflowError = msg);
+    ref.read(wifiConnectionProvider.notifier).sendNavStart();
+    setState(() => _routeWorkflowError = null);
     _showNotice(
       ref,
-      title: 'Автономка заблокирована',
-      message: msg,
-      kind: NoticeKind.danger,
+      title: 'Автономка запущена',
+      message: 'NAV_START sent to ESP32 rover autopilot.',
+      kind: NoticeKind.info,
     );
   }
 

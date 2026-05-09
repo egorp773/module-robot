@@ -356,6 +356,140 @@ Issues found: exact protocol and safety behavior still need confirmation from co
 
 Status update needed: `IMPLEMENTATION_STATUS.md` lists this as confirmed current MVP based on user-provided state, but detailed PASS tests still need to be recorded.
 
+### 2026-05-09 - RTK/autopilot navigation follow-up static check
+
+Date/time: 2026-05-09, Europe/Moscow timezone
+
+Test: source review and local code hardening before the next rover navigation run
+
+Area: RTK/autopilot route following
+
+Hardware: no hardware used in this step.
+
+Steps:
+
+- Reviewed the latest autopilot notes and current diff.
+- Found that the notes said RTCM buffers were widened, but active `base.cpp` and `rover.cpp` still used `512` byte buffers.
+- Increased RTCM frame/packet buffers to `1200` bytes and made rover drop/report oversize or short UDP reads instead of forwarding a truncated RTCM packet to F9P.
+- Rejected negative `ROUTE_WP` indexes on the rover.
+- Made immediate `NAV,ARRIVED` notifications use the full `NAV,<state>,<wpIdx>,<wpTotal>,<dist>` shape expected by Flutter.
+- Updated `PROTOCOL.md` and `IMPLEMENTATION_STATUS.md` for the local-meter route protocol and unblocked `NAV_START` workflow.
+
+Expected result: code matches the intended local-meter navigation protocol and no RTCM packet is silently truncated before F9P.
+
+Actual result:
+
+- `pio run -e base` passed.
+- `pio run -e rover` passed.
+- `flutter test test/gps_navigation_test.dart test/gps_debug_map_points_test.dart` passed.
+- `flutter analyze --no-fatal-infos lib/core/wifi_connection.dart lib/features/auto/auto_map_screen.dart lib/features/gps/gps_debug_screen.dart lib/core/gps_navigation.dart` passed.
+- Plain `flutter analyze` still reports existing info-level `withOpacity` deprecations in `auto_map_screen.dart`.
+
+Result: CODE PASS / HARDWARE PENDING
+
+Issues found:
+
+- This is not a hardware navigation test.
+- RTK/F9P decoding still must be verified by rover logs showing `f9pMessages` increasing and carrier `float` or `fixed`.
+
+Next action: flash `base` and `rover`, then monitor COM logs before any motor movement.
+
+### 2026-05-09 - RTK/autopilot flash and COM log check
+
+Date/time: 2026-05-09, Europe/Moscow timezone
+
+Test: flash updated RTK base/rover firmware and inspect serial logs
+
+Area: RTK transport, F9P decode proof, rover navigation readiness
+
+Hardware:
+
+- Base on `COM4`.
+- Rover on `COM6`.
+- Wi-Fi `Xiaomi_6A92`.
+
+Steps:
+
+- Flashed base: `pio run -e base -t upload --upload-port COM4`.
+- Flashed rover: `pio run -e rover -t upload --upload-port COM6`.
+- Captured short and longer monitor logs under `test_results/2026-05-09_navigation_followup/`.
+- Added rover GPS fallback/watchdog: GGA fallback remains enabled and NMEA is parsed when UBX NAV-PVT is stale.
+- Added base RTCM parser resync after CRC fail and flashed base again.
+
+Observed logs:
+
+- Base connects at `192.168.31.207`.
+- Rover connects at `192.168.31.222`.
+- Rover receives RTCM UDP with relay errors `read=0 write=0 oversize=0`.
+- Rover F9P now confirms internal RTCM decode: `F9P decoded` increases and `crcFail=0`.
+- Rover IMU is fresh.
+- Rover GPS fallback remains fresh through NMEA GGA when UBX NAV-PVT is absent/stale.
+
+Remaining problem:
+
+- Rover `Carrier` remains `0 (NONE)`.
+- Rover quality remains `DEGRADED`; no motor navigation should be started yet.
+- Base still outputs/parses very sparse MSM correction frames: mostly `1005` and `1230`, with rare `1074/1084`.
+- Base RTCM parser still sees many CRC-fail candidates in the mixed UBX/RTCM stream, though forwarded packets have no UDP errors.
+
+Result: PARTIAL PASS
+
+Conclusion:
+
+- The old physical/software blocker `RTCM Fresh but F9P decoded=0` is fixed.
+- The current blocker is RTK correction quality from the base: the rover F9P decodes RTCM, but does not receive enough usable observation corrections to enter RTK float/fixed.
+
+Next action:
+
+- Do not start autonomous motors.
+- Fix base RTCM output/configuration so MSM messages (`1074`, `1084`, and ideally other enabled constellations) repeat continuously after survey-in valid.
+- Then re-test until rover shows `carrier=float` or `carrier=fixed`.
+
+### 2026-05-09 - RTK base raw RTCM stream after survey-in
+
+Date/time: 2026-05-09, Europe/Moscow timezone
+
+Test: flash base raw RTCM forwarding change and inspect base/rover serial logs
+
+Area: RTK base correction stream, rover carrier solution
+
+Hardware:
+
+- Base on `COM4`.
+- Rover on `COM6`.
+- Wi-Fi `Xiaomi_6A92`.
+
+Steps:
+
+- Changed base firmware so after `svinValid=1` and UART `RTCM3`-only output, the ESP32 forwards raw RTCM bytes to rover in UDP chunks instead of gating forwarding on the ESP32 RTCM frame parser.
+- Built base: `pio run -e base`.
+- Flashed base: `pio run -e base -t upload --upload-port COM4`.
+- Captured 150 seconds of paired logs:
+  - `test_results/2026-05-09_navigation_followup/base_COM4_after_raw_forward.log`
+  - `test_results/2026-05-09_navigation_followup/rover_COM6_after_raw_forward.log`
+- Reflashed the same transport with parse-only RTCM type counters in raw mode and captured a second paired log:
+  - `test_results/2026-05-09_navigation_followup/base_COM4_after_raw_forward_typecount.log`
+  - `test_results/2026-05-09_navigation_followup/rover_COM6_after_raw_forward_typecount.log`
+
+Observed logs:
+
+- Base reached `svinValid=1` at `dur=60s`, final repeat log `svinAcc=1.292m`.
+- Base printed `BASE: RTCM raw forwarding enabled`.
+- Base raw stream stayed continuous: final repeat log `rawPkts=1847`, `rawBytes=145626`, `udpErr=0`, `rtcmAge=15ms`.
+- Base RTCM type counters increased continuously after raw mode: final repeat log `t1074=59`, `t1084=59`, `t1094=59`, `t1124=59`.
+- Rover switched from `Carrier: 0 (NONE)` to `Carrier: 2 (FIXED)` immediately after raw forwarding enabled.
+- Rover final status: `Fix: 3`, `Carrier: 2 (FIXED)`, `hAcc: 14 mm`, `Quality: RTK_FIXED`.
+- Rover RTCM relay remained clean: `read=0 write=0 oversize=0`.
+- Rover F9P decode continued increasing with no RTCM CRC failures: repeat log reached `F9P decoded: msgs=1297 crcFail=0`.
+
+Result: PASS for RTK correction delivery and rover carrier lock on the bench.
+
+Conclusion:
+
+- The previous blocker `rover carrier none` is resolved in this hardware setup.
+- The root issue was the base ESP32 RTCM parser dropping/corrupting useful long correction traffic before forwarding. Raw stream forwarding after RTCM-only UART output fixes it.
+- Autonomous motor navigation is still not validated by this test. The next movement test must start as a controlled dry run with RTK fixed and attachment disabled.
+
 ## Required future tests
 
 - Firmware build test.
