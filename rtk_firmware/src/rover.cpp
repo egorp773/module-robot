@@ -97,10 +97,31 @@ static constexpr uint32_t STATUS_MS = 2000;
 static constexpr uint32_t TELEMETRY_MS = 200;
 static constexpr uint32_t MANUAL_CMD_TIMEOUT_MS = 400;
 
-// Motor
-static constexpr int16_t MAX_MOTOR_CMD = 70;
-static constexpr int16_t MOTOR_RAMP_STEP = 2;
-static constexpr int16_t HOVER_MAX_CMD = 300;
+// Motor control - same as sound.ino
+static constexpr int MAX_SPEED_PERCENT = 70;     // -70..70 (after input divide)
+static constexpr int16_t HOVER_MAX_CMD = 300;    // hoverboard command scale
+static constexpr int INPUT_DIV = 2;             // app values / 2 (calmer)
+static constexpr uint32_t HOVER_SEND_MS = 20;
+static constexpr uint32_t CMD_TIMEOUT_MS = 400;
+
+// ramp (percent domain)
+static constexpr uint32_t RAMP_UPDATE_MS = 20;
+static constexpr int RAMP_STEP_UP_PER_TICK = 1;
+static constexpr int RAMP_STEP_DOWN_PER_TICK = 1;
+
+// extra smoothing in hoverboard command domain
+static constexpr int16_t SLEW_SPEED_PER_SEND = 4;
+static constexpr int16_t SLEW_STEER_PER_SEND = 6;
+
+// Motor state
+int16_t g_cmdSpeed = 0;
+int16_t g_cmdSteer = 0;
+volatile int16_t g_targetLeft = 0, g_targetRight = 0;
+int16_t g_curLeft = 0, g_curRight = 0;
+volatile uint32_t g_lastCmdMs = 0;
+uint32_t g_lastSendMs = 0;
+uint32_t g_lastRampMs = 0;
+bool g_isFailSafeStopping = false;
 
 static Preferences g_prefs;
 
@@ -745,16 +766,13 @@ static float g_navTurnScale = 1.0f;
 static bool g_invertForward = false;
 static bool g_invertSteering = false;
 
-// Motor outputs
-static int16_t g_motorTargetL = 0, g_motorTargetR = 0;
-static int16_t g_motorCurrentL = 0, g_motorCurrentR = 0;
-static int16_t g_hoverCmdSpeed = 0, g_hoverCmdSteer = 0;
-static uint32_t g_lastManualCmdMs = 0;
-static bool g_manualActive = false;
+// Motor feedback
 static bool g_haveMotorFeedback = false;
 static int16_t g_motorFbCmd1 = 0, g_motorFbCmd2 = 0;
 static int16_t g_motorSpeedR = 0, g_motorSpeedL = 0;
 static int16_t g_motorBatVoltage = 0, g_motorBoardTemp = 0;
+static uint32_t g_lastManualCmdMs = 0;
+static bool g_manualActive = false;
 
 struct __attribute__((packed)) SerialCommand {
   uint16_t start;
@@ -969,13 +987,16 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   if (cmd == "PING") { client->text("PONG"); return; }
   // FREE: stop sending motor commands (release hoverboard from lock)
   if (cmd == "FREE") {
-    g_motorTargetL = g_motorTargetR = 0;
-    g_motorCurrentL = g_motorCurrentR = 0;
-    g_hoverCmdSpeed = g_hoverCmdSteer = 0;
+    g_targetLeft = 0;
+    g_targetRight = 0;
+    g_curLeft = 0;
+    g_curRight = 0;
+    g_cmdSpeed = 0;
+    g_cmdSteer = 0;
     g_navState = STATE_IDLE;
     g_navReason = "idle";
     g_manualActive = false;
-    g_lastManualCmdMs = 0;
+    g_lastCmdMs = 0;
     client->text("OK FREE");
     Serial.println("MOTOR: free/idle");
     return;
@@ -985,13 +1006,15 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     if (comma1 > 2) {
       int left = cmd.substring(2, comma1).toInt();
       int right = cmd.substring(comma1 + 1).toInt();
-      left = constrain(left, -MAX_MOTOR_CMD, MAX_MOTOR_CMD);
-      right = constrain(right, -MAX_MOTOR_CMD, MAX_MOTOR_CMD);
+      // Same as sound.ino: divide by INPUT_DIV
+      left = left / INPUT_DIV;
+      right = right / INPUT_DIV;
       g_navState = STATE_IDLE;
       g_navReason = "manual";
-      g_motorTargetL = (int16_t)left;
-      g_motorTargetR = (int16_t)right;
-      g_lastManualCmdMs = millis();
+      g_targetLeft = constrain(left, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+      g_targetRight = constrain(right, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+      g_lastCmdMs = millis();
+      g_isFailSafeStopping = false;
       g_manualActive = true;
       client->text("OK");
       return;
@@ -1002,8 +1025,9 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   if (cmd == "STOP" || cmd == "NAV_STOP") {
     g_navState = STATE_IDLE;
     g_navReason = "stopped";
-    g_motorTargetL = g_motorTargetR = 0;
-    g_lastManualCmdMs = 0;
+    g_targetLeft = 0;
+    g_targetRight = 0;
+    g_lastCmdMs = 0;
     g_manualActive = false;
     client->text("OK");
     return;
@@ -1011,7 +1035,8 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   if (cmd == "PAUSE" || cmd == "NAV_PAUSE") {
     g_navState = STATE_PAUSED;
     g_navReason = "paused";
-    g_motorTargetL = g_motorTargetR = 0;
+    g_targetLeft = 0;
+    g_targetRight = 0;
     g_manualActive = false;
     client->text("OK");
     return;
@@ -1023,6 +1048,16 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   }
   if (cmd == "START" || cmd == "NAV_START") {
     if (routeReady() && g_routeIndex < g_routeCount) {
+      // Auto-calibrate IMU to point at first waypoint
+      if (g_imuFresh && g_routeCount > g_routeIndex) {
+        float targetBearing = atan2f(g_route[g_routeIndex].pos.x - g_est.pos.x,
+                                     g_route[g_routeIndex].pos.y - g_est.pos.y) * 180.0f / PI;
+        if (targetBearing < 0) targetBearing += 360.0f;
+        g_imuCalibrationOffset = normalizeAngle(targetBearing - g_imuYaw);
+        saveNavPrefs();
+        Serial.printf("IMU auto-calib: yaw=%.1f target=%.1f offset=%.1f\n",
+          g_imuYaw, targetBearing, g_imuCalibrationOffset);
+      }
       g_navState = STATE_RUNNING;
       g_navReason = "started";
       g_manualActive = false;
@@ -1171,6 +1206,17 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         g_routeReceived[1] = true;
         g_route[0].pos = g_est.pos;  // Current position
         g_route[1].pos = g_singleTarget;  // Target
+
+        // Auto-calibrate IMU: set offset so current heading = bearing to target
+        if (g_imuFresh) {
+          float targetBearing = atan2f(g_singleTarget.x - g_est.pos.x, g_singleTarget.y - g_est.pos.y) * 180.0f / PI;
+          if (targetBearing < 0) targetBearing += 360.0f;
+          g_imuCalibrationOffset = normalizeAngle(targetBearing - g_imuYaw);
+          saveNavPrefs();
+          Serial.printf("IMU auto-calib: yaw=%.1f target=%.1f offset=%.1f\n",
+            g_imuYaw, targetBearing, g_imuCalibrationOffset);
+        }
+
         g_navState = STATE_RUNNING;
         g_navReason = "go_to";
         g_manualActive = false;
@@ -1335,7 +1381,7 @@ static void broadcastTelemetry() {
   // Motor status
   snprintf(msg, sizeof(msg),
     "MOTOR,%d,%d,%u,%d,%d,%d,%d",
-    g_motorCurrentL, g_motorCurrentR,
+    g_curLeft, g_curRight,
     g_haveMotorFeedback ? 1 : 0,
     g_motorSpeedL, g_motorSpeedR,
     g_motorBatVoltage, g_motorBoardTemp
@@ -1348,16 +1394,14 @@ static void broadcastTelemetry() {
 static void navUpdate() {
   if (g_navState != STATE_RUNNING) {
     if (g_manualActive) return;
-    // Keep motors alive with minimal signal to prevent hoverboard beeping
-    // Without this, hoverboard enters error state and beeps when motors are at 0
-    g_motorTargetL = g_motorTargetR = 1;  // Minimum alive signal
+    // Navigation not active - motors controlled by manual or idle
     return;
   }
 
   if (g_routeIndex >= g_routeCount) {
     g_navState = STATE_ARRIVED;
     g_navReason = "route_complete";
-    g_motorTargetL = g_motorTargetR = 0;
+    g_targetLeft = g_targetRight = 0;
     char navMsg[48];
     snprintf(navMsg, sizeof(navMsg), "NAV,ARRIVED,%u,%u,0.00", g_routeIndex, g_routeCount);
     ws.textAll(navMsg);
@@ -1366,7 +1410,7 @@ static void navUpdate() {
 
   // Check quality - don't move if quality is bad
   if (g_est.quality == QUAL_NAV_ERROR || g_est.quality == QUAL_GPS_LOST_WAIT) {
-    g_motorTargetL = g_motorTargetR = 0;
+    g_targetLeft = g_targetRight = 0;
     g_navReason = "no_fix";
     return;
   }
@@ -1376,7 +1420,7 @@ static void navUpdate() {
     if (hypotf(only.x - g_est.pos.x, only.y - g_est.pos.y) < ARRIVAL_DIST) {
       g_navState = STATE_ARRIVED;
       g_navReason = "route_complete";
-      g_motorTargetL = g_motorTargetR = 0;
+      g_targetLeft = g_targetRight = 0;
       char navMsg[48];
       snprintf(navMsg, sizeof(navMsg), "NAV,ARRIVED,%u,%u,0.00", g_routeIndex, g_routeCount);
       ws.textAll(navMsg);
@@ -1443,7 +1487,7 @@ static void navUpdate() {
   if (g_routeCount > 1 && remainingOnPath < ARRIVAL_DIST && bestSeg + 1 >= g_routeCount - 1) {
     g_navState = STATE_ARRIVED;
     g_navReason = "route_complete";
-    g_motorTargetL = g_motorTargetR = 0;
+    g_targetLeft = g_targetRight = 0;
     char navMsg[48];
     snprintf(navMsg, sizeof(navMsg), "NAV,ARRIVED,%u,%u,0.00", g_routeIndex, g_routeCount);
     ws.textAll(navMsg);
@@ -1493,10 +1537,10 @@ static void navUpdate() {
   if (remainingOnPath < 1.0f) speed *= (0.35f + remainingOnPath * 0.65f);
   if (g_est.quality == QUAL_GPS_HOLD_SHORT && fabsf(headingError) > 15) speed = 0.0f;
 
-  float forwardCmd = (speed / MAX_SPEED) * MAX_MOTOR_CMD * g_navForwardScale;
+  float forwardCmd = (speed / MAX_SPEED) * MAX_SPEED_PERCENT * g_navForwardScale;
   if (fabsf(headingError) > 70.0f) forwardCmd = 0.0f;
   float turnCmd = (K_HEADING * headingError + K_CROSSTRACK * g_crossTrackError) * g_navTurnScale;
-  turnCmd = constrain(turnCmd, -MAX_MOTOR_CMD * 0.65f, MAX_MOTOR_CMD * 0.65f);
+  turnCmd = constrain(turnCmd, -MAX_SPEED_PERCENT * 0.65f, MAX_SPEED_PERCENT * 0.65f);
 
   if (g_invertForward) forwardCmd = -forwardCmd;
   if (g_invertSteering) turnCmd = -turnCmd;
@@ -1504,20 +1548,68 @@ static void navUpdate() {
   int16_t left = (int16_t)(forwardCmd - turnCmd);
   int16_t right = (int16_t)(forwardCmd + turnCmd);
 
-  g_motorTargetL = constrain(left, -MAX_MOTOR_CMD, MAX_MOTOR_CMD);
-  g_motorTargetR = constrain(right, -MAX_MOTOR_CMD, MAX_MOTOR_CMD);
+  // Same as sound.ino: percent domain
+  g_targetLeft = constrain(left, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  g_targetRight = constrain(right, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   g_navReason = qualityString(g_est.quality);
 }
 
-static void motorsRamp() {
-  g_motorCurrentL = stepToward(g_motorCurrentL, g_motorTargetL, MOTOR_RAMP_STEP);
-  g_motorCurrentR = stepToward(g_motorCurrentR, g_motorTargetR, MOTOR_RAMP_STEP);
+// ============== MOTOR CONTROL (same as sound.ino) ==============
+
+static inline int16_t limitForAxis(int16_t cur, int16_t target, int ticks) {
+  int absCur = abs((int)cur);
+  int absTgt = abs((int)target);
+  bool up = (absTgt > absCur);
+  int step = up ? RAMP_STEP_UP_PER_TICK : RAMP_STEP_DOWN_PER_TICK;
+  int maxDelta = ticks * step;
+  if (maxDelta < 1) maxDelta = 1;
+  return maxDelta;
+}
+
+static void updateRamp() {
+  uint32_t now = millis();
+  uint32_t dt = now - g_lastRampMs;
+  if (dt < RAMP_UPDATE_MS) return;
+
+  uint32_t ticks = dt / RAMP_UPDATE_MS;
+  g_lastRampMs += ticks * RAMP_UPDATE_MS;
+
+  int16_t tL = constrain(g_targetLeft, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  int16_t tR = constrain(g_targetRight, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+
+  int limL = limitForAxis(g_curLeft, tL, (int)ticks);
+  int limR = limitForAxis(g_curRight, tR, (int)ticks);
+
+  g_curLeft = constrain(stepToward(g_curLeft, tL, limL), -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  g_curRight = constrain(stepToward(g_curRight, tR, limR), -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+}
+
+// left/right (-70..70) -> speed/steer -> SLEW -> send
+static void drive(int16_t leftPct, int16_t rightPct) {
+  leftPct = constrain(leftPct, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  rightPct = constrain(rightPct, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+
+  int32_t speedT = (int32_t)(leftPct + rightPct) * (int32_t)HOVER_MAX_CMD / (2 * MAX_SPEED_PERCENT);
+  int32_t steerT = (int32_t)(rightPct - leftPct) * (int32_t)HOVER_MAX_CMD / (2 * MAX_SPEED_PERCENT);
+
+  int16_t spT = constrain(speedT, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+  int16_t stT = constrain(steerT, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+
+  g_cmdSpeed = stepToward(g_cmdSpeed, spT, SLEW_SPEED_PER_SEND);
+  g_cmdSteer = stepToward(g_cmdSteer, stT, SLEW_STEER_PER_SEND);
+
+  SerialCommand cmd;
+  cmd.start = (uint16_t)0xABCD;
+  cmd.steer = g_cmdSteer;
+  cmd.speed = g_cmdSpeed;
+  cmd.checksum = (uint16_t)(cmd.start ^ cmd.steer ^ cmd.speed);
+  MotorSerial.write((uint8_t*)&cmd, sizeof(cmd));
 }
 
 static void motorsSend() {
   static uint32_t lastSend = 0;
   uint32_t now = millis();
-  if (now - lastSend < MOTOR_SEND_MS) return;
+  if (now - lastSend < HOVER_SEND_MS) return;
   lastSend = now;
 
   static bool init = false;
@@ -1527,20 +1619,7 @@ static void motorsSend() {
     Serial.println("MOTOR: UART2 initialized");
   }
 
-  int16_t speed = (g_motorCurrentL + g_motorCurrentR) / 2;
-  int16_t steer = (g_motorCurrentR - g_motorCurrentL) / 2;
-
-  int16_t targetSpeed = constrain(speed * HOVER_MAX_CMD / 100, -HOVER_MAX_CMD, HOVER_MAX_CMD);
-  int16_t targetSteer = constrain(steer * HOVER_MAX_CMD / 100, -HOVER_MAX_CMD, HOVER_MAX_CMD);
-  g_hoverCmdSpeed = stepToward(g_hoverCmdSpeed, targetSpeed, 4);
-  g_hoverCmdSteer = stepToward(g_hoverCmdSteer, targetSteer, 6);
-
-  SerialCommand cmd;
-  cmd.start = 0xABCD;
-  cmd.steer = g_hoverCmdSteer;
-  cmd.speed = g_hoverCmdSpeed;
-  cmd.checksum = (uint16_t)(cmd.start ^ cmd.steer ^ cmd.speed);
-  MotorSerial.write((uint8_t*)&cmd, sizeof(cmd));
+  drive(g_curLeft, g_curRight);
 }
 
 static void motorsReceiveFeedback() {
@@ -1653,8 +1732,8 @@ static void printStatus() {
   Serial.printf("  State: %s, Reason: %s\n", stateString(g_navState), g_navReason);
   Serial.printf("  Route: %u/%u, XTE: %.2f m, headingErr: %.1f deg, remain: %.2f m\n",
     g_routeIndex, g_routeCount, g_crossTrackError, g_headingError, g_distToRouteEnd);
-  Serial.printf("  Motor: L=%d R=%d (target)\n", g_motorTargetL, g_motorTargetR);
-  Serial.printf("        L=%d R=%d (current)\n", g_motorCurrentL, g_motorCurrentR);
+  Serial.printf("  Motor: L=%d R=%d (target)\n", g_targetLeft, g_targetRight);
+  Serial.printf("        L=%d R=%d (current)\n", g_curLeft, g_curRight);
   Serial.printf("  Motor FB: fresh=%u cmd=(%d,%d) speed=(%d,%d) bat=%d temp=%d\n",
     g_haveMotorFeedback ? 1 : 0,
     g_motorFbCmd1, g_motorFbCmd2,
@@ -1771,17 +1850,19 @@ void loop() {
     navUpdate();
   }
 
+  // Failsafe -> smooth stop (same as sound.ino)
+  if (now - g_lastCmdMs > CMD_TIMEOUT_MS) {
+    if (!g_isFailSafeStopping && (g_targetLeft != 0 || g_targetRight != 0 || g_curLeft != 0 || g_curRight != 0)) {
+      g_isFailSafeStopping = true;
+      Serial.println("FAILSAFE: smooth stop");
+    }
+  }
+
+  // Motor control (same as sound.ino)
   static uint32_t lastMotorUpdate = 0;
   if (now - lastMotorUpdate >= MOTOR_SEND_MS) {
     lastMotorUpdate = now;
-    if (g_lastManualCmdMs > 0 && now - g_lastManualCmdMs > MANUAL_CMD_TIMEOUT_MS) {
-      g_motorTargetL = 0;
-      g_motorTargetR = 0;
-      g_lastManualCmdMs = 0;
-      g_manualActive = false;
-      if (g_navState == STATE_IDLE) g_navReason = "manual_timeout";
-    }
-    motorsRamp();
+    updateRamp();
     motorsSend();
   }
   motorsReceiveFeedback();
