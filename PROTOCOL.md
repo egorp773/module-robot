@@ -1,10 +1,10 @@
 # Protocol
 
-This file describes the WebSocket protocol between `module_app/` and `firmware/`.
+This file describes the WebSocket protocol between `module_app/` and the active RTK ESP32 firmware in `rtk_firmware/`.
 
-Status: code-confirmed draft as of 2026-04-27.
+Status: code-confirmed draft as of 2026-05-09.
 The active protocol is line-based text, not JSON.
-Keep this file synchronized with `firmware/websocket.cpp`, `firmware/telemetry.cpp`, and `module_app/lib/core/wifi_connection.dart`.
+Keep this file synchronized with `rtk_firmware/src/rover.cpp`, `rtk_firmware/src/base.cpp`, and `module_app/lib/core/wifi_connection.dart`.
 
 ## Transport
 
@@ -13,15 +13,16 @@ Keep this file synchronized with `firmware/websocket.cpp`, `firmware/telemetry.c
 - ESP32 also exposes HTTP `GET /ping` returning `OK`.
 - Encoding: UTF-8 text lines.
 - Message separator: one WebSocket text message per command.
-- Maximum inbound message length: `MAX_WS_MSG` from `firmware/config.h`, currently `256`.
+- Maximum inbound message length on the rover is a 255-byte text payload (`char msg[256]`).
 
 ## Protocol rules
 
 - Stop must be accepted at any time.
 - Unknown commands must not move motors.
-- Manual drive commands are refreshed by the app while the user is driving.
-- ESP32 has a motor command timeout (`CMD_TIMEOUT_MS`, currently `400`) that zeros motor targets if movement commands stop.
-- ESP32 stops motors and calls `nav_stop()` on WebSocket disconnect.
+- Manual drive commands are refreshed by the app only while the user is driving manually.
+- Autonomous navigation motor commands are computed on the rover, not in the app.
+- ESP32 has motor/nav failsafes that zero motor targets if movement commands stop or NAV is stopped.
+- ESP32 stops motors and stops NAV on WebSocket disconnect.
 - Attachment and mount controls are explicit commands.
 - This protocol is still not hardware-verified after the firmware build fix.
 
@@ -147,7 +148,7 @@ OK SOUND
 ERR SOUND_RANGE
 ```
 
-### Route upload
+### Route Upload
 
 RTK/autopilot route commands use local-meter coordinates. The app sends the
 GPS origin once, then sends each waypoint as local `x/y` meters relative to
@@ -155,7 +156,8 @@ that origin.
 
 Preferred current flow is robot-side planning: the app sends a cleaning zone
 polygon and the rover builds the snake route onboard. Direct waypoint upload is
-kept as a lower-level fallback.
+kept only as a lower-level fallback. The app must not compute autonomous motor
+commands.
 
 ### Robot-side area planning
 
@@ -196,6 +198,9 @@ Rules:
 ```text
 ROUTE_BEGIN,<count>,<originLat>,<originLon>
 ```
+
+`ROUTE_*` is a rover firmware diagnostic/fallback protocol. The Flutter app
+does not send these commands in the normal autonomous flow.
 
 ```text
 ROUTE_WP,<index>,<x_m>,<y_m>

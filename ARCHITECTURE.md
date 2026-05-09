@@ -5,7 +5,7 @@
 The project is an MVP modular robot cleaner/snow-cleaner.
 It has three major software areas:
 
-- `firmware/`: active modular ESP32 firmware.
+- `rtk_firmware/`: active RTK ESP32 firmware for rover/base.
 - `module_app/`: Flutter app for control, monitoring, mapping, and future route workflows.
 - `sound/`: legacy monolithic firmware reference only.
 
@@ -22,7 +22,7 @@ Flutter app (`module_app/`)
   |
   | Wi-Fi / WebSocket
   v
-ESP32 firmware (`firmware/`)
+ESP32 RTK firmware (`rtk_firmware/`)
   |
   +-- motor driver -> drive motors
   +-- relay/output -> attachment on/off
@@ -31,9 +31,10 @@ ESP32 firmware (`firmware/`)
   +-- safety logic -> stop/failsafe decisions
 ```
 
-## Active firmware
+## Active Firmware
 
-`firmware/` is the target ESP32 firmware.
+`rtk_firmware/` is the only active ESP32 firmware. The old root `firmware/`
+project has been removed to avoid conflicting navigation and coordinate stacks.
 It should contain modular responsibilities:
 
 - config constants,

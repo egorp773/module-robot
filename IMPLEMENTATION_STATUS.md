@@ -61,7 +61,7 @@ Limits:
 
 ### Modular ESP32 firmware
 
-Status: present under `firmware/`, but build needs repair.
+Status: active under `rtk_firmware/`.
 
 Known areas:
 
@@ -73,8 +73,9 @@ Known areas:
 
 Current build status:
 
-- Builds with `pio run`.
-- Build output is configured on `D:/rn-cache/module_robot_pio_build`.
+- Build with `cd rtk_firmware && pio run -e rover`.
+- Build base with `cd rtk_firmware && pio run -e base`.
+- The old root `firmware/` project and root `platformio.ini` have been removed to avoid two navigation stacks.
 
 Implemented but unverified safety behavior:
 
@@ -113,6 +114,8 @@ Recent code-level hardening:
 - `NAV_START` from the auto map screen now sends the command after a route has been uploaded.
 - Route upload now uses `ROUTE_BEGIN,count,originLat,originLon` plus local-meter `ROUTE_WP,index,x,y`.
 - Verified changed auto map file with `dart analyze module_app/lib/features/auto/auto_map_screen.dart`; no errors, existing/deprecated style info remains.
+- GPS debug screen no longer computes autonomous motor commands or stores a local IMU offset. It sends `AREA_BEGIN/AREA_PT/AREA_END`, `NAV_START`, `NAV_STOP`, `CAL_IMU`, and `IMU_RESET`; rover firmware owns route following, IMU offset, and motor output.
+- Removed `module_app/lib/core/gps_navigation.dart`; the app keeps only display-only GPS geometry in `gps_display_math.dart`.
 
 ### Route generation
 
@@ -159,10 +162,8 @@ Limits:
 
 ### Firmware build issues - resolved for compile
 
-- `g_targetLeft` and `g_targetRight` ownership is now in `motors.cpp`.
-- `MAX_WS_MSG` is now taken from `config.h`.
-- `motors_request_smooth_stop`, `motors_check_failsafe`, and `g_lastCmdMs` now have compiled definitions.
-- PlatformIO project config exists in `platformio.ini`.
+- PlatformIO project config exists in `rtk_firmware/platformio.ini`.
+- The active rover/base firmware is `rtk_firmware/`; the old root `firmware/` has been removed.
 
 Impact:
 

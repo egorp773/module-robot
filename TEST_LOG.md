@@ -42,7 +42,7 @@ Test: firmware build
 
 Area: firmware
 
-Code state: local working tree after adding `platformio.ini` and fixing known build blockers.
+Code state: local working tree after adding `rtk_firmware/platformio.ini` and fixing known build blockers.
 
 Hardware: no hardware used.
 
@@ -61,7 +61,7 @@ Actual result: build succeeded, `firmware.bin` was created under `.pio/build/esp
 
 Follow-up verification on 2026-04-27:
 
-- `platformio.ini` was updated to place build output in `D:/rn-cache/module_robot_pio_build` because `C:` ran out of space during later builds.
+- `rtk_firmware/platformio.ini` was updated to place build output in `D:/rn-cache/module_robot_pio_build` because `C:` ran out of space during later builds.
 - `pio run` succeeded again with output under `D:/rn-cache/module_robot_pio_build/esp32dev/firmware.bin`.
 
 Result: PASS
@@ -529,6 +529,37 @@ Conclusion:
 
 - The three-beep/no-wheel-response symptom was consistent with the RTK rover firmware sending an invalid hoverboard frame. The firmware now uses the old working binary frame format and the controller replies.
 - Movement itself still needs a controlled manual test: start with wheels lifted or tracks clear, send a tiny manual command, then STOP.
+
+### 2026-05-09 - Navigation ownership cleanup
+
+Date/time: 2026-05-09, Europe/Moscow timezone
+
+Test: remove duplicated app-side autonomous navigation and old firmware tree
+
+Area: app/firmware architecture
+
+Steps:
+
+- Removed `module_app/lib/core/gps_navigation.dart` and the old app tests for app-side motor command mapping.
+- Added `module_app/lib/core/gps_display_math.dart` for monitor-only distance, bearing, heading error, and local x/y display.
+- Updated GPS debug navigation panel so the app sends `AREA_BEGIN` / `AREA_PT` / `AREA_END`, `NAV_START`, `NAV_STOP`, `CAL_IMU`, and `IMU_RESET`; rover firmware owns route following, IMU offset, and motor output.
+- Removed app-side direct `ROUTE_*` helpers from `wifi_connection.dart`; `ROUTE_*` remains only a rover firmware fallback/parser path.
+- Removed old root `firmware/` and root `platformio.ini`; active firmware is now only `rtk_firmware/`.
+- Updated protocol/status/architecture docs to point at `rtk_firmware/`.
+
+Verification:
+
+- `flutter analyze --no-fatal-infos lib/core/gps_display_math.dart lib/core/wifi_connection.dart lib/features/gps/gps_debug_screen.dart lib/features/auto/auto_map_screen.dart`: PASS, only existing `withOpacity` infos in `auto_map_screen.dart`.
+- `flutter test test/gps_display_math_test.dart test/gps_debug_map_points_test.dart test/gps_perimeter_storage_test.dart`: PASS.
+- `pio run -e rover`: PASS.
+- `pio run -e base`: PASS.
+
+Result: PASS for code-level ownership cleanup.
+
+Conclusion:
+
+- The app no longer computes autonomous motor commands or stores local IMU calibration offset.
+- Navigation authority is now single-owner: `rtk_firmware/src/rover.cpp`.
 
 ## Required future tests
 

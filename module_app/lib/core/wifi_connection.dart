@@ -491,9 +491,8 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         state.rtcmF9pAgeMs == null ? '-' : '${state.rtcmF9pAgeMs}ms';
     final rtcmSource = state.rtcmSource ?? '-';
     final rtcmType = state.rtcmLastType?.toString() ?? '-';
-    final imuYaw = state.imuYaw == null
-        ? '-'
-        : '${state.imuYaw!.toStringAsFixed(1)}deg';
+    final imuYaw =
+        state.imuYaw == null ? '-' : '${state.imuYaw!.toStringAsFixed(1)}deg';
     final imuAge = state.imuAgeMs == null ? '-' : '${state.imuAgeMs}ms';
     final imuFresh =
         state.imuFresh == null ? '-' : (state.imuFresh! ? '1' : '0');
@@ -1072,29 +1071,6 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   }
 
   /// Route upload commands
-  void sendRouteBegin(
-    int count, {
-    required double originLat,
-    required double originLon,
-  }) {
-    if (!state.isConnected) return;
-    sendRaw(
-      "ROUTE_BEGIN,$count,${originLat.toStringAsFixed(8)},${originLon.toStringAsFixed(8)}",
-    );
-  }
-
-  void sendRouteWaypoint(int index, double xMeters, double yMeters) {
-    if (!state.isConnected) return;
-    sendRaw(
-      "ROUTE_WP,$index,${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
-    );
-  }
-
-  void sendRouteEnd() {
-    if (!state.isConnected) return;
-    sendRaw("ROUTE_END");
-  }
-
   void sendAreaBegin(
     int count, {
     required double originLat,
@@ -1121,22 +1097,6 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   }
 
   /// Navigation commands
-  void sendNavConfig({
-    required int forwardPercent,
-    required int turnPercent,
-    required bool invertForward,
-    required bool invertSteering,
-    required double headingOffsetDegrees,
-    required bool invertYaw,
-  }) {
-    if (!state.isConnected) return;
-    sendRaw(
-      "NAV_CFG,$forwardPercent,$turnPercent,${invertForward ? 1 : 0},"
-      "${invertSteering ? 1 : 0},${headingOffsetDegrees.toStringAsFixed(2)},"
-      "${invertYaw ? 1 : 0}",
-    );
-  }
-
   void sendNavStart() {
     if (!state.isConnected) return;
     sendRaw("NAV_START");

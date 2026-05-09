@@ -13,14 +13,14 @@
 - **Реле** - управление насадкой и креплением
 
 ### Софт
-- **ESP32 прошивка** (`firmware/`) - модульная архитектура с GPS, IMU, PID-навигацией
+- **ESP32 прошивка** (`rtk_firmware/`) - модульная архитектура с GPS, IMU, PID-навигацией
 - **Flutter приложение** (`module_app/`) - управление, запись территории, автономный режим
 
 ## Структура проекта
 
 ```
 robot/module/
-├── firmware/              # ESP32 прошивка (Arduino)
+├── rtk_firmware/              # ESP32 прошивка (Arduino)
 │   ├── firmware.ino       # Главный файл
 │   ├── config.h           # Все константы и пины
 │   ├── gps.cpp/h          # UBX-NAV-PVT парсер, RTCM relay
@@ -73,29 +73,14 @@ robot/module/
   - `Adafruit_BNO08x`
   - `LittleFS`
 
-**Шаги:**
-1. Скопируйте `sound/data/` в `firmware/data/`
-2. Загрузите файловую систему: Tools → ESP32 Sketch Data Upload
-3. Откройте `firmware/firmware.ino` в Arduino IDE
-4. Выберите плату: ESP32 Dev Module
-5. Настройки:
-   - Upload Speed: 921600
-   - Flash Size: 4MB (3MB APP / 1MB SPIFFS)
-   - Partition Scheme: Default 4MB with spiffs
-6. Загрузите прошивку
-
-**Проверка:**
+**Active firmware build:**
 ```bash
-# Подключитесь к Serial Monitor (115200 baud)
-# Должны увидеть:
-=== Robot Firmware v2.0 ===
-GPS: UART1 38400 baud, RX=4 TX=5
-IMU: BNO085 found
-WiFi AP: 192.168.4.1
-=== READY ===
+cd rtk_firmware
+pio run -e rover
+pio run -e base
 ```
 
-### 2. Flutter приложение
+The old root `firmware/` Arduino sketch has been removed. Use `rtk_firmware/src/rover.cpp` and `rtk_firmware/src/base.cpp` only.
 
 **Требования:**
 - Flutter SDK 3.3+
