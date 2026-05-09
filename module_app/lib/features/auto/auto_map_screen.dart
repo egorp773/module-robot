@@ -211,17 +211,43 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       return;
     }
 
+    if (map.zones.isEmpty || map.zones.first.points.length < 3) {
+      const msg = 'No valid cleaning zone to send to robot.';
+      setState(() => _routeWorkflowError = msg);
+      _showNotice(
+        ref,
+        title: 'Zone is not ready',
+        message: msg,
+        kind: NoticeKind.danger,
+      );
+      return;
+    }
+
+    final zone = map.zones.first.points;
+    if (zone.length > 32) {
+      const msg = 'Zone has too many points for rover planner. Use 32 or fewer.';
+      setState(() => _routeWorkflowError = msg);
+      _showNotice(
+        ref,
+        title: 'Zone is too complex',
+        message: msg,
+        kind: NoticeKind.danger,
+      );
+      return;
+    }
+
     final ctrl = ref.read(wifiConnectionProvider.notifier);
-    ctrl.sendRouteBegin(
-      _route.length,
+    ctrl.sendAreaBegin(
+      zone.length,
       originLat: map.refLat!,
       originLon: map.refLon!,
+      lineStepMeters: _draftLineStepMeters,
     );
-    for (var i = 0; i < _route.length; i++) {
-      final p = _route[i];
-      ctrl.sendRouteWaypoint(i, p.dx, p.dy);
+    for (var i = 0; i < zone.length; i++) {
+      final p = zone[i];
+      ctrl.sendAreaPoint(i, p.dx, p.dy);
     }
-    ctrl.sendRouteEnd();
+    ctrl.sendAreaEnd();
 
     setState(() {
       _routeSent = true;
@@ -231,7 +257,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     _showNotice(
       ref,
       title: 'Маршрут отправлен',
-      message: 'Draft route sent as local-meter waypoints from GPS origin.',
+      message: 'Robot received the zone and plans the route onboard.',
       kind: NoticeKind.info,
     );
   }
@@ -253,6 +279,25 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         title: 'Маршрут не отправлен',
         message: 'Сначала отправьте построенный маршрут.',
         kind: NoticeKind.warning,
+      );
+      return;
+    }
+    final carrier = wifi.gpsCarrier?.toLowerCase();
+    final rtkReady = carrier == 'fixed' || carrier == 'float';
+    final imuReady = wifi.imuFresh == true;
+    final motorReady = wifi.motorFeedback == true;
+    if (!rtkReady || !imuReady || !motorReady) {
+      final msg = [
+        if (!rtkReady) 'RTK is not float/fixed',
+        if (!imuReady) 'IMU is not fresh',
+        if (!motorReady) 'motor controller feedback is absent',
+      ].join('; ');
+      setState(() => _routeWorkflowError = msg);
+      _showNotice(
+        ref,
+        title: 'Start blocked',
+        message: msg,
+        kind: NoticeKind.danger,
       );
       return;
     }
@@ -693,6 +738,17 @@ class _AutoWorkflowPanel extends StatelessWidget {
         ? 'WP: -'
         : 'WP: ${wifi.navWpIndex ?? 0}/${wifi.navWpTotal}';
     final routeStatus = routeSent ? 'sent' : 'not sent';
+    final carrier = wifi.gpsCarrier ?? 'none';
+    final rtkStatus = 'RTK: $carrier';
+    final motorStatus = wifi.motorFeedback == true
+        ? 'Motor: linked'
+        : 'Motor: no feedback';
+    final startReady = routeSent &&
+        wifi.isConnected &&
+        (wifi.gpsCarrier?.toLowerCase() == 'fixed' ||
+            wifi.gpsCarrier?.toLowerCase() == 'float') &&
+        wifi.imuFresh == true &&
+        wifi.motorFeedback == true;
 
     return _GlassCard(
       borderColor: Colors.white.withOpacity(0.14),
@@ -709,6 +765,8 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 _StatusPill(label: 'NAV: $navMode'),
                 _StatusPill(label: waypoint),
                 _StatusPill(label: gpsStatus),
+                _StatusPill(label: rtkStatus),
+                _StatusPill(label: motorStatus),
                 _StatusPill(label: gpsCoords),
               ],
             ),
@@ -732,7 +790,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 Expanded(
                   child: _WorkflowButton(
                     icon: Icons.upload_rounded,
-                    label: 'Send',
+                    label: 'Send zone',
                     enabled: routePoints > 0 && wifi.isConnected,
                     onTap: onSendRoute,
                   ),
@@ -742,7 +800,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
                   child: _WorkflowButton(
                     icon: Icons.play_arrow_rounded,
                     label: 'Start',
-                    enabled: routeSent && wifi.isConnected,
+                    enabled: startReady,
                     onTap: onStart,
                   ),
                 ),

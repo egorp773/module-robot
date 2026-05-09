@@ -490,6 +490,46 @@ Conclusion:
 - The root issue was the base ESP32 RTCM parser dropping/corrupting useful long correction traffic before forwarding. Raw stream forwarding after RTCM-only UART output fixes it.
 - Autonomous motor navigation is still not validated by this test. The next movement test must start as a controlled dry run with RTK fixed and attachment disabled.
 
+### 2026-05-09 - Rover motor protocol and onboard planner fix
+
+Date/time: 2026-05-09, Europe/Moscow timezone
+
+Test: fix rover motor UART protocol, add manual command support, move route planning onboard, flash rover, and inspect serial log
+
+Area: rover motor controller link, app/autonomy responsibility split
+
+Hardware:
+
+- Rover on `COM6`.
+- Wi-Fi `Xiaomi_6A92`.
+
+Steps:
+
+- Fixed hoverboard motor command frame in `rtk_firmware/src/rover.cpp` to match the old working packed little-endian `0xABCD` protocol and field XOR checksum.
+- Added rover handling for manual `M,<left>,<right>` commands with a 400 ms timeout.
+- Moved motor send/receive to a 20 ms loop.
+- Added motor feedback parsing and `MOTOR,<...>` telemetry.
+- Added `AREA_BEGIN` / `AREA_PT` / `AREA_END` commands so the app sends the cleaning polygon and the rover builds the snake route onboard.
+- Updated auto UI so `Send zone` uploads the zone, not prebuilt waypoints, and `Start` is blocked unless RTK, IMU, and motor feedback are ready.
+- Built rover: `pio run -e rover`.
+- Flashed rover: `pio run -e rover -t upload --upload-port COM6`.
+- Captured log:
+  - `test_results/2026-05-09_navigation_followup/rover_COM6_after_motor_area_fix.log`
+
+Observed logs:
+
+- Rover boots and initializes `Motor UART: RX=16 TX=17 115200 baud`.
+- `MOTOR: UART2 initialized`.
+- Motor controller feedback is present: `Motor FB: fresh=1 cmd=(0,0) speed=(0,0) bat=4060..4068 temp=339..357`.
+- RTK remained available during the check: `Carrier: 2 (FIXED)`, `Quality: RTK_FIXED` / occasional `RTK_FLOAT`.
+
+Result: PASS for motor-controller UART link at zero command and firmware/app build checks.
+
+Conclusion:
+
+- The three-beep/no-wheel-response symptom was consistent with the RTK rover firmware sending an invalid hoverboard frame. The firmware now uses the old working binary frame format and the controller replies.
+- Movement itself still needs a controlled manual test: start with wheels lifted or tracks clear, send a tiny manual command, then STOP.
+
 ## Required future tests
 
 - Firmware build test.

@@ -95,10 +95,12 @@ static constexpr uint32_t NAV_LOOP_MS = 50;
 static constexpr uint32_t MOTOR_SEND_MS = 20;
 static constexpr uint32_t STATUS_MS = 2000;
 static constexpr uint32_t TELEMETRY_MS = 200;
+static constexpr uint32_t MANUAL_CMD_TIMEOUT_MS = 400;
 
 // Motor
 static constexpr int16_t MAX_MOTOR_CMD = 70;
 static constexpr int16_t MOTOR_RAMP_STEP = 2;
+static constexpr int16_t HOVER_MAX_CMD = 300;
 
 static Preferences g_prefs;
 
@@ -229,6 +231,7 @@ static bool g_deadReckoning = false;
 // ============== GPS INPUT ==============
 
 static HardwareSerial GpsSerial(1);
+static HardwareSerial MotorSerial(2);
 
 struct GpsRaw {
   double lat = 0, lon = 0;
@@ -704,7 +707,8 @@ static void updateEstimator() {
 
 // ============== ROUTE ==============
 
-static constexpr uint8_t MAX_WAYPOINTS = 64;
+static constexpr uint8_t MAX_WAYPOINTS = 160;
+static constexpr uint8_t MAX_AREA_POINTS = 32;
 struct Waypoint {
   LocalCoords pos;
 };
@@ -712,6 +716,11 @@ static Waypoint g_route[MAX_WAYPOINTS];
 static bool g_routeReceived[MAX_WAYPOINTS];
 static uint8_t g_routeCount = 0;
 static uint8_t g_routeIndex = 0;
+static LocalCoords g_area[MAX_AREA_POINTS];
+static bool g_areaReceived[MAX_AREA_POINTS];
+static uint8_t g_areaCount = 0;
+static float g_areaLineStep = 0.42f;
+static bool g_areaReady = false;
 
 static NavState g_navState = STATE_IDLE;
 static const char* g_navReason = "idle";
@@ -733,6 +742,32 @@ static bool g_invertSteering = false;
 // Motor outputs
 static int16_t g_motorTargetL = 0, g_motorTargetR = 0;
 static int16_t g_motorCurrentL = 0, g_motorCurrentR = 0;
+static int16_t g_hoverCmdSpeed = 0, g_hoverCmdSteer = 0;
+static uint32_t g_lastManualCmdMs = 0;
+static bool g_manualActive = false;
+static bool g_haveMotorFeedback = false;
+static int16_t g_motorFbCmd1 = 0, g_motorFbCmd2 = 0;
+static int16_t g_motorSpeedR = 0, g_motorSpeedL = 0;
+static int16_t g_motorBatVoltage = 0, g_motorBoardTemp = 0;
+
+struct __attribute__((packed)) SerialCommand {
+  uint16_t start;
+  int16_t steer;
+  int16_t speed;
+  uint16_t checksum;
+};
+
+struct __attribute__((packed)) SerialFeedback {
+  uint16_t start;
+  int16_t cmd1;
+  int16_t cmd2;
+  int16_t speedR_meas;
+  int16_t speedL_meas;
+  int16_t batVoltage;
+  int16_t boardTemp;
+  uint16_t cmdLed;
+  uint16_t checksum;
+};
 
 // Cross track error for telemetry
 static float g_crossTrackError = 0;
@@ -744,6 +779,140 @@ static bool routeReady() {
   for (uint8_t i = 0; i < g_routeCount; i++) {
     if (!g_routeReceived[i]) return false;
   }
+  return true;
+}
+
+static bool areaReady() {
+  if (g_areaCount < 3) return false;
+  for (uint8_t i = 0; i < g_areaCount; i++) {
+    if (!g_areaReceived[i]) return false;
+  }
+  return true;
+}
+
+static bool addRoutePoint(LocalCoords p) {
+  if (g_routeCount >= MAX_WAYPOINTS) return false;
+  if (g_routeCount > 0) {
+    const LocalCoords prev = g_route[g_routeCount - 1].pos;
+    if (hypotf(p.x - prev.x, p.y - prev.y) < 0.05f) return true;
+  }
+  g_route[g_routeCount].pos = p;
+  g_routeReceived[g_routeCount] = true;
+  g_routeCount++;
+  return true;
+}
+
+static void sortFloatArray(float* values, uint8_t count) {
+  for (uint8_t i = 1; i < count; i++) {
+    float v = values[i];
+    int j = (int)i - 1;
+    while (j >= 0 && values[j] > v) {
+      values[j + 1] = values[j];
+      j--;
+    }
+    values[j + 1] = v;
+  }
+}
+
+static uint8_t scanHorizontalIntersections(float y, float* xs, uint8_t maxXs) {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < g_areaCount; i++) {
+    const LocalCoords a = g_area[i];
+    const LocalCoords b = g_area[(i + 1) % g_areaCount];
+    if ((a.y > y) == (b.y > y)) continue;
+    if (fabsf(b.y - a.y) < 0.001f) continue;
+    if (count >= maxXs) break;
+    const float t = (y - a.y) / (b.y - a.y);
+    xs[count++] = a.x + t * (b.x - a.x);
+  }
+  sortFloatArray(xs, count);
+  return count;
+}
+
+static uint8_t scanVerticalIntersections(float x, float* ys, uint8_t maxYs) {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < g_areaCount; i++) {
+    const LocalCoords a = g_area[i];
+    const LocalCoords b = g_area[(i + 1) % g_areaCount];
+    if ((a.x > x) == (b.x > x)) continue;
+    if (fabsf(b.x - a.x) < 0.001f) continue;
+    if (count >= maxYs) break;
+    const float t = (x - a.x) / (b.x - a.x);
+    ys[count++] = a.y + t * (b.y - a.y);
+  }
+  sortFloatArray(ys, count);
+  return count;
+}
+
+static bool buildRouteFromArea() {
+  if (!areaReady()) return false;
+  if (!g_origin.valid) return false;
+
+  float minX = g_area[0].x, maxX = g_area[0].x;
+  float minY = g_area[0].y, maxY = g_area[0].y;
+  for (uint8_t i = 1; i < g_areaCount; i++) {
+    minX = min(minX, g_area[i].x);
+    maxX = max(maxX, g_area[i].x);
+    minY = min(minY, g_area[i].y);
+    maxY = max(maxY, g_area[i].y);
+  }
+
+  const float width = maxX - minX;
+  const float height = maxY - minY;
+  float step = constrain(g_areaLineStep, 0.15f, 2.0f);
+  g_routeCount = 0;
+  g_routeIndex = 0;
+  memset(g_routeReceived, 0, sizeof(g_routeReceived));
+  addRoutePoint(g_est.pos);
+
+  bool reverse = false;
+  bool ok = true;
+  float intersections[MAX_AREA_POINTS];
+
+  if (width >= height) {
+    for (float y = minY + step * 0.5f; y <= maxY - step * 0.5f; y += step) {
+      const uint8_t n = scanHorizontalIntersections(y, intersections, MAX_AREA_POINTS);
+      for (uint8_t i = 0; i + 1 < n; i += 2) {
+        LocalCoords a = {intersections[i], y};
+        LocalCoords b = {intersections[i + 1], y};
+        if (reverse) {
+          ok = addRoutePoint(b) && addRoutePoint(a);
+        } else {
+          ok = addRoutePoint(a) && addRoutePoint(b);
+        }
+        if (!ok) break;
+        reverse = !reverse;
+      }
+      if (!ok) break;
+    }
+  } else {
+    for (float x = minX + step * 0.5f; x <= maxX - step * 0.5f; x += step) {
+      const uint8_t n = scanVerticalIntersections(x, intersections, MAX_AREA_POINTS);
+      for (uint8_t i = 0; i + 1 < n; i += 2) {
+        LocalCoords a = {x, intersections[i]};
+        LocalCoords b = {x, intersections[i + 1]};
+        if (reverse) {
+          ok = addRoutePoint(b) && addRoutePoint(a);
+        } else {
+          ok = addRoutePoint(a) && addRoutePoint(b);
+        }
+        if (!ok) break;
+        reverse = !reverse;
+      }
+      if (!ok) break;
+    }
+  }
+
+  if (!ok || g_routeCount < 2) {
+    g_routeCount = 0;
+    memset(g_routeReceived, 0, sizeof(g_routeReceived));
+    return false;
+  }
+
+  g_navState = STATE_IDLE;
+  g_navReason = "route_planned_on_robot";
+  Serial.printf("PLAN: area %u pts -> route %u pts, step=%.2f\n",
+    g_areaCount, g_routeCount, step);
   return true;
 }
 
@@ -792,10 +961,31 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   cmd.trim();
 
   if (cmd == "PING") { client->text("PONG"); return; }
+  if (cmd.startsWith("M,")) {
+    int comma1 = cmd.indexOf(',', 2);
+    if (comma1 > 2) {
+      int left = cmd.substring(2, comma1).toInt();
+      int right = cmd.substring(comma1 + 1).toInt();
+      left = constrain(left, -MAX_MOTOR_CMD, MAX_MOTOR_CMD);
+      right = constrain(right, -MAX_MOTOR_CMD, MAX_MOTOR_CMD);
+      g_navState = STATE_IDLE;
+      g_navReason = "manual";
+      g_motorTargetL = (int16_t)left;
+      g_motorTargetR = (int16_t)right;
+      g_lastManualCmdMs = millis();
+      g_manualActive = true;
+      client->text("OK");
+      return;
+    }
+    client->text("ERR,MOVE");
+    return;
+  }
   if (cmd == "STOP" || cmd == "NAV_STOP") {
     g_navState = STATE_IDLE;
     g_navReason = "stopped";
     g_motorTargetL = g_motorTargetR = 0;
+    g_lastManualCmdMs = 0;
+    g_manualActive = false;
     client->text("OK");
     return;
   }
@@ -803,6 +993,7 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     g_navState = STATE_PAUSED;
     g_navReason = "paused";
     g_motorTargetL = g_motorTargetR = 0;
+    g_manualActive = false;
     client->text("OK");
     return;
   }
@@ -815,6 +1006,7 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     if (routeReady() && g_routeIndex < g_routeCount) {
       g_navState = STATE_RUNNING;
       g_navReason = "started";
+      g_manualActive = false;
       client->text("OK");
     } else {
       client->text("ERR,NO_ROUTE");
@@ -869,6 +1061,67 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
       Serial.printf("WS: route ready %u waypoints\n", g_routeCount);
     } else {
       client->text("ERR,ROUTE_INCOMPLETE");
+    }
+    return;
+  }
+  // AREA_BEGIN,count,originLat,originLon,lineStep
+  if (cmd.startsWith("AREA_BEGIN,")) {
+    int first = 11;
+    int p1 = cmd.indexOf(',', first);
+    int p2 = cmd.indexOf(',', p1 + 1);
+    int p3 = cmd.indexOf(',', p2 + 1);
+    if (p1 > first && p2 > p1 && p3 > p2) {
+      int count = cmd.substring(first, p1).toInt();
+      double originLat = cmd.substring(p1 + 1, p2).toDouble();
+      double originLon = cmd.substring(p2 + 1, p3).toDouble();
+      float lineStep = cmd.substring(p3 + 1).toFloat();
+      if (count >= 3 && count <= MAX_AREA_POINTS && originLat != 0 && originLon != 0 &&
+          lineStep > 0.05f && lineStep <= 5.0f) {
+        g_areaCount = (uint8_t)count;
+        g_areaLineStep = lineStep;
+        g_areaReady = false;
+        memset(g_areaReceived, 0, sizeof(g_areaReceived));
+        g_routeCount = 0;
+        memset(g_routeReceived, 0, sizeof(g_routeReceived));
+        g_navState = STATE_IDLE;
+        g_navReason = "area_upload";
+        setOrigin(originLat, originLon);
+        client->text("OK");
+        Serial.printf("WS: area begin %u points, origin %.8f %.8f, step=%.2f\n",
+          count, originLat, originLon, lineStep);
+        return;
+      }
+    }
+    client->text("ERR,AREA_BEGIN");
+    return;
+  }
+  // AREA_PT,idx,x_m,y_m
+  if (cmd.startsWith("AREA_PT,")) {
+    int first = 8;
+    int p1 = cmd.indexOf(',', first);
+    int p2 = cmd.indexOf(',', p1 + 1);
+    if (p1 > first && p2 > p1) {
+      int idx = cmd.substring(first, p1).toInt();
+      float x = cmd.substring(p1 + 1, p2).toFloat();
+      float y = cmd.substring(p2 + 1).toFloat();
+      if (idx >= 0 && idx < g_areaCount && isfinite(x) && isfinite(y)) {
+        g_area[idx] = {x, y};
+        g_areaReceived[idx] = true;
+        client->text("OK");
+        return;
+      }
+    }
+    client->text("ERR,AREA_PT");
+    return;
+  }
+  if (cmd == "AREA_END" || cmd == "PLAN_CLEAN") {
+    g_areaReady = areaReady();
+    if (g_areaReady && buildRouteFromArea()) {
+      char resp[48];
+      snprintf(resp, sizeof(resp), "OK,ROUTE,%u", g_routeCount);
+      client->text(resp);
+    } else {
+      client->text("ERR,PLAN_FAILED");
     }
     return;
   }
@@ -1023,8 +1276,11 @@ static void broadcastTelemetry() {
 
   // Motor status
   snprintf(msg, sizeof(msg),
-    "MOTOR,%d,%d",
-    g_motorCurrentL, g_motorCurrentR
+    "MOTOR,%d,%d,%u,%d,%d,%d,%d",
+    g_motorCurrentL, g_motorCurrentR,
+    g_haveMotorFeedback ? 1 : 0,
+    g_motorSpeedL, g_motorSpeedR,
+    g_motorBatVoltage, g_motorBoardTemp
   );
   ws.textAll(msg);
 }
@@ -1033,6 +1289,7 @@ static void broadcastTelemetry() {
 
 static void navUpdate() {
   if (g_navState != STATE_RUNNING) {
+    if (g_manualActive) return;
     g_motorTargetL = g_motorTargetR = 0;
     return;
   }
@@ -1203,10 +1460,9 @@ static void motorsSend() {
   if (now - lastSend < MOTOR_SEND_MS) return;
   lastSend = now;
 
-  static HardwareSerial motorSerial(2);
   static bool init = false;
   if (!init) {
-    motorSerial.begin(MOTOR_BAUD, SERIAL_8N1, MOTOR_RX, MOTOR_TX);
+    MotorSerial.begin(MOTOR_BAUD, SERIAL_8N1, MOTOR_RX, MOTOR_TX);
     init = true;
     Serial.println("MOTOR: UART2 initialized");
   }
@@ -1214,22 +1470,71 @@ static void motorsSend() {
   int16_t speed = (g_motorCurrentL + g_motorCurrentR) / 2;
   int16_t steer = (g_motorCurrentR - g_motorCurrentL) / 2;
 
-  // Hover protocol: speed/steer normalized to 500
-  const int16_t HOVER_MAX = 500;
-  int16_t cmdSpeed = constrain(speed * HOVER_MAX / 100, -HOVER_MAX, HOVER_MAX);
-  int16_t cmdSteer = constrain(steer * HOVER_MAX / 100, -HOVER_MAX, HOVER_MAX);
+  int16_t targetSpeed = constrain(speed * HOVER_MAX_CMD / 100, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+  int16_t targetSteer = constrain(steer * HOVER_MAX_CMD / 100, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+  g_hoverCmdSpeed = stepToward(g_hoverCmdSpeed, targetSpeed, 4);
+  g_hoverCmdSteer = stepToward(g_hoverCmdSteer, targetSteer, 6);
 
-  uint8_t buf[8];
-  buf[0] = 0xAB; buf[1] = 0xCD;
-  buf[2] = (uint8_t)(cmdSteer & 0xFF);
-  buf[3] = (uint8_t)((cmdSteer >> 8) & 0xFF);
-  buf[4] = (uint8_t)(cmdSpeed & 0xFF);
-  buf[5] = (uint8_t)((cmdSpeed >> 8) & 0xFF);
-  uint16_t crc = buf[0] ^ buf[1] ^ buf[2] ^ buf[3] ^ buf[4] ^ buf[5];
-  buf[6] = (uint8_t)(crc & 0xFF);
-  buf[7] = (uint8_t)((crc >> 8) & 0xFF);
+  SerialCommand cmd;
+  cmd.start = 0xABCD;
+  cmd.steer = g_hoverCmdSteer;
+  cmd.speed = g_hoverCmdSpeed;
+  cmd.checksum = (uint16_t)(cmd.start ^ cmd.steer ^ cmd.speed);
+  MotorSerial.write((uint8_t*)&cmd, sizeof(cmd));
+}
 
-  motorSerial.write(buf, 8);
+static void motorsReceiveFeedback() {
+  static bool init = false;
+  static SerialFeedback feedback{};
+  static SerialFeedback incoming{};
+  static uint8_t idx = 0;
+  static uint8_t* p = nullptr;
+  static uint8_t prev = 0;
+
+  if (!init) {
+    MotorSerial.begin(MOTOR_BAUD, SERIAL_8N1, MOTOR_RX, MOTOR_TX);
+    init = true;
+  }
+
+  while (MotorSerial.available()) {
+    uint8_t b = (uint8_t)MotorSerial.read();
+    uint16_t start = ((uint16_t)b << 8) | prev;
+
+    if (start == 0xABCD) {
+      p = (uint8_t*)&incoming;
+      *p++ = prev;
+      *p++ = b;
+      idx = 2;
+    } else if (idx >= 2 && idx < sizeof(SerialFeedback)) {
+      *p++ = b;
+      idx++;
+    }
+
+    if (idx == sizeof(SerialFeedback)) {
+      uint16_t checksum = (uint16_t)(
+        incoming.start ^
+        incoming.cmd1 ^
+        incoming.cmd2 ^
+        incoming.speedR_meas ^
+        incoming.speedL_meas ^
+        incoming.batVoltage ^
+        incoming.boardTemp ^
+        incoming.cmdLed
+      );
+      if (incoming.start == 0xABCD && checksum == incoming.checksum) {
+        feedback = incoming;
+        g_haveMotorFeedback = true;
+        g_motorFbCmd1 = feedback.cmd1;
+        g_motorFbCmd2 = feedback.cmd2;
+        g_motorSpeedR = feedback.speedR_meas;
+        g_motorSpeedL = feedback.speedL_meas;
+        g_motorBatVoltage = feedback.batVoltage;
+        g_motorBoardTemp = feedback.boardTemp;
+      }
+      idx = 0;
+    }
+    prev = b;
+  }
 }
 
 // ============== STATUS ==============
@@ -1290,6 +1595,11 @@ static void printStatus() {
     g_routeIndex, g_routeCount, g_crossTrackError, g_headingError, g_distToRouteEnd);
   Serial.printf("  Motor: L=%d R=%d (target)\n", g_motorTargetL, g_motorTargetR);
   Serial.printf("        L=%d R=%d (current)\n", g_motorCurrentL, g_motorCurrentR);
+  Serial.printf("  Motor FB: fresh=%u cmd=(%d,%d) speed=(%d,%d) bat=%d temp=%d\n",
+    g_haveMotorFeedback ? 1 : 0,
+    g_motorFbCmd1, g_motorFbCmd2,
+    g_motorSpeedL, g_motorSpeedR,
+    g_motorBatVoltage, g_motorBoardTemp);
 
   Serial.println("-- Origin --");
   if (g_origin.valid) {
@@ -1399,9 +1709,22 @@ void loop() {
   if (now - lastNav >= NAV_LOOP_MS) {
     lastNav = now;
     navUpdate();
+  }
+
+  static uint32_t lastMotorUpdate = 0;
+  if (now - lastMotorUpdate >= MOTOR_SEND_MS) {
+    lastMotorUpdate = now;
+    if (g_lastManualCmdMs > 0 && now - g_lastManualCmdMs > MANUAL_CMD_TIMEOUT_MS) {
+      g_motorTargetL = 0;
+      g_motorTargetR = 0;
+      g_lastManualCmdMs = 0;
+      g_manualActive = false;
+      if (g_navState == STATE_IDLE) g_navReason = "manual_timeout";
+    }
     motorsRamp();
     motorsSend();
   }
+  motorsReceiveFeedback();
 
   // Telemetry
   if (g_wifiConnected) {

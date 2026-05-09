@@ -150,6 +150,7 @@ Limits:
 - Rover GPS/F9P UART is physically producing position data.
 - Rover F9P now confirms RTCM decode through `UBX-RXM-RTCM` in hardware logs.
 - Rover reached `Carrier: 2 (FIXED)` / `RTK_FIXED` in the 2026-05-09 bench log after base raw RTCM forwarding was enabled.
+- Rover motor controller now replies to the RTK rover firmware (`Motor FB: fresh=1`) after restoring the packed hoverboard UART frame format.
 - Manual map recording is mostly conditional/simulated.
 - It is not a confirmed GPS perimeter recording workflow.
 - Displaying lat/lon in the app does not prove RTK fix quality or field localization.
@@ -170,12 +171,12 @@ Impact:
 
 ### Auto UI workflow gaps
 
-Status: code-level partial, not hardware-tested.
+Status: code-level partial, motor/RTK prerequisites bench-checked, movement not field-tested.
 
 Implemented in UI:
 
 - Build route.
-- Send route.
+- Send zone to rover.
 - Start.
 - Pause.
 - Stop.
@@ -188,10 +189,10 @@ Implemented in UI:
 
 Limits:
 
-- Route sending is still a draft protocol workflow, but the active RTK/autopilot path is local-meter based.
+- App route preview is still code-level, but active RTK/autopilot now sends the local-meter cleaning zone and rover plans the snake route onboard.
 - Route upload is blocked unless the map is marked GPS-based and has `refLat/refLon`.
-- When a GPS origin exists, route upload sends local-meter route points directly with the GPS origin attached to `ROUTE_BEGIN`.
-- Start control sends `NAV_START` after route upload; the rover still suppresses motor output if GPS/RTK quality is not safe.
+- When a GPS origin exists, area upload sends local-meter polygon vertices with the GPS origin attached to `AREA_BEGIN`.
+- Start control sends `NAV_START` after area upload; the app blocks start unless RTK, IMU, and motor feedback are ready, and the rover still suppresses motor output if GPS/RTK quality is not safe.
 - No real robot autonomous test has been run.
 - Do not mark autonomy or GPS route following as working from this UI change.
 
@@ -199,7 +200,7 @@ Limits:
 
 - Current snake route is not good enough.
 - Current line step is wrong if using `44.0`; active cleaning planner default is now `0.42`.
-- Route generation must be converted to local metric x/y coordinates.
+- Route generation now exists onboard for one uploaded polygon; forbidden-zone handling and multi-zone planning still need firmware-side work.
 - Robot marker on auto map must not be presented as reliable GPS position yet.
 
 ## Not tested on hardware
@@ -210,7 +211,7 @@ Limits:
 - lat/lon telemetry in Flutter.
 - local x/y origin workflow.
 - GPS perimeter recording.
-- waypoint upload to ESP32.
+- area upload and onboard route generation in a movement test.
 - autonomous route following.
 - RTK in field conditions.
 - autonomous movement with attachment enabled.

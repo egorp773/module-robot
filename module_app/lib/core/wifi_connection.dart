@@ -48,6 +48,13 @@ class WifiConnectionState {
   final int? navWpIndex;
   final int? navWpTotal;
   final double? navDistToWp;
+  final int? motorLeft;
+  final int? motorRight;
+  final bool? motorFeedback;
+  final int? motorSpeedLeft;
+  final int? motorSpeedRight;
+  final int? motorBatteryRaw;
+  final int? motorBoardTempRaw;
 
   const WifiConnectionState({
     required this.isConnecting,
@@ -85,6 +92,13 @@ class WifiConnectionState {
     this.navWpIndex,
     this.navWpTotal,
     this.navDistToWp,
+    this.motorLeft,
+    this.motorRight,
+    this.motorFeedback,
+    this.motorSpeedLeft,
+    this.motorSpeedRight,
+    this.motorBatteryRaw,
+    this.motorBoardTempRaw,
   });
 
   factory WifiConnectionState.initial() => const WifiConnectionState(
@@ -123,6 +137,13 @@ class WifiConnectionState {
         navWpIndex: null,
         navWpTotal: null,
         navDistToWp: null,
+        motorLeft: null,
+        motorRight: null,
+        motorFeedback: null,
+        motorSpeedLeft: null,
+        motorSpeedRight: null,
+        motorBatteryRaw: null,
+        motorBoardTempRaw: null,
       );
 
   WifiConnectionState copyWith({
@@ -161,6 +182,13 @@ class WifiConnectionState {
     int? navWpIndex,
     int? navWpTotal,
     double? navDistToWp,
+    int? motorLeft,
+    int? motorRight,
+    bool? motorFeedback,
+    int? motorSpeedLeft,
+    int? motorSpeedRight,
+    int? motorBatteryRaw,
+    int? motorBoardTempRaw,
   }) {
     return WifiConnectionState(
       isConnecting: isConnecting ?? this.isConnecting,
@@ -198,6 +226,13 @@ class WifiConnectionState {
       navWpIndex: navWpIndex ?? this.navWpIndex,
       navWpTotal: navWpTotal ?? this.navWpTotal,
       navDistToWp: navDistToWp ?? this.navDistToWp,
+      motorLeft: motorLeft ?? this.motorLeft,
+      motorRight: motorRight ?? this.motorRight,
+      motorFeedback: motorFeedback ?? this.motorFeedback,
+      motorSpeedLeft: motorSpeedLeft ?? this.motorSpeedLeft,
+      motorSpeedRight: motorSpeedRight ?? this.motorSpeedRight,
+      motorBatteryRaw: motorBatteryRaw ?? this.motorBatteryRaw,
+      motorBoardTempRaw: motorBoardTempRaw ?? this.motorBoardTempRaw,
     );
   }
 
@@ -243,6 +278,13 @@ class WifiConnectionState {
       navWpIndex: null,
       navWpTotal: null,
       navDistToWp: null,
+      motorLeft: null,
+      motorRight: null,
+      motorFeedback: null,
+      motorSpeedLeft: null,
+      motorSpeedRight: null,
+      motorBatteryRaw: null,
+      motorBoardTempRaw: null,
     );
   }
 }
@@ -844,6 +886,30 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
           }
 
           // Если получили STATE,CONNECTED - соединение установлено
+          if (msgStr.startsWith("MOTOR,")) {
+            try {
+              final parts = msgStr.split(",");
+              if (parts.length >= 3) {
+                state = state.copyWith(
+                  motorLeft: int.tryParse(parts[1]),
+                  motorRight: int.tryParse(parts[2]),
+                  motorFeedback:
+                      parts.length >= 4 ? parts[3].trim() == '1' : null,
+                  motorSpeedLeft:
+                      parts.length >= 5 ? int.tryParse(parts[4]) : null,
+                  motorSpeedRight:
+                      parts.length >= 6 ? int.tryParse(parts[5]) : null,
+                  motorBatteryRaw:
+                      parts.length >= 7 ? int.tryParse(parts[6]) : null,
+                  motorBoardTempRaw:
+                      parts.length >= 8 ? int.tryParse(parts[7]) : null,
+                );
+              }
+            } catch (e) {
+              _log("Failed to parse MOTOR: $e");
+            }
+          }
+
           if (upperMsg.contains("CONNECTED") || upperMsg.contains("STATE")) {
             if (!connectionEstablished) {
               connectionEstablished = true;
@@ -1027,6 +1093,31 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   void sendRouteEnd() {
     if (!state.isConnected) return;
     sendRaw("ROUTE_END");
+  }
+
+  void sendAreaBegin(
+    int count, {
+    required double originLat,
+    required double originLon,
+    required double lineStepMeters,
+  }) {
+    if (!state.isConnected) return;
+    sendRaw(
+      "AREA_BEGIN,$count,${originLat.toStringAsFixed(8)},"
+      "${originLon.toStringAsFixed(8)},${lineStepMeters.toStringAsFixed(3)}",
+    );
+  }
+
+  void sendAreaPoint(int index, double xMeters, double yMeters) {
+    if (!state.isConnected) return;
+    sendRaw(
+      "AREA_PT,$index,${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
+    );
+  }
+
+  void sendAreaEnd() {
+    if (!state.isConnected) return;
+    sendRaw("AREA_END");
   }
 
   /// Navigation commands

@@ -153,6 +153,46 @@ RTK/autopilot route commands use local-meter coordinates. The app sends the
 GPS origin once, then sends each waypoint as local `x/y` meters relative to
 that origin.
 
+Preferred current flow is robot-side planning: the app sends a cleaning zone
+polygon and the rover builds the snake route onboard. Direct waypoint upload is
+kept as a lower-level fallback.
+
+### Robot-side area planning
+
+```text
+AREA_BEGIN,<count>,<originLat>,<originLon>,<lineStepMeters>
+AREA_PT,<index>,<x_m>,<y_m>
+AREA_END
+```
+
+Example:
+
+```text
+AREA_BEGIN,4,55.12345678,37.12345678,0.420
+AREA_PT,0,0.000,0.000
+AREA_PT,1,4.000,0.000
+AREA_PT,2,4.000,2.000
+AREA_PT,3,0.000,2.000
+AREA_END
+```
+
+Firmware responses:
+
+```text
+OK
+OK,ROUTE,<count>
+ERR,AREA_BEGIN
+ERR,AREA_PT
+ERR,PLAN_FAILED
+```
+
+Rules:
+
+- `count` must be `3..32`.
+- points are local meters relative to `originLat/originLon`.
+- the rover starts the generated route from its current estimated local position.
+- the generated route is stored inside rover firmware and then started with `NAV_START`.
+
 ```text
 ROUTE_BEGIN,<count>,<originLat>,<originLon>
 ```
@@ -186,7 +226,7 @@ ERR,ROUTE_INCOMPLETE
 
 Rules:
 
-- `count` must be `1..64`.
+- `count` must be `1..160`.
 - `originLat` and `originLon` must be non-zero.
 - waypoint indexes outside `0..count-1` are rejected.
 - `NAV_START` is accepted only after every waypoint has been received.
@@ -335,6 +375,21 @@ States:
 
 The auto UI should show this state, current waypoint, total waypoints, and errors.
 
+### Motor telemetry
+
+```text
+MOTOR,<left>,<right>,<feedback>,<speedL>,<speedR>,<batRaw>,<tempRaw>
+```
+
+Example:
+
+```text
+MOTOR,0,0,1,0,0,4060,355
+```
+
+`feedback=1` means the hoverboard motor controller is replying on UART. If it is
+`0`, do not start autonomous movement.
+
 ### Generic errors
 
 Known current errors:
@@ -350,7 +405,7 @@ ERR ROUTE_WP_FULL
 ## Known protocol risks
 
 - Protocol is text-based but older documentation and future designs may mention JSON. Do not mix them accidentally.
-- Route upload is currently lat/lon, while roadmap requires local meters.
+- Route and area upload use local meters relative to a GPS origin.
 - `PING` is not a full heartbeat/failsafe loop.
 - App must keep sending manual `M,left,right` updates during movement; firmware timeout stops stale movement commands.
 - Hardware behavior still needs real tests.
