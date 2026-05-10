@@ -28,7 +28,7 @@ static constexpr int PIN_GPS_TX = 5;
 static constexpr uint32_t GPS_BAUD = 38400;
 static constexpr uint32_t STATUS_INTERVAL_MS = 5000;
 static constexpr uint32_t SVIN_MIN_DUR_S = 120;
-static constexpr uint32_t SVIN_ACC_LIMIT_0_1MM = 2500;  // 0.25 m, units are 0.1 mm
+static constexpr uint32_t SVIN_ACC_LIMIT_0_1MM = 20000;  // 2.0 m, units are 0.1 mm
 
 static HardwareSerial GpsSerial(1);
 static WiFiUDP udp;
