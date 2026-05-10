@@ -1295,9 +1295,9 @@ static void broadcastTelemetry() {
   const uint32_t imuAge = g_lastImuMs ? now - g_lastImuMs : 99999;
   const char* carrier = g_gps.carrier == 2 ? "fixed" : (g_gps.carrier == 1 ? "float" : "none");
 
-  // Main telemetry: simplified GPS + IMU + heading
+  // Main telemetry: keep the old Flutter parser compatible.
   snprintf(msg, sizeof(msg),
-    "TEL,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.1f,%lu,%u,%s",
+    "TEL,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu,%lu,%lu,%.1f,%lu,%u,%lu,%lu,%s,%lu,%lu,%lu",
     g_gps.lat, g_gps.lon,
     0.0f,
     g_est.heading,
@@ -1308,22 +1308,79 @@ static void broadcastTelemetry() {
     g_gps.hAcc,
     g_gps.vAcc,
     g_gps.speed,
+    0.0f,
+    (unsigned long)gpsAge,
+    (unsigned long)g_rtcmBytes,
+    (unsigned long)rtcmTransportAge,
     g_imuYaw,
     (unsigned long)imuAge,
     g_imuFresh ? 1 : 0,
-    g_rtcmFresh ? "ok" : "nocorr"
+    (unsigned long)rtcmTransportAge,
+    (unsigned long)rtcmF9pAge,
+    g_rtcmFresh ? "udp" : "none",
+    (unsigned long)g_f9pRtcmMsgs,
+    (unsigned long)g_f9pRtcmCrcFail,
+    (unsigned long)g_rtcmLastType
   );
   ws.textAll(msg);
 
-  // Nav + Motor combined
+  // Extended GPS info.
   snprintf(msg, sizeof(msg),
-    "NAV,%s,%u,%u,%.2f,%d,%d,%d,%d",
+    "GPSDBG,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu",
+    g_gps.lat, g_gps.lon,
+    0.0f,
+    g_est.heading,
+    g_gps.fixType,
+    carrier,
+    g_gps.diff ? 1 : 0,
+    (uint8_t)g_gps.numSV,
+    g_gps.hAcc,
+    g_gps.vAcc,
+    g_gps.speed,
+    0.0f,
+    (unsigned long)gpsAge
+  );
+  ws.textAll(msg);
+
+  // RTCM status
+  snprintf(msg, sizeof(msg),
+    "RTCM,%lu,%lu,%lu,%lu,%s,%lu,%lu,%lu",
+    (unsigned long)g_rtcmBytes,
+    (unsigned long)rtcmTransportAge,
+    (unsigned long)rtcmTransportAge,
+    (unsigned long)rtcmF9pAge,
+    g_rtcmFresh ? "udp" : "none",
+    (unsigned long)g_f9pRtcmMsgs,
+    (unsigned long)g_f9pRtcmCrcFail,
+    (unsigned long)g_rtcmLastType
+  );
+  ws.textAll(msg);
+
+  // IMU status
+  snprintf(msg, sizeof(msg),
+    "IMU,%.1f,%lu,%u",
+    g_imuYaw,
+    (unsigned long)imuAge,
+    g_imuFresh ? 1 : 0
+  );
+  ws.textAll(msg);
+
+  snprintf(msg, sizeof(msg),
+    "NAV,%s,%u,%u,%.2f",
     stateString(g_navState),
     g_routeIndex,
     g_routeCount,
-    g_distToRouteEnd,
+    g_distToRouteEnd
+  );
+  ws.textAll(msg);
+
+  // Motor status
+  snprintf(msg, sizeof(msg),
+    "MOTOR,%d,%d,%u,%d,%d,%d,%d",
     g_curLeft, g_curRight,
-    g_motorSpeedL, g_motorSpeedR
+    g_haveMotorFeedback ? 1 : 0,
+    g_motorSpeedL, g_motorSpeedR,
+    g_motorBatVoltage, g_motorBoardTemp
   );
   ws.textAll(msg);
 }
