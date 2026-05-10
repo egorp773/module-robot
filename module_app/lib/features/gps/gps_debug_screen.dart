@@ -294,7 +294,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                                 icon: Icons.explore_rounded,
                                 label: 'Калибровать\nIMU',
                                 color: const Color(0xFFFFD166),
-                                enabled: wifi.imuFresh == true,
+                                enabled: wifi.imuFresh == true && _savedTarget != null && currentPoint != null,
                                 onTap: () => _calibrateImu(wifi),
                               ),
                             ),
@@ -312,7 +312,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          '1. Сохрани цель (当前位置). 2. Отнеси робота. 3. Нажми "Ехать". Робот сам вычисляет путь.',
+                          '1. Сохрани цель. 2. Отнеси робота и направь нос на цель. 3. Нажми "Калибровать IMU". 4. Нажми "Ехать".',
                           style: TextStyle(color: Colors.white.withValues(alpha: 0.5), fontSize: 11),
                         ),
                       ],
@@ -535,9 +535,6 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       setState(() => _notice = 'Нет связи с роботом');
       return;
     }
-    // Calibrate IMU using its own IMU yaw (robot ignores any parameters)
-    ref.read(wifiConnectionProvider.notifier).sendRaw('CAL_IMU');
-    // Send GO_TO command
     ref.read(wifiConnectionProvider.notifier).sendGoToTarget(_savedTarget!.lat, _savedTarget!.lon);
     setState(() {
       _navActive = true;
@@ -554,10 +551,27 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   }
 
   void _calibrateImu(WifiConnectionState wifi) {
-    // Send CAL_IMU_SELF - robot sets heading = current IMU yaw
-    // Don't pass any bearing - robot uses its own IMU yaw
-    ref.read(wifiConnectionProvider.notifier).sendRaw('CAL_IMU_SELF');
-    setState(() => _notice = 'Калибровка отправлена...');
+    // Align raw BNO085 yaw to the GPS bearing of the selected target.
+    final target = _savedTarget;
+    if (target == null) {
+      setState(() => _notice = 'Save target first');
+      return;
+    }
+    final current = _currentPoint(wifi);
+    if (current == null) {
+      setState(() => _notice = 'No GPS position');
+      return;
+    }
+    final bearing = GpsDisplayGeometry.bearingDegrees(
+      current.lat,
+      current.lon,
+      target.lat,
+      target.lon,
+    );
+    ref.read(wifiConnectionProvider.notifier).sendRaw(
+      'CAL_IMU,${bearing.toStringAsFixed(1)}',
+    );
+    setState(() => _notice = 'IMU calibrated to ${bearing.toStringAsFixed(1)} deg');
   }
 
   // Use IMU yaw if fresh, otherwise GPS heading

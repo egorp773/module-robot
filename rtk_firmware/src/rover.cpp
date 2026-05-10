@@ -124,6 +124,7 @@ uint32_t g_lastRampMs = 0;
 bool g_isFailSafeStopping = false;
 
 static Preferences g_prefs;
+static void saveNavPrefs();
 
 // ============== UTILITIES ==============
 
@@ -582,6 +583,7 @@ static void relayRtcm() {
 // ============== IMU ==============
 
 static Adafruit_BNO08x bno08x;
+static float g_imuRawYaw = 0;
 static float g_imuYaw = 0;
 static float g_imuPitch = 0;
 static float g_imuRoll = 0;
@@ -632,7 +634,8 @@ static void updateImu() {
       float rawYaw = radToDeg(yaw);
       if (rawYaw < 0) rawYaw += 360.0f;
       if (g_invertYaw) rawYaw = normalizeAngle360(360.0f - rawYaw);
-      g_imuYaw = normalizeAngle360(rawYaw + g_imuCalibrationOffset);
+      g_imuRawYaw = normalizeAngle360(rawYaw);
+      g_imuYaw = normalizeAngle360(g_imuRawYaw + g_imuCalibrationOffset);
 
       float pitch = asin(2.0f * (qw * qy - qz * qx));
       g_imuPitch = radToDeg(pitch);
@@ -651,7 +654,9 @@ static void updateImu() {
       uint32_t now = millis();
       if (now - lastDebugMs > 2000) {
         lastDebugMs = now;
-        Serial.printf("IMU: yaw=%.1f fresh=1 age=%lu\n", g_imuYaw, (unsigned long)(now - g_imuFirstReadMs));
+        Serial.printf("IMU: raw=%.1f heading=%.1f offset=%.1f fresh=1 age=%lu\n",
+          g_imuRawYaw, g_imuYaw, g_imuCalibrationOffset,
+          (unsigned long)(now - g_imuFirstReadMs));
       }
     }
   }
@@ -664,6 +669,28 @@ static void updateImu() {
 static bool imuReadyForCalibration() {
   // Just check if IMU is fresh - robot uses its own IMU yaw
   return g_imuFresh;
+}
+
+static void calibrateImuToHeading(float desiredHeading) {
+  desiredHeading = normalizeAngle360(desiredHeading);
+  g_imuCalibrationOffset = normalizeAngle(desiredHeading - g_imuRawYaw);
+  g_imuYaw = normalizeAngle360(g_imuRawYaw + g_imuCalibrationOffset);
+  g_est.heading = g_imuYaw;
+  saveNavPrefs();
+}
+
+static void updateEstimatorHeading() {
+  if (g_imuFresh) {
+    g_est.heading = g_imuYaw;
+    return;
+  }
+
+  // GPS heading is course-over-ground, not body yaw. Use it only as a fallback
+  // while moving fast enough for the F9P heading to be meaningful.
+  const uint32_t gpsAge = g_gps.lastMs ? millis() - g_gps.lastMs : 99999;
+  if (g_gps.valid && gpsAge <= GPS_HOLD_AGE_MS && fabsf(g_gps.speed) >= 0.15f) {
+    g_est.heading = normalizeAngle360(g_gps.heading);
+  }
 }
 
 // ============== ESTIMATOR ==============
@@ -696,6 +723,7 @@ static void updateEstimator() {
 
   g_est.quality = qual;
   g_est.qualityAgeMs = gpsAge;
+  updateEstimatorHeading();
 
   // Update position estimate
   if (qual == QUAL_RTK_FIXED_GOOD || qual == QUAL_RTK_FLOAT_OK || qual == QUAL_GPS_DEGRADED) {
@@ -717,7 +745,6 @@ static void updateEstimator() {
     g_haveRtkFix = (qual == QUAL_RTK_FIXED_GOOD || qual == QUAL_RTK_FLOAT_OK);
     g_est.rtkFixed = (g_gps.carrier == 2);
     g_deadReckoning = false;
-    // heading is set only during IMU calibration, NOT auto-updated here
   } else if (qual == QUAL_GPS_HOLD_SHORT) {
     // Dead reckoning
     if (!g_deadReckoning) {
@@ -735,7 +762,6 @@ static void updateEstimator() {
       g_est.pos.y += speed * cos(headingRad) * dt;
     }
     g_est.lastUpdateMs = now;
-    // heading is set only during IMU calibration, NOT auto-updated
   } else {
     g_est.speed = 0;
     g_est.vel = {0, 0};
@@ -1243,33 +1269,48 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     client->text(resp);
     return;
   }
-  // Calibrate IMU: set heading = current IMU yaw (no GPS needed)
-  // IMPORTANT: check CAL_IMU_SELF FIRST because "CAL_IMU_SELF".startsWith("CAL_IMU") = true
+  // Calibrate IMU without GPS bearing: calibrated heading follows raw yaw.
+  // Prefer CAL_IMU,<bearing_deg> from GPS Debug when a target is selected.
   if (cmd == "CAL_IMU_SELF") {
-    Serial.printf("CAL: imuYaw=%.1f ready=%u headingBefore=%.1f\n",
-      g_imuYaw, imuReadyForCalibration() ? 1 : 0, g_est.heading);
+    Serial.printf("CAL_SELF: raw=%.1f heading=%.1f ready=%u headingBefore=%.1f\n",
+      g_imuRawYaw, g_imuYaw, imuReadyForCalibration() ? 1 : 0, g_est.heading);
     if (imuReadyForCalibration()) {
       float oldHeading = g_est.heading;
-      g_est.heading = g_imuYaw;
-      Serial.printf("CAL: SUCCESS heading %.1f -> %.1f\n", oldHeading, g_est.heading);
+      calibrateImuToHeading(g_imuRawYaw);
+      Serial.printf("CAL_SELF: SUCCESS heading %.1f -> %.1f offset=%.1f\n",
+        oldHeading, g_est.heading, g_imuCalibrationOffset);
       char resp[64];
-      snprintf(resp, sizeof(resp), "CAL_OK,heading=%.1f", g_est.heading);
+      snprintf(resp, sizeof(resp), "CAL_OK,heading=%.1f,offset=%.1f", g_est.heading, g_imuCalibrationOffset);
       client->text(resp);
       return;
     }
     client->text("ERR,CAL_NOT_READY");
     return;
   }
-  // Calibrate IMU: heading = current IMU yaw (ignore any parameters)
+  // Calibrate IMU to a real world heading: CAL_IMU,<bearing_degrees>.
+  // When the robot nose is aimed at the selected target, the app sends the
+  // GPS bearing to that target. From then on heading is updated continuously
+  // as raw BNO085 yaw + stored offset.
   if (cmd.startsWith("CAL_IMU")) {
-    Serial.printf("CAL_IMU: imuYaw=%.1f ready=%u headingBefore=%.1f\n",
-      g_imuYaw, imuReadyForCalibration() ? 1 : 0, g_est.heading);
+    float desiredHeading = NAN;
+    int comma = cmd.indexOf(',');
+    if (comma > 0) {
+      desiredHeading = cmd.substring(comma + 1).toFloat();
+    }
+    Serial.printf("CAL_IMU: raw=%.1f heading=%.1f desired=%.1f ready=%u headingBefore=%.1f\n",
+      g_imuRawYaw, g_imuYaw, desiredHeading, imuReadyForCalibration() ? 1 : 0, g_est.heading);
     if (imuReadyForCalibration()) {
       float oldHeading = g_est.heading;
-      g_est.heading = g_imuYaw;
-      Serial.printf("CAL_IMU: SUCCESS heading %.1f -> %.1f\n", oldHeading, g_est.heading);
+      if (isfinite(desiredHeading)) {
+        calibrateImuToHeading(desiredHeading);
+      } else {
+        calibrateImuToHeading(g_imuRawYaw);
+      }
+      Serial.printf("CAL_IMU: SUCCESS heading %.1f -> %.1f raw=%.1f offset=%.1f\n",
+        oldHeading, g_est.heading, g_imuRawYaw, g_imuCalibrationOffset);
       char resp[64];
-      snprintf(resp, sizeof(resp), "CAL_OK,heading=%.1f,imuYaw=%.1f", g_est.heading, g_imuYaw);
+      snprintf(resp, sizeof(resp), "CAL_OK,heading=%.1f,raw=%.1f,offset=%.1f",
+        g_est.heading, g_imuRawYaw, g_imuCalibrationOffset);
       client->text(resp);
       return;
     }
@@ -1387,15 +1428,13 @@ static void broadcastTelemetry() {
   );
   ws.textAll(msg);
 
-  // Calculate heading error: IMU_YAW - AZIMUT (normalized)
-  float headingError = normalizeAngle(g_imuYaw - g_est.heading);
   snprintf(msg, sizeof(msg),
     "NAV,%s,%u,%u,%.2f,%.1f",
     stateString(g_navState),
     g_routeIndex,
     g_routeCount,
     g_distToRouteEnd,
-    headingError
+    g_headingError
   );
   ws.textAll(msg);
 
@@ -1538,9 +1577,11 @@ static void navUpdate() {
     target = end;
   }
 
-  // IMU yaw: 0° = North, 90° = East, clockwise
-  // atan2(dy, dx) gives: 0° = North, 90° = East (matches IMU convention!)
-  float desiredHeading = atan2f(target.y - g_est.pos.y, target.x - g_est.pos.x) * 180.0f / PI;
+  // Heading convention: 0 deg = North (+Y), 90 deg = East (+X), clockwise.
+  // For local coordinates x=east, y=north this is atan2(dx, dy).
+  const float dxToTarget = target.x - g_est.pos.x;
+  const float dyToTarget = target.y - g_est.pos.y;
+  float desiredHeading = atan2f(dxToTarget, dyToTarget) * 180.0f / PI;
   if (desiredHeading < 0) desiredHeading += 360.0f;
 
   float headingError = normalizeAngle(desiredHeading - g_est.heading);
@@ -1563,8 +1604,8 @@ static void navUpdate() {
   if (g_est.quality == QUAL_GPS_HOLD_SHORT && fabsf(headingError) > 15) speed = 0.0f;
 
   float forwardCmd = (speed / MAX_SPEED) * MAX_SPEED_PERCENT * g_navForwardScale;
-  // headingError > 0: target is LEFT of current heading → need to turn left
-  // turnCmd > 0: right wheel faster → left turn
+  // headingError > 0 means the target is clockwise/right of current heading.
+  // For tank drive, right turn means left wheel faster than right wheel.
   float turnCmd = K_HEADING * headingError * g_navTurnScale;
   // Add gentle crosstrack correction (don't override heading)
   turnCmd += K_CROSSTRACK * g_crossTrackError * 0.1f * g_navTurnScale;
@@ -1574,12 +1615,14 @@ static void navUpdate() {
   if (g_invertForward) forwardCmd = -forwardCmd;
   if (g_invertSteering) turnCmd = -turnCmd;
 
-  int16_t left = (int16_t)(forwardCmd - turnCmd);
-  int16_t right = (int16_t)(forwardCmd + turnCmd);
+  int16_t left = (int16_t)(forwardCmd + turnCmd);
+  int16_t right = (int16_t)(forwardCmd - turnCmd);
 
   // Same as sound.ino: percent domain
   g_targetLeft = constrain(left, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   g_targetRight = constrain(right, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  g_lastCmdMs = now;
+  g_isFailSafeStopping = false;
   g_navReason = qualityString(g_est.quality);
 
   // Debug nav: log every 2 seconds
@@ -1743,8 +1786,8 @@ static void printStatus() {
     (unsigned long)g_gpsNmeaParsed);
 
   Serial.println("-- IMU --");
-  Serial.printf("  Yaw: %.1f deg, Fresh: %u, Age: %lu ms\n",
-    g_imuYaw, g_imuFresh ? 1 : 0,
+  Serial.printf("  Raw yaw: %.1f deg, Heading: %.1f deg, Offset: %.1f deg, Fresh: %u, Age: %lu ms\n",
+    g_imuRawYaw, g_imuYaw, g_imuCalibrationOffset, g_imuFresh ? 1 : 0,
     (unsigned long)(g_lastImuMs ? now - g_lastImuMs : 0));
 
   Serial.println("-- RTCM --");
