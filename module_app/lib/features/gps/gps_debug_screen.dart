@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -1081,8 +1080,12 @@ class _TrailPainter extends CustomPainter {
 
     // Grid
     final gridPaint = Paint()..color = Colors.white.withValues(alpha: 0.05)..strokeWidth = 1;
-    for (double x = 0; x <= size.width; x += 32) canvas.drawLine(Offset(x, 0), Offset(x, size.height), gridPaint);
-    for (double y = 0; y <= size.height; y += 32) canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
+    for (double x = 0; x <= size.width; x += 32) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), gridPaint);
+    }
+    for (double y = 0; y <= size.height; y += 32) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
+    }
 
     if (trail.isEmpty && current == null && target == null) {
       _drawCenterText(canvas, size, 'Нет данных');
@@ -1106,7 +1109,9 @@ class _TrailPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeCap = StrokeCap.round;
       final path = Path()..moveTo(projected[0].dx, projected[0].dy);
-      for (int i = 1; i < trail.length; i++) path.lineTo(projected[i].dx, projected[i].dy);
+      for (int i = 1; i < trail.length; i++) {
+        path.lineTo(projected[i].dx, projected[i].dy);
+      }
       canvas.drawPath(path, trailPaint);
     }
 
@@ -1190,8 +1195,12 @@ class _PerimeterPainter extends CustomPainter {
     canvas.drawRect(Offset.zero & size, Paint()..color = const Color(0xFF1A1F24));
 
     final gridPaint = Paint()..color = Colors.white.withValues(alpha: 0.08)..strokeWidth = 1;
-    for (double x = 0; x <= size.width; x += 32) canvas.drawLine(Offset(x, 0), Offset(x, size.height), gridPaint);
-    for (double y = 0; y <= size.height; y += 32) canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
+    for (double x = 0; x <= size.width; x += 32) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), gridPaint);
+    }
+    for (double y = 0; y <= size.height; y += 32) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
+    }
 
     if (points.isEmpty) {
       _drawCenterText(canvas, size, 'Нет точек');
@@ -1203,7 +1212,9 @@ class _PerimeterPainter extends CustomPainter {
     // Path
     if (screen.length >= 2) {
       final path = Path()..moveTo(screen.first.dx, screen.first.dy);
-      for (final p in screen.skip(1)) path.lineTo(p.dx, p.dy);
+      for (final p in screen.skip(1)) {
+        path.lineTo(p.dx, p.dy);
+      }
       if (screen.length >= 3) path.close();
       canvas.drawPath(path, Paint()..color = Colors.white..strokeWidth = 2..style = PaintingStyle.stroke..strokeCap = StrokeCap.round);
     }
