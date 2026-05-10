@@ -693,15 +693,7 @@ static void updateEstimator() {
     g_haveRtkFix = (qual == QUAL_RTK_FIXED_GOOD || qual == QUAL_RTK_FLOAT_OK);
     g_est.rtkFixed = (g_gps.carrier == 2);
     g_deadReckoning = false;
-
-    // Update heading: always sync with IMU yaw (it's calibrated to geographic north)
-    // GPS heading used only when moving fast enough
-    if (g_gps.speed > 0.3f && g_gps.heading >= 0 && g_gps.heading < 360) {
-      g_est.heading = g_gps.heading;
-    } else if (g_imuFresh) {
-      // Always use IMU yaw - it's calibrated and continuous
-      g_est.heading = g_imuYaw;
-    }
+    // heading is set only during IMU calibration, NOT auto-updated here
   } else if (qual == QUAL_GPS_HOLD_SHORT) {
     // Dead reckoning
     if (!g_deadReckoning) {
@@ -719,9 +711,7 @@ static void updateEstimator() {
       g_est.pos.y += speed * cos(headingRad) * dt;
     }
     g_est.lastUpdateMs = now;
-    if (g_imuFresh) {
-      g_est.heading = g_imuYaw;
-    }
+    // heading is set only during IMU calibration, NOT auto-updated
   } else {
     g_est.speed = 0;
     g_est.vel = {0, 0};
