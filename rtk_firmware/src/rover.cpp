@@ -93,8 +93,8 @@ static constexpr float HOLD_SPEED = 0.05f;
 // Timing
 static constexpr uint32_t NAV_LOOP_MS = 50;
 static constexpr uint32_t MOTOR_SEND_MS = 20;
-static constexpr uint32_t STATUS_MS = 2000;
-static constexpr uint32_t TELEMETRY_MS = 200;
+static constexpr uint32_t STATUS_MS = 5000;
+static constexpr uint32_t TELEMETRY_MS = 500;
 static constexpr uint32_t MANUAL_CMD_TIMEOUT_MS = 400;
 
 // Motor control - same as sound.ino
@@ -694,12 +694,12 @@ static void updateEstimator() {
     g_est.rtkFixed = (g_gps.carrier == 2);
     g_deadReckoning = false;
 
-    // Update heading: prefer GPS when moving (it's calibrated to geographic north)
-    // Use GPS heading > 0 as indicator of valid movement-based heading
+    // Update heading: always sync with IMU yaw (it's calibrated to geographic north)
+    // GPS heading used only when moving fast enough
     if (g_gps.speed > 0.3f && g_gps.heading >= 0 && g_gps.heading < 360) {
       g_est.heading = g_gps.heading;
     } else if (g_imuFresh) {
-      // Fallback to IMU when stationary or GPS heading invalid
+      // Always use IMU yaw - it's calibrated and continuous
       g_est.heading = g_imuYaw;
     }
   } else if (qual == QUAL_GPS_HOLD_SHORT) {
@@ -1233,12 +1233,26 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     if (gpsHeading >= 0 && gpsHeading < 360 && g_imuFresh) {
       g_imuCalibrationOffset = normalizeAngle(gpsHeading - g_imuYaw);
       saveNavPrefs();
+      // Immediately sync heading to calibrated IMU yaw
+      g_est.heading = g_imuYaw;
       char resp[64];
-      snprintf(resp, sizeof(resp), "CAL_IMU,offset=%.1f", g_imuCalibrationOffset);
+      snprintf(resp, sizeof(resp), "CAL_IMU,offset=%.1f,heading=%.1f", g_imuCalibrationOffset, g_imuYaw);
       client->text(resp);
       return;
     }
     client->text("ERR,CAL_FAILED");
+    return;
+  }
+  // Calibrate IMU: set heading = current IMU yaw (no GPS needed)
+  if (cmd == "CAL_IMU_SELF") {
+    if (g_imuFresh) {
+      g_est.heading = g_imuYaw;
+      char resp[64];
+      snprintf(resp, sizeof(resp), "CAL_IMU_SELF,heading=%.1f", g_imuYaw);
+      client->text(resp);
+      return;
+    }
+    client->text("ERR,NO_IMU");
     return;
   }
   if (cmd.startsWith("NAV_CFG,")) {
@@ -1281,9 +1295,9 @@ static void broadcastTelemetry() {
   const uint32_t imuAge = g_lastImuMs ? now - g_lastImuMs : 99999;
   const char* carrier = g_gps.carrier == 2 ? "fixed" : (g_gps.carrier == 1 ? "float" : "none");
 
-  // Main telemetry: keep the old Flutter parser compatible.
+  // Main telemetry: simplified GPS + IMU + heading
   snprintf(msg, sizeof(msg),
-    "TEL,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu,%lu,%lu,%.1f,%lu,%u,%lu,%lu,%s,%lu,%lu,%lu",
+    "TEL,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.1f,%lu,%u,%s",
     g_gps.lat, g_gps.lon,
     0.0f,
     g_est.heading,
@@ -1294,79 +1308,22 @@ static void broadcastTelemetry() {
     g_gps.hAcc,
     g_gps.vAcc,
     g_gps.speed,
-    0.0f,
-    (unsigned long)gpsAge,
-    (unsigned long)g_rtcmBytes,
-    (unsigned long)rtcmTransportAge,
     g_imuYaw,
     (unsigned long)imuAge,
     g_imuFresh ? 1 : 0,
-    (unsigned long)rtcmTransportAge,
-    (unsigned long)rtcmF9pAge,
-    g_rtcmFresh ? "udp" : "none",
-    (unsigned long)g_f9pRtcmMsgs,
-    (unsigned long)g_f9pRtcmCrcFail,
-    (unsigned long)g_rtcmLastType
+    g_rtcmFresh ? "ok" : "nocorr"
   );
   ws.textAll(msg);
 
-  // Extended GPS info.
+  // Nav + Motor combined
   snprintf(msg, sizeof(msg),
-    "GPSDBG,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu",
-    g_gps.lat, g_gps.lon,
-    0.0f,
-    g_est.heading,
-    g_gps.fixType,
-    carrier,
-    g_gps.diff ? 1 : 0,
-    (uint8_t)g_gps.numSV,
-    g_gps.hAcc,
-    g_gps.vAcc,
-    g_gps.speed,
-    0.0f,
-    (unsigned long)gpsAge
-  );
-  ws.textAll(msg);
-
-  // RTCM status
-  snprintf(msg, sizeof(msg),
-    "RTCM,%lu,%lu,%lu,%lu,%s,%lu,%lu,%lu",
-    (unsigned long)g_rtcmBytes,
-    (unsigned long)rtcmTransportAge,
-    (unsigned long)rtcmTransportAge,
-    (unsigned long)rtcmF9pAge,
-    g_rtcmFresh ? "udp" : "none",
-    (unsigned long)g_f9pRtcmMsgs,
-    (unsigned long)g_f9pRtcmCrcFail,
-    (unsigned long)g_rtcmLastType
-  );
-  ws.textAll(msg);
-
-  // IMU status
-  snprintf(msg, sizeof(msg),
-    "IMU,%.1f,%lu,%u",
-    g_imuYaw,
-    (unsigned long)imuAge,
-    g_imuFresh ? 1 : 0
-  );
-  ws.textAll(msg);
-
-  snprintf(msg, sizeof(msg),
-    "NAV,%s,%u,%u,%.2f",
+    "NAV,%s,%u,%u,%.2f,%d,%d,%d,%d",
     stateString(g_navState),
     g_routeIndex,
     g_routeCount,
-    g_distToRouteEnd
-  );
-  ws.textAll(msg);
-
-  // Motor status
-  snprintf(msg, sizeof(msg),
-    "MOTOR,%d,%d,%u,%d,%d,%d,%d",
+    g_distToRouteEnd,
     g_curLeft, g_curRight,
-    g_haveMotorFeedback ? 1 : 0,
-    g_motorSpeedL, g_motorSpeedR,
-    g_motorBatVoltage, g_motorBoardTemp
+    g_motorSpeedL, g_motorSpeedR
   );
   ws.textAll(msg);
 }
@@ -1856,4 +1813,7 @@ void loop() {
 
   // Status
   printStatus();
+
+  // Yield to let WiFi/AsyncWebServer process
+  yield();
 }
