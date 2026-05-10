@@ -617,6 +617,7 @@ static bool initImu() {
 static void updateImu() {
   if (!g_imuOk) return;
   sh2_SensorValue_t value;
+  static uint32_t lastDebugMs = 0;
   while (bno08x.getSensorEvent(&value)) {
     if (value.sensorId == SH2_GAME_ROTATION_VECTOR) {
       float qw = value.un.gameRotationVector.real;
@@ -635,6 +636,13 @@ static void updateImu() {
 
       g_lastImuMs = millis();
       g_imuFresh = true;
+
+      // Debug every 2 seconds
+      uint32_t now = millis();
+      if (now - lastDebugMs > 2000) {
+        lastDebugMs = now;
+        Serial.printf("IMU: yaw=%.1f fresh=1\n", g_imuYaw);
+      }
     }
   }
   if (g_lastImuMs > 0 && millis() - g_lastImuMs > IMU_TIMEOUT_MS) {
@@ -976,6 +984,8 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   String cmd = String(msg);
   cmd.trim();
 
+  Serial.printf("WS CMD: '%s'\n", cmd.c_str());
+
   if (cmd == "PING") { client->text("PONG"); return; }
   // FREE: stop sending motor commands (release hoverboard from lock)
   if (cmd == "FREE") {
@@ -1217,28 +1227,30 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     client->text(resp);
     return;
   }
-  // Calibrate IMU to GPS heading
-  if (cmd.startsWith("CAL_IMU,")) {
-    float gpsHeading = cmd.substring(8).toFloat();
-    if (gpsHeading >= 0 && gpsHeading < 360 && g_imuFresh) {
-      g_imuCalibrationOffset = normalizeAngle(gpsHeading - g_imuYaw);
-      saveNavPrefs();
-      // Immediately sync heading to calibrated IMU yaw
+  // Calibrate IMU: set heading = current IMU yaw (no GPS needed)
+  // IMPORTANT: check CAL_IMU_SELF FIRST because "CAL_IMU_SELF".startsWith("CAL_IMU") = true
+  if (cmd == "CAL_IMU_SELF") {
+    Serial.printf("CAL: imuYaw=%.1f imuFresh=%u headingBefore=%.1f\n",
+      g_imuYaw, g_imuFresh ? 1 : 0, g_est.heading);
+    if (g_imuFresh) {
       g_est.heading = g_imuYaw;
+      Serial.printf("CAL: headingAfter=%.1f\n", g_est.heading);
       char resp[64];
-      snprintf(resp, sizeof(resp), "CAL_IMU,offset=%.1f,heading=%.1f", g_imuCalibrationOffset, g_imuYaw);
+      snprintf(resp, sizeof(resp), "CAL_IMU_SELF,heading=%.1f", g_imuYaw);
       client->text(resp);
       return;
     }
-    client->text("ERR,CAL_FAILED");
+    client->text("ERR,NO_IMU");
     return;
   }
-  // Calibrate IMU: set heading = current IMU yaw (no GPS needed)
-  if (cmd == "CAL_IMU_SELF") {
+  // Calibrate IMU: heading = current IMU yaw (ignore any parameters)
+  if (cmd.startsWith("CAL_IMU")) {
+    Serial.printf("CAL_IMU: imuYaw=%.1f imuFresh=%u\n", g_imuYaw, g_imuFresh ? 1 : 0);
     if (g_imuFresh) {
       g_est.heading = g_imuYaw;
+      Serial.printf("CAL_IMU: heading set to %.1f\n", g_imuYaw);
       char resp[64];
-      snprintf(resp, sizeof(resp), "CAL_IMU_SELF,heading=%.1f", g_imuYaw);
+      snprintf(resp, sizeof(resp), "CAL_IMU,heading=%.1f,imuYaw=%.1f", g_est.heading, g_imuYaw);
       client->text(resp);
       return;
     }
@@ -1381,6 +1393,8 @@ static void broadcastTelemetry() {
 // ============== NAVIGATION UPDATE ==============
 
 static void navUpdate() {
+  uint32_t now = millis();
+
   if (g_navState != STATE_RUNNING) {
     if (g_manualActive) return;
     // Navigation not active - motors controlled by manual or idle
@@ -1528,7 +1542,11 @@ static void navUpdate() {
 
   float forwardCmd = (speed / MAX_SPEED) * MAX_SPEED_PERCENT * g_navForwardScale;
   if (fabsf(headingError) > 70.0f) forwardCmd = 0.0f;
-  float turnCmd = (K_HEADING * headingError + K_CROSSTRACK * g_crossTrackError) * g_navTurnScale;
+  // headingError = desiredHeading - heading: positive = target LEFT, negative = target RIGHT
+  // Positive turnCmd should create LEFT turn: left = forwardCmd + turnCmd, right = forwardCmd - turnCmd
+  // But current mixing does: left = forwardCmd - turnCmd, right = forwardCmd + turnCmd (right turn for positive)
+  // So we need to INVERT turnCmd to get correct behavior
+  float turnCmd = -(K_HEADING * headingError + K_CROSSTRACK * g_crossTrackError) * g_navTurnScale;
   turnCmd = constrain(turnCmd, -MAX_SPEED_PERCENT * 0.65f, MAX_SPEED_PERCENT * 0.65f);
 
   if (g_invertForward) forwardCmd = -forwardCmd;
@@ -1541,6 +1559,16 @@ static void navUpdate() {
   g_targetLeft = constrain(left, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   g_targetRight = constrain(right, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   g_navReason = qualityString(g_est.quality);
+
+  // Debug nav: log every 2 seconds
+  static uint32_t lastNavDebug = 0;
+  if (now - lastNavDebug > 2000) {
+    lastNavDebug = now;
+    Serial.printf("NAV: pos=(%.2f,%.2f) heading=%.1f imuYaw=%.1f target=(%.2f,%.2f) desiredHdg=%.1f hdgErr=%.1f turnCmd=%.1f L=%d R=%d\n",
+      g_est.pos.x, g_est.pos.y, g_est.heading, g_imuYaw,
+      target.x, target.y, desiredHeading, headingError,
+      turnCmd, g_targetLeft, g_targetRight);
+  }
 }
 
 // ============== MOTOR CONTROL (same as sound.ino) ==============
