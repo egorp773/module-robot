@@ -120,6 +120,11 @@ static constexpr uint32_t CFG_SIGNAL_GLO_ENA = 0x10310025;
 static constexpr uint32_t CFG_SIGNAL_GLO_L1_ENA = 0x10310018;
 static constexpr uint32_t CFG_SIGNAL_GLO_L2_ENA = 0x1031001A;
 
+// UBX-CFG-NMEA: принудительный режим UBX (игнорирует NMEA mode)
+static constexpr uint32_t CFG_NMEA_PROTOVER = 0x2099001A;
+static constexpr uint32_t CFG_NMEA_OUT_PROTOVERSION = 0x2099001B;
+static constexpr uint32_t CFG_NMEA_BRDOT = 0x20990026;
+
 // Состояние
 static bool wifiConnected = false;
 static bool gpsConfigured = false;
@@ -236,7 +241,7 @@ void configureRtcmOutput() {
   sendValset(CFG_RTCM_1124, 1, 1);
   sendValset(CFG_RTCM_1230, 10, 1);
 
-  sendCfgMsg(0xF5, 0x05, 1);   // RTCM3 1005
+  sendCfgMsg(0xF5, 0x05, 10);  // RTCM3 1005 - чаще (каждые 100 мс при 10Hz)
   sendCfgMsg(0xF5, 0x4A, 1);   // RTCM3 1074 GPS MSM4
   sendCfgMsg(0xF5, 0x54, 1);   // RTCM3 1084 GLONASS MSM4
   sendCfgMsg(0xF5, 0x5E, 1);   // RTCM3 1094 Galileo MSM4
@@ -260,12 +265,82 @@ void configureGnssSignals() {
   sendValset(CFG_SIGNAL_GLO_L2_ENA, 1, 1);
 }
 
+// Принудительно включает UBX протокол (важно если GPS в NMEA режиме)
+void forceUbxMode() {
+  Serial.println("BASE: forcing UBX protocol mode...");
+
+  // UBX-CFG-NMEA: отключаем NMEA режим, включаем UBX
+  // b2=0x00 отключает compatibility mode, filter=0 фильтрует NMEA
+  uint8_t nmeaPayload[12] = {0};
+  nmeaPayload[0] = 0x00;  // fixme: major NMEA version (ignored if outProtoVersion=1)
+  nmeaPayload[1] = 0x00;  // filter flags
+  nmeaPayload[2] = 0x00;  // nmeaVersion = 0 = unknown/out
+  nmeaPayload[3] = 0x00;  // flags
+  nmeaPayload[4] = 0x00;  // inProtoMask: UBX only (0x01)
+  nmeaPayload[5] = 0x01;  // (continued)
+  nmeaPayload[6] = 0x00;  // outProtoMask: UBX only (0x01)
+  nmeaPayload[7] = 0x01;  // (continued)
+  nmeaPayload[8] = 0x00;  // outProtoVersion: 0 = current
+  nmeaPayload[9] = 0x00;  // (continued)
+  nmeaPayload[10] = 0x00; // bbr: 0
+  nmeaPayload[11] = 0x00; // (continued)
+
+  writeUbx(0x06, 0x41, nmeaPayload, sizeof(nmeaPayload));
+  GpsSerial.flush();
+  delay(100);
+
+  // Дополнительно: UBX-CFG-PRT для UART с протоколами UBX
+  // Port 1 = UART
+  uint8_t cfgPrt[32];
+  cfgPrt[0] = 0xB5; cfgPrt[1] = 0x62;  // sync
+  cfgPrt[2] = 0x06; cfgPrt[3] = 0x00;  // class, id
+  cfgPrt[4] = 0x14; cfgPrt[5] = 0x00;  // len = 20
+  cfgPrt[6] = 0x01;  // portID = UART
+  cfgPrt[7] = 0x00;  // reserved
+  cfgPrt[8] = 0x00; cfgPrt[9] = 0x00; cfgPrt[10] = 0x00; cfgPrt[11] = 0x00;  // txReady
+  cfgPrt[12] = 0xC0; cfgPrt[13] = 0x08; cfgPrt[14] = 0x00; cfgPrt[15] = 0x00;  // mode: 8N1
+  cfgPrt[16] = (uint8_t)GPS_BAUD;
+  cfgPrt[17] = (uint8_t)(GPS_BAUD >> 8);
+  cfgPrt[18] = (uint8_t)(GPS_BAUD >> 16);
+  cfgPrt[19] = (uint8_t)(GPS_BAUD >> 24);
+  cfgPrt[20] = 0x01; cfgPrt[21] = 0x00;  // inProtoMask = UBX only
+  cfgPrt[22] = 0x01; cfgPrt[23] = 0x00;  // outProtoMask = UBX only
+  cfgPrt[24] = 0x00; cfgPrt[25] = 0x00;  // flags
+  uint8_t ckA = 0, ckB = 0;
+  for (int i = 2; i <= 25; i++) { ckA += cfgPrt[i]; ckB += ckA; }
+  cfgPrt[26] = ckA; cfgPrt[27] = ckB;
+  GpsSerial.write(cfgPrt, 28);
+  GpsSerial.flush();
+  delay(100);
+
+  Serial.println("BASE: UBX mode forced");
+}
+
 void configureGps() {
   Serial.println("BASE: === GPS CONFIGURATION ===");
 
-  // Сначала переключим GPS на UBX протокол (CFG-PRT)
-  // Port 1 = UART, mode = 8N1, current baud, input UBX, output UBX+RTCM3.
-  sendCfgPrt(0x0001, 0x0021, "config");  // UBX in, UBX + RTCM3 out
+  // ПЕРВОЕ: сбрасываем GPS конфигурацию (BBR)
+  // Это КРИТИЧНО для сброса старого Survey-In режима
+  Serial.println("BASE: resetting GPS config (BBR clear)...");
+  uint8_t resetPayload[12] = {0};
+  resetPayload[0] = 0xFF; resetPayload[1] = 0xFF;  // clearMask: IOPORT + MSG
+  resetPayload[2] = 0x00; resetPayload[3] = 0x00;
+  resetPayload[4] = 0x00; resetPayload[5] = 0x00;
+  resetPayload[6] = 0x00; resetPayload[7] = 0x00;  // saveMask
+  resetPayload[8] = 0x00; resetPayload[9] = 0x00;
+  resetPayload[10] = 0x00; resetPayload[11] = 0x00;  // loadMask
+  writeUbx(0x06, 0x09, resetPayload, 12);
+  GpsSerial.flush();
+  delay(200);
+  Serial.println("BASE: GPS config reset done");
+
+  // ВТОРОЕ: очищаем буфер UART
+  while (GpsSerial.available()) GpsSerial.read();
+  delay(100);
+
+  // ТРЕТЬЕ: принудительно включаем UBX протокол
+  // Это КРИТИЧНО - если GPS в NMEA режиме, все UBX команды игнорируются!
+  forceUbxMode();
 
   // Survey-In: 10 минут, точность 1м
   configureGnssSignals();
@@ -276,6 +351,11 @@ void configureGps() {
   sendValset(CFG_TMODE_SVIN_ACC_LIMIT, SVIN_ACC_LIMIT_0_1MM, 4);
 
   configureRtcmOutput();
+
+  // ВАЖНО: открываем выходной протокол для RTCM3 (UBX-CFG-PRT)
+  // forceUbxMode() установил UBX only, теперь добавляем RTCM3
+  sendCfgPrt(0x0001, 0x0021, "ubx+rtcm");  // UBX in, UBX + RTCM3 out
+
   sendValset(CFG_MSGOUT_UBX_NAV_SVIN_UART1, 0, 1);
   sendValset(CFG_MSGOUT_UBX_NAV_PVT_UART1, 0, 1);
   sendCfgMsg(0x01, 0x3B, 0);   // UBX-NAV-SVIN off on UART1
@@ -298,6 +378,13 @@ void configureGps() {
   sendValset(CFG_TMODE_MODE, 1, 1);
   sendCfgTmode3SurveyIn();
   writeUbx(0x01, 0x3B, nullptr, 0);
+
+  // Очищаем буфер от мусора конфигурации
+  delay(100);
+  while (GpsSerial.available()) GpsSerial.read();
+  rtcmLen = 0;
+  rtcmExpectedLen = 0;
+  Serial.println("BASE: GPS config complete, starting fresh");
 
   Serial.println("BASE: === GPS CONFIGURED ===");
 }
@@ -735,7 +822,30 @@ void loop() {
   if (svinValid && !rtcmConfiguredAfterSvin) {
     rtcmConfiguredAfterSvin = true;
     configureRtcmOutput();
-    sendCfgPrt(0x0001, 0x0020, "rtcm-only");  // UBX in, RTCM3 out
+
+    // Переключаем UART на UBX in + RTCM3 out (без UBX out чтобы не мешал)
+    uint8_t cfgPrt[32];
+    cfgPrt[0] = 0xB5; cfgPrt[1] = 0x62;
+    cfgPrt[2] = 0x06; cfgPrt[3] = 0x00;
+    cfgPrt[4] = 0x14; cfgPrt[5] = 0x00;
+    cfgPrt[6] = 0x01;  // portID = UART
+    cfgPrt[7] = 0x00;  // reserved
+    cfgPrt[8] = 0x00; cfgPrt[9] = 0x00; cfgPrt[10] = 0x00; cfgPrt[11] = 0x00;  // txReady
+    cfgPrt[12] = 0xC0; cfgPrt[13] = 0x08; cfgPrt[14] = 0x00; cfgPrt[15] = 0x00;  // mode: 8N1
+    cfgPrt[16] = (uint8_t)GPS_BAUD;
+    cfgPrt[17] = (uint8_t)(GPS_BAUD >> 8);
+    cfgPrt[18] = (uint8_t)(GPS_BAUD >> 16);
+    cfgPrt[19] = (uint8_t)(GPS_BAUD >> 24);
+    cfgPrt[20] = 0x01; cfgPrt[21] = 0x00;  // inProtoMask = UBX only
+    cfgPrt[22] = 0x20; cfgPrt[23] = 0x00;  // outProtoMask = RTCM3 only
+    cfgPrt[24] = 0x00; cfgPrt[25] = 0x00;  // flags
+    uint8_t ckA = 0, ckB = 0;
+    for (int i = 2; i <= 25; i++) { ckA += cfgPrt[i]; ckB += ckA; }
+    cfgPrt[26] = ckA; cfgPrt[27] = ckB;
+    GpsSerial.write(cfgPrt, 28);
+    GpsSerial.flush();
+    delay(200);
+    Serial.println("BASE: switched to RTCM-only output mode");
     delay(200);
     while (GpsSerial.available()) {
       GpsSerial.read();

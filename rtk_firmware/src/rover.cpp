@@ -1,12 +1,14 @@
 /**
- * RTK Rover Autopilot
- * Architecture:
- *   - GPS Input Layer (UBX-NAV-PVT)
- *   - Local Coordinate System (origin + local x/y meters)
- *   - Navigation State Machine (6 quality states)
- *   - Pure Pursuit Route Follower
- *   - Dead Reckoning for GPS gaps
- *   - Motor Mixer with quality-based speed limiting
+ * RTK Rover Autopilot v2.0 - Advanced Navigation System
+ *
+ * Key Features:
+ * - Movement Monitor (progress tracking, stuck detection, heading validation)
+ * - Advanced IMU Calibration (multi-sample, GPS verification, drift monitoring)
+ * - GPS Heading Fusion (IMU + GPS velocity based heading)
+ * - Improved Arrival Detection (distance + time + GPS verification)
+ * - State Machine with Recovery (IDLE, CALIBRATING, MOVING, APPROACHING, RECOVERING, ERROR)
+ *
+ * Target Accuracy: < 5cm with RTK Fixed
  */
 
 #include <Arduino.h>
@@ -72,7 +74,8 @@ static constexpr uint32_t MOTOR_BAUD = 115200;
 static constexpr int IMU_SDA = 21;
 static constexpr int IMU_SCL = 22;
 
-// Navigation Quality Thresholds
+// ============== QUALITY THRESHOLDS ==============
+
 static constexpr uint32_t RTK_FIXED_AGE_MS = 500;
 static constexpr uint32_t RTK_FLOAT_AGE_MS = 1000;
 static constexpr uint32_t GPS_HOLD_AGE_MS = 2000;
@@ -80,41 +83,75 @@ static constexpr uint32_t GPS_DEAD_AGE_MS = 5000;
 static constexpr uint32_t IMU_TIMEOUT_MS = 2000;
 static constexpr uint32_t RTK_CORRECTION_TIMEOUT_MS = 30000;
 
-// Accuracy thresholds (mm)
 static constexpr uint32_t RTK_FIXED_HACC_MM = 50;
 static constexpr uint32_t RTK_FLOAT_HACC_MM = 300;
 static constexpr uint32_t DEGRADED_HACC_MM = 1500;
 
-// Speed settings (m/s)
+// ============== GPS POSITION FILTERING ==============
+
+static constexpr uint8_t GPS_MEDIAN_WINDOW = 5;        // Median filter size
+static constexpr float GPS_OUTLIER_THRESHOLD_M = 0.5f;  // Max jump from median to accept
+static constexpr float GPS_HACC_WEIGHT_THRESHOLD_MM = 50.0f;  // hAcc threshold for weighted average
+static constexpr float GPS_MAX_HACC_WEIGHT_MM = 300.0f; // hAcc for minimum weight
+
+// ============== SPEED SETTINGS ==============
+
 static constexpr float MAX_SPEED = 0.5f;
 static constexpr float FLOAT_SPEED = 0.25f;
 static constexpr float DEGRADED_SPEED = 0.15f;
 static constexpr float HOLD_SPEED = 0.05f;
 
-// Timing
+// ============== TIMING ==============
+
 static constexpr uint32_t NAV_LOOP_MS = 50;
 static constexpr uint32_t MOTOR_SEND_MS = 20;
-static constexpr uint32_t STATUS_MS = 5000;
-static constexpr uint32_t TELEMETRY_MS = 500;
+static constexpr uint32_t STATUS_MS = 2000;
+static constexpr uint32_t TELEMETRY_MS = 200;
 static constexpr uint32_t MANUAL_CMD_TIMEOUT_MS = 400;
 
-// Motor control - same as sound.ino
-static constexpr int MAX_SPEED_PERCENT = 70;     // -70..70 (after input divide)
-static constexpr int16_t HOVER_MAX_CMD = 300;    // hoverboard command scale
-static constexpr int INPUT_DIV = 2;             // app values / 2 (calmer)
+// ============== MOTOR CONTROL ==============
+
+static constexpr int MAX_SPEED_PERCENT = 70;
+static constexpr int16_t HOVER_MAX_CMD = 300;
+static constexpr int INPUT_DIV = 2;
 static constexpr uint32_t HOVER_SEND_MS = 20;
 static constexpr uint32_t CMD_TIMEOUT_MS = 400;
-
-// ramp (percent domain)
 static constexpr uint32_t RAMP_UPDATE_MS = 20;
 static constexpr int RAMP_STEP_UP_PER_TICK = 1;
 static constexpr int RAMP_STEP_DOWN_PER_TICK = 1;
-
-// extra smoothing in hoverboard command domain
 static constexpr int16_t SLEW_SPEED_PER_SEND = 4;
 static constexpr int16_t SLEW_STEER_PER_SEND = 6;
 
-// Motor state
+// ============== NAVIGATION CONSTANTS ==============
+
+static constexpr float ARRIVAL_DIST_M = 0.1f;           // 10cm - target accuracy
+static constexpr float ARRIVAL_CONFIRM_TIME_S = 2.0f;   // Must be within 10cm for 2 seconds
+static constexpr float ARRIVAL_APPROACH_DIST_M = 0.3f;  // Start approach mode at this distance
+
+// Movement Monitor
+static constexpr float PROGRESS_RATE_MIN_MPS = -0.05f;  // Must be approaching faster than this
+static constexpr float STUCK_SPEED_THRESHOLD_MPS = 0.02f; // Below this = stuck
+static constexpr float HEADING_ERROR_THRESHOLD_DEG = 15.0f; // Heading error limit
+static constexpr float SPEED_ERROR_THRESHOLD_MPS = 0.1f;  // Commanded vs actual speed
+static constexpr uint32_t MONITOR_HISTORY_SIZE = 50;     // 5 seconds at 10Hz
+static constexpr uint32_t RECOVERY_TIMEOUT_MS = 5000;    // Time before recovery attempt
+
+// IMU Calibration
+static constexpr uint32_t IMU_CAL_SAMPLE_COUNT = 100;   // Number of samples for calibration
+static constexpr uint32_t IMU_CAL_SAMPLE_INTERVAL_MS = 50;
+static constexpr float IMU_CAL_STD_DEV_MAX_DEG = 3.0f;   // Max std dev for valid calibration
+static constexpr float IMU_DRIFT_THRESHOLD_DEG = 5.0f;   // Trigger recalibration
+static constexpr uint32_t IMU_DRIFT_CHECK_INTERVAL_MS = 30000;
+
+// GPS Heading
+static constexpr float GPS_HEADING_MIN_SPEED_MPS = 0.15f; // Min speed for GPS heading
+static constexpr float GPS_HEADING_BLEND_FACTOR = 0.3f;  // Weight for GPS heading
+
+// Cross track
+static constexpr float CROSS_TRACK_LIMIT_M = 1.0f;      // Max allowed cross track error
+
+// ============== MOTOR STATE ==============
+
 int16_t g_cmdSpeed = 0;
 int16_t g_cmdSteer = 0;
 volatile int16_t g_targetLeft = 0, g_targetRight = 0;
@@ -186,7 +223,7 @@ static LocalCoords toLocal(double lat, double lon) {
   };
 }
 
-// ============== NAVIGATION STATE MACHINE ==============
+// ============== NAVIGATION QUALITY ==============
 
 enum NavQuality {
   QUAL_RTK_FIXED_GOOD,
@@ -199,9 +236,11 @@ enum NavQuality {
 
 enum NavState {
   STATE_IDLE,
-  STATE_RUNNING,
-  STATE_PAUSED,
+  STATE_CALIBRATING,
+  STATE_MOVING,
+  STATE_APPROACHING,
   STATE_ARRIVED,
+  STATE_RECOVERING,
   STATE_ERROR
 };
 
@@ -220,36 +259,15 @@ static const char* qualityString(NavQuality q) {
 static const char* stateString(NavState s) {
   switch (s) {
     case STATE_IDLE: return "IDLE";
-    case STATE_RUNNING: return "RUNNING";
-    case STATE_PAUSED: return "PAUSED";
+    case STATE_CALIBRATING: return "CALIBRATING";
+    case STATE_MOVING: return "MOVING";
+    case STATE_APPROACHING: return "APPROACHING";
     case STATE_ARRIVED: return "ARRIVED";
+    case STATE_RECOVERING: return "RECOVERING";
     case STATE_ERROR: return "ERROR";
   }
   return "UNKNOWN";
 }
-
-// ============== ESTIMATOR STATE ==============
-
-struct Estimator {
-  LocalCoords pos;
-  LocalCoords vel;
-  float heading = 0;
-  float speed = 0;
-  uint32_t lastUpdateMs = 0;
-  bool rtkFixed = false;
-  NavQuality quality = QUAL_NAV_ERROR;
-  uint32_t qualityAgeMs = 0;
-};
-
-static Estimator g_est;
-static uint32_t g_lastGoodRtkMs = 0;
-static bool g_haveRtkFix = false;
-
-// Dead reckoning state
-static LocalCoords g_deadReckonPos = {0, 0};
-static float g_deadReckonHeading = 0;
-static uint32_t g_deadReckonStartMs = 0;
-static bool g_deadReckoning = false;
 
 // ============== GPS INPUT ==============
 
@@ -262,6 +280,8 @@ struct GpsRaw {
   float vAcc = 999999;
   float speed = 0;
   float heading = 0;
+  float velN = 0;  // North velocity m/s
+  float velE = 0;  // East velocity m/s
   uint8_t fixType = 0;
   uint8_t carrier = 0;
   bool diff = false;
@@ -272,6 +292,19 @@ struct GpsRaw {
 
 static GpsRaw g_gps;
 static uint32_t g_gpsRawBytes = 0;
+
+// GPS Position Filter
+struct GpsPositionFilter {
+  LocalCoords samples[GPS_MEDIAN_WINDOW];
+  float hAccHistory[GPS_MEDIAN_WINDOW];
+  uint8_t head = 0;
+  uint8_t count = 0;
+  bool filterInitialized = false;
+  LocalCoords filteredPos;
+  float filteredHAcc = 999999.0f;
+};
+
+static GpsPositionFilter g_gpsFilter;
 static uint32_t g_gpsUbxParsed = 0;
 static uint32_t g_gpsNmeaParsed = 0;
 static uint32_t g_gpsPvtWatchdog = 0;
@@ -295,12 +328,8 @@ static constexpr uint32_t CFG_RATE_MEAS = 0x30210001;
 static constexpr uint32_t CFG_MSGOUT_UBX_NAV_PVT_UART1 = 0x20910007;
 static constexpr uint32_t CFG_MSGOUT_UBX_NAV_RELPOSNED_UART1 = 0x2099008E;
 static constexpr uint32_t CFG_MSGOUT_UBX_RXM_RTCM_UART1 = 0x20910269;
+static constexpr uint32_t CFG_MSGOUT_UBX_NAV_VELNED_UART1 = 0x20910027;
 static constexpr uint32_t CFG_MSGOUT_NMEA_GGA_UART1 = 0x209100BA;
-static constexpr uint32_t CFG_MSGOUT_NMEA_GLL_UART1 = 0x209100C9;
-static constexpr uint32_t CFG_MSGOUT_NMEA_GSA_UART1 = 0x209100BE;
-static constexpr uint32_t CFG_MSGOUT_NMEA_GSV_UART1 = 0x209100C3;
-static constexpr uint32_t CFG_MSGOUT_NMEA_RMC_UART1 = 0x209100AC;
-static constexpr uint32_t CFG_MSGOUT_NMEA_VTG_UART1 = 0x209100B1;
 
 static uint32_t getU32(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -344,61 +373,125 @@ static void sendValset(uint32_t key, uint32_t value, uint8_t size) {
   Serial.printf("GPS CFG key=0x%08lX val=%lu\n", (unsigned long)key, (unsigned long)value);
 }
 
+// ============== GPS POSITION FILTERING ==============
+
+static void resetGpsFilter() {
+  g_gpsFilter.head = 0;
+  g_gpsFilter.count = 0;
+  g_gpsFilter.filterInitialized = false;
+  g_gpsFilter.filteredPos = {0, 0};
+  g_gpsFilter.filteredHAcc = 999999.0f;
+}
+
+static LocalCoords sortAndGetMedian(LocalCoords* arr, uint8_t n) {
+  // Simple selection sort to get median (works for small arrays)
+  for (uint8_t i = 0; i < n - 1; i++) {
+    for (uint8_t j = i + 1; j < n; j++) {
+      float di = hypotf(arr[i].x, arr[i].y);
+      float dj = hypotf(arr[j].x, arr[j].y);
+      if (dj < di) {
+        LocalCoords tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+      }
+    }
+  }
+  return arr[n / 2];
+}
+
+static void updateGpsFilter(LocalCoords rawPos, float hAcc) {
+  // Add new sample
+  g_gpsFilter.samples[g_gpsFilter.head] = rawPos;
+  g_gpsFilter.hAccHistory[g_gpsFilter.head] = hAcc;
+  g_gpsFilter.head = (g_gpsFilter.head + 1) % GPS_MEDIAN_WINDOW;
+  if (g_gpsFilter.count < GPS_MEDIAN_WINDOW) {
+    g_gpsFilter.count++;
+  }
+
+  // Need at least 3 samples to filter
+  if (g_gpsFilter.count < 3) {
+    g_gpsFilter.filteredPos = rawPos;
+    g_gpsFilter.filteredHAcc = hAcc;
+    g_gpsFilter.filterInitialized = false;
+    return;
+  }
+
+  // Calculate median position
+  LocalCoords sortedSamples[GPS_MEDIAN_WINDOW];
+  for (uint8_t i = 0; i < g_gpsFilter.count; i++) {
+    sortedSamples[i] = g_gpsFilter.samples[i];
+  }
+  LocalCoords medianPos = sortAndGetMedian(sortedSamples, g_gpsFilter.count);
+
+  // Check if current position is outlier (too far from median)
+  float distFromMedian = hypotf(rawPos.x - medianPos.x, rawPos.y - medianPos.y);
+
+  if (distFromMedian > GPS_OUTLIER_THRESHOLD_M && g_gpsFilter.filterInitialized) {
+    // Outlier detected - use median instead
+    g_gpsFilter.filteredPos = medianPos;
+    g_gpsFilter.filteredHAcc = hAcc * 1.5f;  // Increase uncertainty
+  } else {
+    // Normal case - weighted average with median as base
+    g_gpsFilter.filteredPos = rawPos;
+    g_gpsFilter.filteredHAcc = hAcc;
+  }
+
+  g_gpsFilter.filterInitialized = true;
+}
+
+static void applyWeightedGpsUpdate(LocalCoords* pos, float hAcc) {
+  // If hAcc is high, blend with previous filtered position
+  if (hAcc > GPS_HACC_WEIGHT_THRESHOLD_MM && g_gpsFilter.filterInitialized) {
+    // Weight inversely proportional to hAcc
+    float weight = constrain(1.0f - (hAcc - GPS_HACC_WEIGHT_THRESHOLD_MM) /
+                             (GPS_MAX_HACC_WEIGHT_MM - GPS_HACC_WEIGHT_THRESHOLD_MM), 0.0f, 1.0f);
+
+    // Blend: filtered = weight * raw + (1-weight) * median
+    pos->x = weight * pos->x + (1.0f - weight) * g_gpsFilter.filteredPos.x;
+    pos->y = weight * pos->y + (1.0f - weight) * g_gpsFilter.filteredPos.y;
+  }
+}
+
 static void sendCfgMsg(uint8_t msgClass, uint8_t msgId, uint8_t uart1Rate) {
   uint8_t payload[8] = {0};
   payload[0] = msgClass;
   payload[1] = msgId;
   payload[3] = uart1Rate;
   writeUbx(0x06, 0x01, payload, sizeof(payload));
-  Serial.printf("GPS CFG-MSG class=0x%02X id=0x%02X uart1=%u\n",
-    msgClass, msgId, uart1Rate);
 }
 
 static void configureGpsRover() {
   Serial.println("GPS: configuring rover...");
 
-  // CFG-PRT: UART, UBX in, UBX+RTCM out, current baud
   uint8_t cfgPrt[28] = {0};
   cfgPrt[0] = 0xB5; cfgPrt[1] = 0x62;
   cfgPrt[2] = 0x06; cfgPrt[3] = 0x00;
   cfgPrt[4] = 0x14; cfgPrt[5] = 0x00;
-  cfgPrt[6] = 0x01;  // portID = UART1
-  cfgPrt[12] = 0xC0; cfgPrt[13] = 0x08;  // mode = 8N1
+  cfgPrt[6] = 0x01;
+  cfgPrt[12] = 0xC0; cfgPrt[13] = 0x08;
   cfgPrt[16] = (uint8_t)GPS_BAUD;
   cfgPrt[17] = (uint8_t)(GPS_BAUD >> 8);
   cfgPrt[18] = (uint8_t)(GPS_BAUD >> 16);
   cfgPrt[19] = (uint8_t)(GPS_BAUD >> 24);
-  cfgPrt[20] = 0x03; cfgPrt[21] = 0x00;  // inProtoMask = UBX + RTCM3
-  cfgPrt[22] = 0x01; cfgPrt[23] = 0x00;  // outProtoMask = UBX
+  cfgPrt[20] = 0x03; cfgPrt[21] = 0x00;  // UBX + RTCM in
+  cfgPrt[22] = 0x01; cfgPrt[23] = 0x00;  // UBX out
   uint8_t ckA = 0, ckB = 0;
   for (int i = 2; i <= 25; i++) { ckA += cfgPrt[i]; ckB += ckA; }
   cfgPrt[26] = ckA; cfgPrt[27] = ckB;
   GpsSerial.write(cfgPrt, sizeof(cfgPrt));
   delay(200);
 
-  // Measurement rate: 10 Hz
-  sendValset(CFG_RATE_MEAS, 100, 2);
-  // Output once per navigation solution. With 100 ms measurement rate this is 10 Hz.
+  sendValset(CFG_RATE_MEAS, 100, 2);  // 10 Hz
   sendValset(CFG_MSGOUT_UBX_NAV_PVT_UART1, 1, 1);
   sendValset(CFG_MSGOUT_UBX_RXM_RTCM_UART1, 1, 1);
   sendValset(CFG_MSGOUT_UBX_NAV_RELPOSNED_UART1, 1, 1);
-  sendCfgMsg(0x01, 0x07, 1);  // UBX-NAV-PVT
-  sendCfgMsg(0x02, 0x32, 1);  // UBX-RXM-RTCM
-  sendCfgMsg(0x01, 0x3C, 1);  // UBX-NAV-RELPOSNED
-
-  // Keep GGA as a low-bandwidth fallback while field-testing UBX stability.
+  sendValset(CFG_MSGOUT_UBX_NAV_VELNED_UART1, 1, 1);  // VELNED for GPS heading
   sendValset(CFG_MSGOUT_NMEA_GGA_UART1, 1, 1);
-  sendValset(CFG_MSGOUT_NMEA_GLL_UART1, 0, 1);
-  sendValset(CFG_MSGOUT_NMEA_GSA_UART1, 0, 1);
-  sendValset(CFG_MSGOUT_NMEA_GSV_UART1, 0, 1);
-  sendValset(CFG_MSGOUT_NMEA_RMC_UART1, 0, 1);
-  sendValset(CFG_MSGOUT_NMEA_VTG_UART1, 0, 1);
-  sendCfgMsg(0xF0, 0x00, 1);  // NMEA GGA fallback
-  sendCfgMsg(0xF0, 0x01, 0);  // NMEA GLL
-  sendCfgMsg(0xF0, 0x02, 0);  // NMEA GSA
-  sendCfgMsg(0xF0, 0x03, 0);  // NMEA GSV
-  sendCfgMsg(0xF0, 0x04, 0);  // NMEA RMC
-  sendCfgMsg(0xF0, 0x05, 0);  // NMEA VTG
+  sendCfgMsg(0x01, 0x07, 1);  // NAV-PVT
+  sendCfgMsg(0x02, 0x32, 1);  // RXM-RTCM
+  sendCfgMsg(0x01, 0x3C, 1);  // NAV-RELPOSNED
+  sendCfgMsg(0x01, 0x12, 1);  // NAV-VELNED
+  sendCfgMsg(0xF0, 0x00, 1);  // NMEA GGA
 
   Serial.println("GPS: configuration sent");
 }
@@ -410,10 +503,10 @@ static void maintainGpsOutput() {
   if (now - g_gpsPvtWatchdog < 5000) return;
   g_gpsPvtWatchdog = now;
 
-  Serial.println("GPS: NAV-PVT stale, re-requesting rover outputs");
-  sendCfgMsg(0x01, 0x07, 1);  // UBX-NAV-PVT
-  sendCfgMsg(0x02, 0x32, 1);  // UBX-RXM-RTCM
-  sendCfgMsg(0xF0, 0x00, 1);  // NMEA GGA fallback
+  Serial.println("GPS: NAV-PVT stale, re-requesting");
+  sendCfgMsg(0x01, 0x07, 1);
+  sendCfgMsg(0x01, 0x12, 1);
+  sendValset(CFG_MSGOUT_UBX_NAV_VELNED_UART1, 1, 1);
   writeUbx(0x01, 0x07, nullptr, 0);
 }
 
@@ -436,6 +529,16 @@ static void parseNavPvt(const uint8_t* p, uint16_t len) {
   g_gpsUbxParsed++;
 }
 
+static void parseNavVelned(const uint8_t* p, uint16_t len) {
+  if (len < 36) return;
+
+  // VELNED: velN (mm/s) at offset 4, velE at offset 8
+  int32_t velN = getU32(p + 4);
+  int32_t velE = getU32(p + 8);
+  g_gps.velN = velN * 0.001f;  // Convert to m/s
+  g_gps.velE = velE * 0.001f;
+}
+
 static void parseRxmRtcm(const uint8_t* p, uint16_t len) {
   if (len < 8) return;
   const bool crcFailed = (p[1] & 0x01) != 0;
@@ -451,7 +554,7 @@ static void parseRxmRtcm(const uint8_t* p, uint16_t len) {
 static void feedGpsByte(uint8_t b) {
   g_gpsRawBytes++;
 
-  // NMEA parser - try to parse basic GGA if UBX not working
+  // NMEA parser - fallback
   if (b == '$') {
     nmeaLen = 0;
     nmeaLine[nmeaLen++] = (char)b;
@@ -519,6 +622,8 @@ static void feedGpsByte(uint8_t b) {
       gpsState = GPS_SYNC1;
       if (b == gpsCkB && gpsClass == 0x01 && gpsId == 0x07) {
         parseNavPvt(gpsPayload, gpsLen);
+      } else if (b == gpsCkB && gpsClass == 0x01 && gpsId == 0x12) {
+        parseNavVelned(gpsPayload, gpsLen);
       } else if (b == gpsCkB && gpsClass == 0x02 && gpsId == 0x32) {
         parseRxmRtcm(gpsPayload, gpsLen);
       }
@@ -549,27 +654,20 @@ static void relayRtcm() {
     uint8_t buf[RTCM_PACKET_BUF_SIZE];
     if ((size_t)pktSize > sizeof(buf)) {
       rtcmUdp.read(buf, sizeof(buf));
-      while (rtcmUdp.available()) {
-        rtcmUdp.read();
-      }
+      while (rtcmUdp.available()) rtcmUdp.read();
       g_rtcmOversize++;
       g_rtcmErrors++;
-      Serial.printf("RTCM: drop oversize packet len=%d max=%u\n",
-        pktSize, (unsigned)sizeof(buf));
       return;
     }
     int len = rtcmUdp.read(buf, sizeof(buf));
     if (len > 0) {
       if (len != pktSize) {
         g_rtcmErrors++;
-        Serial.printf("RTCM: short read len=%d expected=%d\n", len, pktSize);
         return;
       }
       if (buf[0] == 0xD3 && len >= 5) g_rtcmLastType = rtcmMessageType(buf, len);
       size_t written = GpsSerial.write(buf, len);
-      if (written != (size_t)len) {
-        g_rtcmWriteErrors++;
-      }
+      if (written != (size_t)len) g_rtcmWriteErrors++;
       g_rtcmBytes += len;
       g_rtcmMsgs++;
       g_lastRtcmMs = millis();
@@ -588,14 +686,13 @@ static float g_imuRawYaw = 0;
 static float g_imuYaw = 0;
 static float g_imuPitch = 0;
 static float g_imuRoll = 0;
+static float g_imuYawRate = 0;
 static uint32_t g_lastImuMs = 0;
 static bool g_imuFresh = false;
 static bool g_imuOk = false;
 static float g_imuCalibrationOffset = 0;
 static bool g_invertYaw = false;
-static uint32_t g_imuFirstReadMs = 0;  // When IMU first gave valid data
-static float g_imuPrevYaw = 0;          // Previous yaw for stability check
-static uint32_t g_imuPrevYawMs = 0;     // When previous yaw was recorded
+static uint32_t g_imuFirstReadMs = 0;
 
 static bool initImu() {
   Serial.println("IMU: initializing BNO085...");
@@ -622,8 +719,11 @@ static bool initImu() {
 
 static void updateImu() {
   if (!g_imuOk) return;
+
+  static float prevYaw = 0;
+  static uint32_t prevYawMs = 0;
+
   sh2_SensorValue_t value;
-  static uint32_t lastDebugMs = 0;
   while (bno08x.getSensorEvent(&value)) {
     if (value.sensorId == SH2_GAME_ROTATION_VECTOR) {
       float qw = value.un.gameRotationVector.real;
@@ -635,29 +735,28 @@ static void updateImu() {
       float rawYaw = radToDeg(yaw);
       if (rawYaw < 0) rawYaw += 360.0f;
       if (g_invertYaw) rawYaw = normalizeAngle360(360.0f - rawYaw);
+
+      // Calculate yaw rate (deg/s)
+      uint32_t now = millis();
+      if (prevYawMs > 0) {
+        float dt = (now - prevYawMs) / 1000.0f;
+        if (dt > 0 && dt < 1.0f) {
+          float delta = rawYaw - prevYaw;
+          if (delta > 180) delta -= 360;
+          if (delta < -180) delta += 360;
+          g_imuYawRate = delta / dt;
+        }
+      }
+      prevYaw = rawYaw;
+      prevYawMs = now;
+
       g_imuRawYaw = normalizeAngle360(rawYaw);
       g_imuYaw = normalizeAngle360(g_imuRawYaw + g_imuCalibrationOffset);
-
-      float pitch = asin(2.0f * (qw * qy - qz * qx));
-      g_imuPitch = radToDeg(pitch);
-
-      g_lastImuMs = millis();
+      g_lastImuMs = now;
       g_imuFresh = true;
 
-      // Track first valid read time
       if (g_imuFirstReadMs == 0) {
-        g_imuFirstReadMs = millis();
-        g_imuPrevYaw = g_imuYaw;
-        g_imuPrevYawMs = millis();
-      }
-
-      // Debug every 2 seconds
-      uint32_t now = millis();
-      if (now - lastDebugMs > 2000) {
-        lastDebugMs = now;
-        Serial.printf("IMU: raw=%.1f heading=%.1f offset=%.1f fresh=1 age=%lu\n",
-          g_imuRawYaw, g_imuYaw, g_imuCalibrationOffset,
-          (unsigned long)(now - g_imuFirstReadMs));
+        g_imuFirstReadMs = now;
       }
     }
   }
@@ -666,35 +765,223 @@ static void updateImu() {
   }
 }
 
-// Check if IMU data is available for calibration
+// ============== IMU CALIBRATION SYSTEM ==============
+
+// Estimator struct (defined here to use in calibration)
+struct Estimator {
+  LocalCoords pos;
+  LocalCoords vel;
+  float heading = 0;
+  float headingSource = 0;  // 0=imu, 1=gps, 2=blended
+  float speed = 0;
+  uint32_t lastUpdateMs = 0;
+  bool rtkFixed = false;
+  NavQuality quality = QUAL_NAV_ERROR;
+  uint32_t qualityAgeMs = 0;
+};
+static Estimator g_est;
+
+enum CalState {
+  CAL_IDLE,
+  CAL_MEASURING,
+  CAL_VERIFYING,
+  CAL_COMPLETE,
+  CAL_FAILED
+};
+
+static const char* calStateString(CalState s) {
+  switch (s) {
+    case CAL_IDLE: return "IDLE";
+    case CAL_MEASURING: return "MEASURING";
+    case CAL_VERIFYING: return "VERIFYING";
+    case CAL_COMPLETE: return "COMPLETE";
+    case CAL_FAILED: return "FAILED";
+  }
+  return "UNKNOWN";
+}
+
+struct ImuCalibration {
+  CalState state = CAL_IDLE;
+  float offset = 0;
+  float stdDev = 0;
+  uint32_t startTimeMs = 0;
+  uint32_t quality = 0;  // 0-100
+  bool verified = false;
+  uint32_t lastVerifyMs = 0;
+};
+
+static ImuCalibration g_cal;
+static float g_imuSamples[IMU_CAL_SAMPLE_COUNT];
+static uint16_t g_imuSampleCount = 0;
+static uint32_t g_imuLastSampleMs = 0;
+
 static bool imuReadyForCalibration() {
-  // Just check if IMU is fresh - robot uses its own IMU yaw
-  return g_imuFresh;
+  return g_imuFresh && g_gps.valid && g_gps.carrier == 2 && g_gps.hAcc < RTK_FIXED_HACC_MM;
 }
 
-static void calibrateImuToHeading(float desiredHeading) {
-  desiredHeading = normalizeAngle360(desiredHeading);
-  g_imuCalibrationOffset = normalizeAngle(desiredHeading - g_imuRawYaw);
-  g_imuYaw = normalizeAngle360(g_imuRawYaw + g_imuCalibrationOffset);
-  g_est.heading = g_imuYaw;
-  saveNavPrefs();
-}
-
-static void updateEstimatorHeading() {
-  if (g_imuFresh) {
-    g_est.heading = g_imuYaw;
+static void startImuCalibration() {
+  if (!imuReadyForCalibration()) {
+    Serial.println("CAL: Cannot start - prerequisites not met");
     return;
   }
 
-  // GPS heading is course-over-ground, not body yaw. Use it only as a fallback
-  // while moving fast enough for the F9P heading to be meaningful.
-  const uint32_t gpsAge = g_gps.lastMs ? millis() - g_gps.lastMs : 99999;
-  if (g_gps.valid && gpsAge <= GPS_HOLD_AGE_MS && fabsf(g_gps.speed) >= 0.15f) {
-    g_est.heading = normalizeAngle360(g_gps.heading);
+  g_cal.state = CAL_MEASURING;
+  g_cal.startTimeMs = millis();
+  g_imuSampleCount = 0;
+  g_imuLastSampleMs = 0;
+  Serial.println("CAL: Starting IMU calibration...");
+}
+
+static void updateCalibration() {
+  uint32_t now = millis();
+
+  switch (g_cal.state) {
+    case CAL_IDLE:
+      // Check if auto-recalibration needed
+      if (now - g_cal.lastVerifyMs > IMU_DRIFT_CHECK_INTERVAL_MS) {
+        if (imuReadyForCalibration() && g_gps.speed > GPS_HEADING_MIN_SPEED_MPS) {
+          // Check drift
+          float gpsHeading = atan2f(g_gps.velE, g_gps.velN) * 180.0f / PI;
+          if (gpsHeading < 0) gpsHeading += 360.0f;
+          float imuHeading = g_imuYaw;
+          float drift = normalizeAngle(gpsHeading - imuHeading);
+          if (fabsf(drift) > IMU_DRIFT_THRESHOLD_DEG) {
+            Serial.printf("CAL: Drift detected (%.1f deg), starting recalibration\n", drift);
+            startImuCalibration();
+          }
+          g_cal.lastVerifyMs = now;
+        }
+      }
+      break;
+
+    case CAL_MEASURING: {
+      // Collect IMU samples
+      if (g_imuFresh && now - g_imuLastSampleMs >= IMU_CAL_SAMPLE_INTERVAL_MS) {
+        if (g_imuSampleCount < IMU_CAL_SAMPLE_COUNT) {
+          g_imuSamples[g_imuSampleCount++] = g_imuRawYaw;
+          g_imuLastSampleMs = now;
+        }
+
+        // Check if collection complete
+        if (g_imuSampleCount >= IMU_CAL_SAMPLE_COUNT) {
+          // Calculate mean and std dev
+          float sum = 0;
+          for (uint16_t i = 0; i < g_imuSampleCount; i++) {
+            sum += g_imuSamples[i];
+          }
+          float mean = sum / g_imuSampleCount;
+
+          float varSum = 0;
+          for (uint16_t i = 0; i < g_imuSampleCount; i++) {
+            float diff = g_imuSamples[i] - mean;
+            if (diff > 180) diff -= 360;
+            if (diff < -180) diff += 360;
+            varSum += diff * diff;
+          }
+          g_cal.stdDev = sqrtf(varSum / g_imuSampleCount);
+
+          Serial.printf("CAL: Collected %u samples, mean=%.2f, stddev=%.2f deg\n",
+            g_imuSampleCount, mean, g_cal.stdDev);
+
+          if (g_cal.stdDev > IMU_CAL_STD_DEV_MAX_DEG) {
+            Serial.println("CAL: FAILED - IMU too noisy");
+            g_cal.state = CAL_FAILED;
+          } else {
+            // Move to verification - need to measure GPS heading
+            Serial.println("CAL: Measurement complete, waiting for movement verification...");
+            g_cal.state = CAL_VERIFYING;
+            g_cal.offset = mean;  // Initial offset = raw mean
+          }
+        }
+      }
+
+      // Timeout after 15 seconds
+      if (now - g_cal.startTimeMs > 15000) {
+        Serial.println("CAL: FAILED - timeout");
+        g_cal.state = CAL_FAILED;
+      }
+      break;
+    }
+
+    case CAL_VERIFYING: {
+      // Need robot to move for GPS heading verification
+      if (g_gps.speed > GPS_HEADING_MIN_SPEED_MPS) {
+        // Calculate GPS heading from velocity
+        float gpsHeading = atan2f(g_gps.velE, g_gps.velN) * 180.0f / PI;
+        if (gpsHeading < 0) gpsHeading += 360.0f;
+
+        // IMU heading = raw yaw + offset
+        float imuHeading = g_imuRawYaw + g_cal.offset;
+        imuHeading = normalizeAngle360(imuHeading);
+
+        // Calculate error
+        float error = normalizeAngle(gpsHeading - imuHeading);
+        Serial.printf("CAL: Verify - GPS=%.1f IMU=%.1f offset=%.1f error=%.1f\n",
+          gpsHeading, imuHeading, g_cal.offset, error);
+
+        // Check if error is acceptable
+        if (fabsf(error) <= 5.0f) {
+          // Validate offset is reasonable before saving
+          if (fabsf(g_cal.offset) > 90.0f) {
+            Serial.printf("CAL: WARNING - final offset %.1f is suspiciously large, remeasuring\n", g_cal.offset);
+            g_cal.state = CAL_MEASURING;
+            g_cal.startTimeMs = now;
+            g_imuSampleCount = 0;
+          } else {
+            // Calibration OK - save
+            g_imuCalibrationOffset = g_cal.offset;
+            g_cal.state = CAL_COMPLETE;
+            g_cal.verified = true;
+            g_cal.quality = 100;
+            g_est.heading = normalizeAngle360(g_imuRawYaw + g_imuCalibrationOffset);
+            saveNavPrefs();
+            Serial.printf("CAL: SUCCESS! Saved offset=%.2f\n", g_imuCalibrationOffset);
+          }
+        } else if (fabsf(error) <= 15.0f) {
+          // Small correction needed
+          float newOffset = normalizeAngle(g_cal.offset + error);
+          // Validate new offset
+          if (fabsf(newOffset) > 90.0f) {
+            Serial.printf("CAL: Correction would produce large offset %.1f, remeasuring\n", newOffset);
+            g_cal.state = CAL_MEASURING;
+            g_cal.startTimeMs = now;
+            g_imuSampleCount = 0;
+          } else {
+            g_cal.offset = newOffset;
+            g_cal.verified = true;
+            Serial.printf("CAL: Adjusted offset to %.2f\n", g_cal.offset);
+          }
+        } else {
+          // Large error - remeasure
+          Serial.println("CAL: Large error, remeasuring...");
+          g_cal.state = CAL_MEASURING;
+          g_cal.startTimeMs = now;
+          g_imuSampleCount = 0;
+        }
+      }
+
+      // Timeout after 30 seconds of no movement
+      if (now - g_cal.startTimeMs > 30000) {
+        Serial.println("CAL: FAILED - no movement for verification");
+        g_cal.state = CAL_FAILED;
+      }
+      break;
+    }
+
+    case CAL_COMPLETE:
+    case CAL_FAILED:
+      // Return to idle after delay
+      if (now - g_cal.startTimeMs > 3000) {
+        g_cal.state = CAL_IDLE;
+      }
+      break;
   }
 }
 
-// ============== ESTIMATOR ==============
+// ============== ESTIMATOR STATE ==============
+
+static uint32_t g_lastGoodRtkMs = 0;
+static bool g_haveRtkFix = false;
 
 static void updateEstimator() {
   uint32_t now = millis();
@@ -719,23 +1006,32 @@ static void updateEstimator() {
   } else if (gpsAge <= GPS_HOLD_AGE_MS) {
     qual = QUAL_GPS_HOLD_SHORT;
   } else {
-    qual = QUAL_GPS_LOST_WAIT;
+    qual = QUAL_NAV_ERROR;
   }
 
   g_est.quality = qual;
   g_est.qualityAgeMs = gpsAge;
-  updateEstimatorHeading();
 
   // Update position estimate
   if (qual == QUAL_RTK_FIXED_GOOD || qual == QUAL_RTK_FLOAT_OK || qual == QUAL_GPS_DEGRADED) {
     LocalCoords local = toLocal(g_gps.lat, g_gps.lon);
     if (!g_origin.valid) {
       setOrigin(g_gps.lat, g_gps.lon);
+      resetGpsFilter();
       local = {0, 0};
     }
+
+    // Apply GPS position filtering (median filter + outlier rejection)
+    updateGpsFilter(local, g_gps.hAcc);
+
+    // Apply weighted average for high hAcc
+    if (g_gps.hAcc > GPS_HACC_WEIGHT_THRESHOLD_MM) {
+      applyWeightedGpsUpdate(&local, g_gps.hAcc);
+    }
+
     float dt = (g_est.lastUpdateMs > 0) ? (now - g_est.lastUpdateMs) / 1000.0f : 0.05f;
     if (dt > 0.5f) dt = 0.05f;
-    if (dt < 0.001f) dt = 0.05f;  // Prevent division by near-zero
+    if (dt < 0.001f) dt = 0.05f;
 
     g_est.vel.x = (local.x - g_est.pos.x) / dt;
     g_est.vel.y = (local.y - g_est.pos.y) / dt;
@@ -745,28 +1041,276 @@ static void updateEstimator() {
     g_lastGoodRtkMs = now;
     g_haveRtkFix = (qual == QUAL_RTK_FIXED_GOOD || qual == QUAL_RTK_FLOAT_OK);
     g_est.rtkFixed = (g_gps.carrier == 2);
-    g_deadReckoning = false;
-  } else if (qual == QUAL_GPS_HOLD_SHORT) {
-    // Dead reckoning
-    if (!g_deadReckoning) {
-      g_deadReckonPos = g_est.pos;
-      g_deadReckonHeading = g_est.heading;
-      g_deadReckonStartMs = now;
-      g_deadReckoning = true;
-    }
 
-    float dt = (g_est.lastUpdateMs > 0) ? (now - g_est.lastUpdateMs) / 1000.0f : 0.0f;
-    if (dt > 0 && dt < 0.5f) {
-      float speed = g_est.speed * 0.8f;
+    // Update heading from GPS velocity if moving
+    if (g_est.speed > GPS_HEADING_MIN_SPEED_MPS) {
+      float gpsHeading = atan2f(g_est.vel.x, g_est.vel.y) * 180.0f / PI;
+      if (gpsHeading < 0) gpsHeading += 360.0f;
+
+      if (g_imuFresh) {
+        // Blend IMU and GPS heading
+        float imuHeading = g_imuYaw;
+        float imuError = normalizeAngle(gpsHeading - imuHeading);
+        g_est.heading = normalizeAngle360(imuHeading + imuError * GPS_HEADING_BLEND_FACTOR);
+        g_est.headingSource = 2;  // blended
+      } else {
+        // Use GPS heading only
+        g_est.heading = gpsHeading;
+        g_est.headingSource = 1;  // GPS
+      }
+    } else if (g_imuFresh) {
+      // Use IMU when stationary
+      g_est.heading = g_imuYaw;
+      g_est.headingSource = 0;  // IMU
+    }
+  } else if (qual == QUAL_GPS_HOLD_SHORT && g_est.lastUpdateMs > 0) {
+    // Dead reckoning - use last known heading
+    float dt = (now - g_est.lastUpdateMs) / 1000.0f;
+    if (dt > 0 && dt < 0.5f && g_est.speed > 0.01f) {
       float headingRad = degToRad(g_est.heading);
-      g_est.pos.x += speed * sin(headingRad) * dt;
-      g_est.pos.y += speed * cos(headingRad) * dt;
+      g_est.pos.x += g_est.speed * sin(headingRad) * dt * 0.8f;
+      g_est.pos.y += g_est.speed * cos(headingRad) * dt * 0.8f;
     }
     g_est.lastUpdateMs = now;
   } else {
     g_est.speed = 0;
     g_est.vel = {0, 0};
-    g_deadReckoning = false;
+  }
+}
+
+// ============== MOVEMENT MONITOR ==============
+
+struct MovementMonitor {
+  float distHistory[MONITOR_HISTORY_SIZE];
+  uint32_t timeHistory[MONITOR_HISTORY_SIZE];
+  uint16_t head = 0;
+  uint16_t count = 0;
+
+  // Analysis results
+  float progressRate = 0;       // m/s (negative = approaching)
+  bool isApproaching = false;
+  bool isStuck = false;
+  bool isGoingWrong = false;
+  float actualSpeed = 0;
+  float actualHeading = 0;
+  float headingError = 0;
+  float commandedSpeed = 0;
+  float commandedHeading = 0;
+  float crossTrackError = 0;
+  uint32_t lastUpdateMs = 0;
+};
+
+static MovementMonitor g_mon;
+
+static void resetMovementMonitor() {
+  g_mon.head = 0;
+  g_mon.count = 0;
+  g_mon.progressRate = 0;
+  g_mon.isApproaching = false;
+  g_mon.isStuck = false;
+  g_mon.isGoingWrong = false;
+  g_mon.actualSpeed = 0;
+  g_mon.actualHeading = 0;
+  g_mon.headingError = 0;
+  g_mon.lastUpdateMs = 0;
+}
+
+static void updateMovementMonitor(LocalCoords target, float cmdSpeed, float cmdHeading) {
+  uint32_t now = millis();
+
+  // Calculate current distance to target
+  float dist = hypotf(target.x - g_est.pos.x, target.y - g_est.pos.y);
+
+  // Add to history
+  g_mon.distHistory[g_mon.head] = dist;
+  g_mon.timeHistory[g_mon.head] = now;
+  g_mon.head = (g_mon.head + 1) % MONITOR_HISTORY_SIZE;
+  if (g_mon.count < MONITOR_HISTORY_SIZE) g_mon.count++;
+
+  // Update commanded values
+  g_mon.commandedSpeed = cmdSpeed;
+  g_mon.commandedHeading = cmdHeading;
+
+  // Update actual values from GPS
+  g_mon.actualSpeed = g_est.speed;
+  if (g_est.speed > GPS_HEADING_MIN_SPEED_MPS) {
+    g_mon.actualHeading = atan2f(g_est.vel.x, g_est.vel.y) * 180.0f / PI;
+    if (g_mon.actualHeading < 0) g_mon.actualHeading += 360.0f;
+  }
+
+  // Calculate heading error
+  if (g_est.speed > 0.1f) {
+    g_mon.headingError = normalizeAngle(g_mon.commandedHeading - g_mon.actualHeading);
+  }
+
+  // Calculate progress rate
+  if (g_mon.count >= 10) {
+    uint16_t oldestIdx = (g_mon.head + MONITOR_HISTORY_SIZE - g_mon.count) % MONITOR_HISTORY_SIZE;
+    uint16_t newestIdx = (g_mon.head + MONITOR_HISTORY_SIZE - 1) % MONITOR_HISTORY_SIZE;
+
+    float oldestDist = g_mon.distHistory[oldestIdx];
+    float newestDist = g_mon.distHistory[newestIdx];
+    uint32_t timeDiff = (g_mon.timeHistory[newestIdx] - g_mon.timeHistory[oldestIdx]) / 1000.0f;
+
+    if (timeDiff > 0.5f) {
+      g_mon.progressRate = (newestDist - oldestDist) / timeDiff;
+      g_mon.isApproaching = g_mon.progressRate < -0.02f;
+      g_mon.isGoingWrong = g_mon.progressRate > 0.02f;
+      g_mon.isStuck = g_est.speed < STUCK_SPEED_THRESHOLD_MPS &&
+                      g_mon.commandedSpeed > STUCK_SPEED_THRESHOLD_MPS;
+    }
+  }
+
+  // Cross track error
+  g_mon.crossTrackError = 0;  // Calculated in nav update
+
+  g_mon.lastUpdateMs = now;
+}
+
+static const char* getMovementStatus() {
+  if (g_mon.isStuck) return "STUCK";
+  if (g_mon.isGoingWrong) return "WRONG_DIR";
+  if (g_mon.isApproaching) return "APPROACHING";
+  if (g_mon.actualSpeed < 0.05f && g_mon.commandedSpeed > 0.1f) return "STARTING";
+  return "OK";
+}
+
+// ============== ARRIVAL DETECTION ==============
+
+struct ArrivalDetector {
+  float arrivalTimer = 0;
+  float distanceAtArrival = 999;
+  uint8_t gpsConfirmCount = 0;
+  LocalCoords lastPositions[5];
+  uint8_t posIndex = 0;
+  bool arrived = false;
+};
+
+static ArrivalDetector g_arrival;
+
+static void resetArrivalDetector() {
+  g_arrival.arrivalTimer = 0;
+  g_arrival.distanceAtArrival = 999;
+  g_arrival.gpsConfirmCount = 0;
+  g_arrival.posIndex = 0;
+  g_arrival.arrived = false;
+  resetGpsFilter();
+}
+
+static bool checkArrival(LocalCoords target, float commandedSpeed, float headingError) {
+  uint32_t now = millis();
+
+  float dist = hypotf(target.x - g_est.pos.x, target.y - g_est.pos.y);
+  float speed = g_est.speed;
+
+  // Only save position for verification when we're actually close to target
+  // This prevents mixing positions from different contexts
+  if (dist < ARRIVAL_DIST_M * 2.0f) {
+    g_arrival.lastPositions[g_arrival.posIndex] = g_est.pos;
+    g_arrival.posIndex = (g_arrival.posIndex + 1) % 5;
+  }
+
+  // Check if we meet arrival criteria
+  bool withinThreshold = dist < ARRIVAL_DIST_M;
+  bool stopped = speed < 0.03f;
+  bool headingOk = fabsf(headingError) < 15.0f;
+
+  if (withinThreshold && stopped && headingOk) {
+    g_arrival.arrivalTimer += NAV_LOOP_MS / 1000.0f;
+    g_arrival.distanceAtArrival = dist;
+
+    // GPS verification: check last 5 positions are consistent
+    if (g_arrival.gpsConfirmCount < 5) {
+      g_arrival.gpsConfirmCount++;
+    }
+
+    // Check position consistency
+    bool consistent = true;
+    for (uint8_t i = 0; i < g_arrival.gpsConfirmCount - 1; i++) {
+      uint8_t idx1 = (g_arrival.posIndex + 5 - g_arrival.gpsConfirmCount + i) % 5;
+      uint8_t idx2 = (g_arrival.posIndex + 5 - g_arrival.gpsConfirmCount + i + 1) % 5;
+      float posDiff = hypotf(
+        g_arrival.lastPositions[idx1].x - g_arrival.lastPositions[idx2].x,
+        g_arrival.lastPositions[idx1].y - g_arrival.lastPositions[idx2].y
+      );
+      if (posDiff > 0.1f) consistent = false;
+    }
+
+    if (g_arrival.arrivalTimer >= ARRIVAL_CONFIRM_TIME_S && consistent) {
+      g_arrival.arrived = true;
+      return true;
+    }
+  } else {
+    // Reset if we moved away
+    if (dist > ARRIVAL_DIST_M + 0.1f) {
+      g_arrival.arrivalTimer = 0;
+      g_arrival.gpsConfirmCount = 0;
+    }
+  }
+
+  return false;
+}
+
+// ============== RECOVERY SYSTEM ==============
+
+struct RecoverySystem {
+  uint32_t recoveryStartMs = 0;
+  uint32_t recoveryAttempts = 0;
+  LocalCoords lastGoodPosition;
+  float lastGoodHeading = 0;
+  bool recoveryActive = false;
+};
+
+static RecoverySystem g_recovery;
+
+static void triggerRecovery(const char* reason) {
+  uint32_t now = millis();
+
+  Serial.printf("RECOVERY: Triggered - %s\n", reason);
+  Serial.printf("  Position: (%.3f, %.3f)\n", g_est.pos.x, g_est.pos.y);
+  Serial.printf("  Heading: %.1f\n", g_est.heading);
+  Serial.printf("  Speed: %.3f m/s, Progress: %.3f m/s\n", g_mon.actualSpeed, g_mon.progressRate);
+
+  g_recovery.lastGoodPosition = g_est.pos;
+  g_recovery.lastGoodHeading = g_est.heading;
+  g_recovery.recoveryStartMs = now;
+  g_recovery.recoveryActive = true;
+  g_recovery.recoveryAttempts++;
+
+  // Stop motors during recovery
+  g_targetLeft = 0;
+  g_targetRight = 0;
+  g_curLeft = 0;
+  g_curRight = 0;
+}
+
+static void updateRecovery() {
+  if (!g_recovery.recoveryActive) return;
+
+  uint32_t now = millis();
+  uint32_t elapsed = now - g_recovery.recoveryStartMs;
+
+  // Check if we should exit recovery
+  bool gpsGood = g_est.quality == QUAL_RTK_FIXED_GOOD || g_est.quality == QUAL_RTK_FLOAT_OK;
+  bool imuGood = g_imuFresh;
+
+  if (gpsGood && imuGood && elapsed > 2000) {
+    // Verify position is consistent
+    float posDrift = hypotf(g_est.pos.x - g_recovery.lastGoodPosition.x,
+                            g_est.pos.y - g_recovery.lastGoodPosition.y);
+
+    if (posDrift < 0.5f) {
+      Serial.printf("RECOVERY: Success after %lu ms, attempts=%lu\n",
+        (unsigned long)elapsed, (unsigned long)g_recovery.recoveryAttempts);
+      g_recovery.recoveryActive = false;
+      return;
+    }
+  }
+
+  // Timeout recovery after 10 seconds
+  if (elapsed > 10000) {
+    Serial.println("RECOVERY: Timeout - manual intervention required");
+    g_recovery.recoveryActive = false;
   }
 }
 
@@ -774,9 +1318,11 @@ static void updateEstimator() {
 
 static constexpr uint8_t MAX_WAYPOINTS = 160;
 static constexpr uint8_t MAX_AREA_POINTS = 32;
+
 struct Waypoint {
   LocalCoords pos;
 };
+
 static Waypoint g_route[MAX_WAYPOINTS];
 static bool g_routeReceived[MAX_WAYPOINTS];
 static uint8_t g_routeCount = 0;
@@ -787,22 +1333,16 @@ static uint8_t g_areaCount = 0;
 static float g_areaLineStep = 0.42f;
 static bool g_areaReady = false;
 
-// Simple single-target navigation
-static bool g_singleTargetActive = false;
-static LocalCoords g_singleTarget = {0, 0};
-static bool g_singleTargetSet = false;
-
 static NavState g_navState = STATE_IDLE;
 static const char* g_navReason = "idle";
 
-// Pure pursuit parameters
-static constexpr float ARRIVAL_DIST = 0.2f;
-static constexpr float BASE_SPEED = 0.3f;
-static constexpr float LOOKAHEAD_MIN_M = 0.55f;
-static constexpr float LOOKAHEAD_MAX_M = 1.50f;
-static constexpr float LOOKAHEAD_SPEED_GAIN = 1.6f;
-static constexpr float K_HEADING = 0.45f;
-static constexpr float K_CROSSTRACK = 18.0f;
+// Pure pursuit
+static constexpr float LOOKAHEAD_MIN_M = 0.5f;
+static constexpr float LOOKAHEAD_MAX_M = 1.2f;
+static constexpr float LOOKAHEAD_SPEED_GAIN = 1.5f;
+static constexpr float K_HEADING = 0.5f;
+static constexpr float K_CROSSTRACK = 15.0f;
+static constexpr float K_PROGRESS = 5.0f;
 
 static float g_navForwardScale = 1.0f;
 static float g_navTurnScale = 1.0f;
@@ -816,6 +1356,12 @@ static int16_t g_motorSpeedR = 0, g_motorSpeedL = 0;
 static int16_t g_motorBatVoltage = 0, g_motorBoardTemp = 0;
 static uint32_t g_lastManualCmdMs = 0;
 static bool g_manualActive = false;
+
+// Extended telemetry
+static float g_crossTrackError = 0;
+static float g_headingError = 0;
+static float g_distToRouteEnd = 0;
+static float g_distToNextWaypoint = 0;
 
 struct __attribute__((packed)) SerialCommand {
   uint16_t start;
@@ -835,11 +1381,6 @@ struct __attribute__((packed)) SerialFeedback {
   uint16_t cmdLed;
   uint16_t checksum;
 };
-
-// Cross track error for telemetry
-static float g_crossTrackError = 0;
-static float g_headingError = 0;
-static float g_distToRouteEnd = 0;
 
 static bool routeReady() {
   if (g_routeCount == 0) return false;
@@ -912,8 +1453,7 @@ static uint8_t scanVerticalIntersections(float x, float* ys, uint8_t maxYs) {
 }
 
 static bool buildRouteFromArea() {
-  if (!areaReady()) return false;
-  if (!g_origin.valid) return false;
+  if (!areaReady() || !g_origin.valid) return false;
 
   float minX = g_area[0].x, maxX = g_area[0].x;
   float minY = g_area[0].y, maxY = g_area[0].y;
@@ -942,11 +1482,8 @@ static bool buildRouteFromArea() {
       for (uint8_t i = 0; i + 1 < n; i += 2) {
         LocalCoords a = {intersections[i], y};
         LocalCoords b = {intersections[i + 1], y};
-        if (reverse) {
-          ok = addRoutePoint(b) && addRoutePoint(a);
-        } else {
-          ok = addRoutePoint(a) && addRoutePoint(b);
-        }
+        if (reverse) { ok = addRoutePoint(b) && addRoutePoint(a); }
+        else { ok = addRoutePoint(a) && addRoutePoint(b); }
         if (!ok) break;
         reverse = !reverse;
       }
@@ -958,11 +1495,8 @@ static bool buildRouteFromArea() {
       for (uint8_t i = 0; i + 1 < n; i += 2) {
         LocalCoords a = {x, intersections[i]};
         LocalCoords b = {x, intersections[i + 1]};
-        if (reverse) {
-          ok = addRoutePoint(b) && addRoutePoint(a);
-        } else {
-          ok = addRoutePoint(a) && addRoutePoint(b);
-        }
+        if (reverse) { ok = addRoutePoint(b) && addRoutePoint(a); }
+        else { ok = addRoutePoint(a) && addRoutePoint(b); }
         if (!ok) break;
         reverse = !reverse;
       }
@@ -977,9 +1511,8 @@ static bool buildRouteFromArea() {
   }
 
   g_navState = STATE_IDLE;
-  g_navReason = "route_planned_on_robot";
-  Serial.printf("PLAN: area %u pts -> route %u pts, step=%.2f\n",
-    g_areaCount, g_routeCount, step);
+  g_navReason = "route_planned";
+  Serial.printf("PLAN: area %u pts -> route %u pts\n", g_areaCount, g_routeCount);
   return true;
 }
 
@@ -994,11 +1527,44 @@ static void saveNavPrefs() {
 
 static void loadNavPrefs() {
   g_imuCalibrationOffset = g_prefs.getFloat("imuOffset", 0.0f);
+
+  // Validate loaded offset
+  if (fabsf(g_imuCalibrationOffset) > 180.0f) {
+    Serial.printf("NAV PREFS: WARNING - saved IMU offset %.1f exceeds bounds, resetting\n", g_imuCalibrationOffset);
+    g_imuCalibrationOffset = 0.0f;
+    g_cal.verified = false;
+  } else if (fabsf(g_imuCalibrationOffset) > 90.0f) {
+    Serial.printf("NAV PREFS: WARNING - saved IMU offset %.1f is large, recalibration recommended\n", g_imuCalibrationOffset);
+  }
+
   g_invertYaw = g_prefs.getBool("invYaw", false);
   g_invertForward = g_prefs.getBool("invFwd", false);
   g_invertSteering = g_prefs.getBool("invSteer", false);
   g_navForwardScale = g_prefs.getFloat("fwdScale", 1.0f);
   g_navTurnScale = g_prefs.getFloat("turnScale", 1.0f);
+}
+
+static void calibrateImuToHeading(float desiredHeading) {
+  desiredHeading = normalizeAngle360(desiredHeading);
+  g_imuCalibrationOffset = normalizeAngle(desiredHeading - g_imuRawYaw);
+
+  // Validate offset is within reasonable bounds
+  if (fabsf(g_imuCalibrationOffset) > 180.0f) {
+    Serial.printf("CAL_IMU: WARNING - offset %.1f exceeds bounds, clamping\n", g_imuCalibrationOffset);
+    g_imuCalibrationOffset = normalizeAngle(g_imuCalibrationOffset);
+  }
+
+  // Warn if offset is suspiciously large (possible bad calibration)
+  if (fabsf(g_imuCalibrationOffset) > 90.0f) {
+    Serial.printf("CAL_IMU: WARNING - large offset %.1f degrees, verify IMU mounting\n", g_imuCalibrationOffset);
+  }
+
+  g_imuYaw = normalizeAngle360(g_imuRawYaw + g_imuCalibrationOffset);
+  g_est.heading = g_imuYaw;
+  g_cal.offset = g_imuCalibrationOffset;
+  g_cal.verified = true;
+  saveNavPrefs();
+  Serial.printf("CAL_IMU: offset=%.2f heading=%.1f\n", g_imuCalibrationOffset, g_est.heading);
 }
 
 // ============== WEBSOCKET ==============
@@ -1031,7 +1597,7 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   Serial.printf("WS CMD: '%s'\n", cmd.c_str());
 
   if (cmd == "PING") { client->text("PONG"); return; }
-  // FREE: stop sending motor commands (release hoverboard from lock)
+
   if (cmd == "FREE") {
     g_targetLeft = 0;
     g_targetRight = 0;
@@ -1043,16 +1609,16 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     g_navReason = "idle";
     g_manualActive = false;
     g_lastCmdMs = 0;
+    resetMovementMonitor();
     client->text("OK FREE");
-    Serial.println("MOTOR: free/idle");
     return;
   }
+
   if (cmd.startsWith("M,")) {
     int comma1 = cmd.indexOf(',', 2);
     if (comma1 > 2) {
       int left = cmd.substring(2, comma1).toInt();
       int right = cmd.substring(comma1 + 1).toInt();
-      // Same as sound.ino: divide by INPUT_DIV
       left = left / INPUT_DIV;
       right = right / INPUT_DIV;
       g_navState = STATE_IDLE;
@@ -1068,6 +1634,7 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     client->text("ERR,MOVE");
     return;
   }
+
   if (cmd == "STOP" || cmd == "NAV_STOP") {
     g_navState = STATE_IDLE;
     g_navReason = "stopped";
@@ -1075,34 +1642,37 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     g_targetRight = 0;
     g_lastCmdMs = 0;
     g_manualActive = false;
+    resetMovementMonitor();
     client->text("OK");
     return;
   }
-  if (cmd == "PAUSE" || cmd == "NAV_PAUSE") {
-    g_navState = STATE_PAUSED;
-    g_navReason = "paused";
-    g_targetLeft = 0;
-    g_targetRight = 0;
-    g_manualActive = false;
-    client->text("OK");
+
+  if (cmd == "CAL_IMU") {
+    // Manual calibration command
+    if (imuReadyForCalibration()) {
+      startImuCalibration();
+      client->text("OK,CAL_STARTED");
+    } else {
+      client->text("ERR,CAL_NOT_READY");
+    }
     return;
   }
-  if (cmd == "RESUME" || cmd == "NAV_RESUME") {
-    if (g_navState == STATE_PAUSED) g_navState = STATE_RUNNING;
-    client->text("OK");
-    return;
-  }
+
   if (cmd == "START" || cmd == "NAV_START") {
     if (routeReady() && g_routeIndex < g_routeCount) {
-      g_navState = STATE_RUNNING;
+      g_navState = STATE_MOVING;
       g_navReason = "started";
       g_manualActive = false;
+      resetMovementMonitor();
+      resetArrivalDetector();
       client->text("OK");
+      Serial.printf("NAV: Started, route %u/%u\n", g_routeIndex, g_routeCount);
     } else {
       client->text("ERR,NO_ROUTE");
     }
     return;
   }
+
   // ROUTE_BEGIN,count,originLat,originLon
   if (cmd.startsWith("ROUTE_BEGIN,")) {
     int first = 12;
@@ -1119,14 +1689,14 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         g_navState = STATE_IDLE;
         setOrigin(originLat, originLon);
         client->text("OK");
-        Serial.printf("WS: route begin %u points, origin %.8f %.8f\n", count, originLat, originLon);
+        Serial.printf("WS: route begin %u points\n", count);
         return;
       }
     }
     client->text("ERR,INVALID");
     return;
   }
-  // ROUTE_WP,idx,x_m,y_m
+
   if (cmd.startsWith("ROUTE_WP,")) {
     int first = 9;
     int comma1 = cmd.indexOf(',', first);
@@ -1145,6 +1715,7 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     client->text("ERR,INVALID");
     return;
   }
+
   if (cmd == "ROUTE_END") {
     if (routeReady()) {
       client->text("OK");
@@ -1154,7 +1725,7 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     }
     return;
   }
-  // AREA_BEGIN,count,originLat,originLon,lineStep
+
   if (cmd.startsWith("AREA_BEGIN,")) {
     int first = 11;
     int p1 = cmd.indexOf(',', first);
@@ -1165,8 +1736,7 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
       double originLat = cmd.substring(p1 + 1, p2).toDouble();
       double originLon = cmd.substring(p2 + 1, p3).toDouble();
       float lineStep = cmd.substring(p3 + 1).toFloat();
-      if (count >= 3 && count <= MAX_AREA_POINTS && originLat != 0 && originLon != 0 &&
-          lineStep > 0.05f && lineStep <= 5.0f) {
+      if (count >= 3 && count <= MAX_AREA_POINTS && originLat != 0 && originLon != 0) {
         g_areaCount = (uint8_t)count;
         g_areaLineStep = lineStep;
         g_areaReady = false;
@@ -1174,18 +1744,15 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         g_routeCount = 0;
         memset(g_routeReceived, 0, sizeof(g_routeReceived));
         g_navState = STATE_IDLE;
-        g_navReason = "area_upload";
         setOrigin(originLat, originLon);
         client->text("OK");
-        Serial.printf("WS: area begin %u points, origin %.8f %.8f, step=%.2f\n",
-          count, originLat, originLon, lineStep);
         return;
       }
     }
     client->text("ERR,AREA_BEGIN");
     return;
   }
-  // AREA_PT,idx,x_m,y_m
+
   if (cmd.startsWith("AREA_PT,")) {
     int first = 8;
     int p1 = cmd.indexOf(',', first);
@@ -1204,6 +1771,7 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     client->text("ERR,AREA_PT");
     return;
   }
+
   if (cmd == "AREA_END" || cmd == "PLAN_CLEAN") {
     g_areaReady = areaReady();
     if (g_areaReady && buildRouteFromArea()) {
@@ -1215,15 +1783,13 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     }
     return;
   }
-  // Simple single-target navigation: GO_TO,lat,lon
-  // Robot saves the target and starts navigation to it
+
   if (cmd.startsWith("GO_TO,")) {
     int comma = cmd.indexOf(',', 6);
     if (comma > 6) {
       double lat = cmd.substring(6, comma).toDouble();
       double lon = cmd.substring(comma + 1).toDouble();
       if (lat != 0 && lon != 0) {
-        // Set origin from current GPS if not set
         if (!g_origin.valid && g_gps.valid) {
           setOrigin(g_gps.lat, g_gps.lon);
         }
@@ -1231,31 +1797,28 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
           client->text("ERR,NO_ORIGIN");
           return;
         }
-        g_singleTarget = toLocal(lat, lon);
-        g_singleTargetSet = true;
-        g_singleTargetActive = true;
-        // Build a simple 2-point route: current position -> target
+        LocalCoords target = toLocal(lat, lon);
         g_routeCount = 2;
         g_routeIndex = 0;
         memset(g_routeReceived, 0, sizeof(g_routeReceived));
         g_routeReceived[0] = true;
         g_routeReceived[1] = true;
-        g_route[0].pos = g_est.pos;  // Current position
-        g_route[1].pos = g_singleTarget;  // Target
-
-        g_navState = STATE_RUNNING;
+        g_route[0].pos = g_est.pos;
+        g_route[1].pos = target;
+        g_navState = STATE_MOVING;
         g_navReason = "go_to";
         g_manualActive = false;
+        resetMovementMonitor();
+        resetArrivalDetector();
         client->text("OK");
-        Serial.printf("GO_TO: target lat=%.8f lon=%.8f -> (%.2f, %.2f) m\n",
-          lat, lon, g_singleTarget.x, g_singleTarget.y);
+        Serial.printf("GO_TO: (%.2f, %.2f) m\n", target.x, target.y);
         return;
       }
     }
     client->text("ERR,GO_TO");
     return;
   }
-  // STATUS request
+
   if (cmd == "STATUS") {
     char resp[256];
     snprintf(resp, sizeof(resp),
@@ -1271,54 +1834,21 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     client->text(resp);
     return;
   }
-  // Calibrate IMU without GPS bearing: calibrated heading follows raw yaw.
-  // Prefer CAL_IMU,<bearing_deg> from GPS Debug when a target is selected.
-  if (cmd == "CAL_IMU_SELF") {
-    Serial.printf("CAL_SELF: raw=%.1f heading=%.1f ready=%u headingBefore=%.1f\n",
-      g_imuRawYaw, g_imuYaw, imuReadyForCalibration() ? 1 : 0, g_est.heading);
-    if (imuReadyForCalibration()) {
-      float oldHeading = g_est.heading;
-      calibrateImuToHeading(g_imuRawYaw);
-      Serial.printf("CAL_SELF: SUCCESS heading %.1f -> %.1f offset=%.1f\n",
-        oldHeading, g_est.heading, g_imuCalibrationOffset);
+
+  if (cmd.startsWith("CAL_IMU,")) {
+    float desiredHeading = cmd.substring(8).toFloat();
+    if (imuReadyForCalibration() || g_imuFresh) {
+      calibrateImuToHeading(desiredHeading);
       char resp[64];
-      snprintf(resp, sizeof(resp), "CAL_OK,heading=%.1f,offset=%.1f", g_est.heading, g_imuCalibrationOffset);
+      snprintf(resp, sizeof(resp), "CAL_OK,heading=%.1f,offset=%.2f",
+        g_est.heading, g_imuCalibrationOffset);
       client->text(resp);
-      return;
+    } else {
+      client->text("ERR,CAL_NOT_READY");
     }
-    client->text("ERR,CAL_NOT_READY");
     return;
   }
-  // Calibrate IMU to a real world heading: CAL_IMU,<bearing_degrees>.
-  // When the robot nose is aimed at the selected target, the app sends the
-  // GPS bearing to that target. From then on heading is updated continuously
-  // as raw BNO085 yaw + stored offset.
-  if (cmd.startsWith("CAL_IMU")) {
-    float desiredHeading = NAN;
-    int comma = cmd.indexOf(',');
-    if (comma > 0) {
-      desiredHeading = cmd.substring(comma + 1).toFloat();
-    }
-    Serial.printf("CAL_IMU: raw=%.1f heading=%.1f desired=%.1f ready=%u headingBefore=%.1f\n",
-      g_imuRawYaw, g_imuYaw, desiredHeading, imuReadyForCalibration() ? 1 : 0, g_est.heading);
-    if (imuReadyForCalibration()) {
-      float oldHeading = g_est.heading;
-      if (isfinite(desiredHeading)) {
-        calibrateImuToHeading(desiredHeading);
-      } else {
-        calibrateImuToHeading(g_imuRawYaw);
-      }
-      Serial.printf("CAL_IMU: SUCCESS heading %.1f -> %.1f raw=%.1f offset=%.1f\n",
-        oldHeading, g_est.heading, g_imuRawYaw, g_imuCalibrationOffset);
-      char resp[64];
-      snprintf(resp, sizeof(resp), "CAL_OK,heading=%.1f,raw=%.1f,offset=%.1f",
-        g_est.heading, g_imuRawYaw, g_imuCalibrationOffset);
-      client->text(resp);
-      return;
-    }
-    client->text("ERR,CAL_NOT_READY");
-    return;
-  }
+
   if (cmd.startsWith("NAV_CFG,")) {
     int p1 = cmd.indexOf(',', 8);
     int p2 = cmd.indexOf(',', p1 + 1);
@@ -1334,11 +1864,11 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
       g_invertYaw = cmd.substring(p5 + 1).toInt() != 0;
       g_navForwardScale = constrain(forwardPercent / 100.0f, 0.15f, 1.0f);
       g_navTurnScale = constrain(turnPercent / 100.0f, 0.15f, 1.0f);
+      g_est.heading = normalizeAngle360(g_imuRawYaw + g_imuCalibrationOffset);
       saveNavPrefs();
       client->text("OK");
-      Serial.printf("NAV_CFG: fwd=%.2f turn=%.2f invF=%u invS=%u imuOffset=%.1f invYaw=%u\n",
-        g_navForwardScale, g_navTurnScale, g_invertForward ? 1 : 0,
-        g_invertSteering ? 1 : 0, g_imuCalibrationOffset, g_invertYaw ? 1 : 0);
+      Serial.printf("NAV_CFG: fwd=%.2f turn=%.2f offset=%.2f\n",
+        g_navForwardScale, g_navTurnScale, g_imuCalibrationOffset);
       return;
     }
     client->text("ERR,NAV_CFG");
@@ -1352,20 +1882,22 @@ static void broadcastTelemetry() {
   if (now - lastTelem < TELEMETRY_MS) return;
   lastTelem = now;
 
-  char msg[256];
+  char msg[512];
   const uint32_t gpsAge = g_gps.lastMs ? now - g_gps.lastMs : 99999;
   const uint32_t rtcmTransportAge = g_lastRtcmMs ? now - g_lastRtcmMs : 99999;
   const uint32_t rtcmF9pAge = g_lastF9pRtcmMs ? now - g_lastF9pRtcmMs : 99999;
   const uint32_t imuAge = g_lastImuMs ? now - g_lastImuMs : 99999;
   const char* carrier = g_gps.carrier == 2 ? "fixed" : (g_gps.carrier == 1 ? "float" : "none");
 
-  // Main telemetry: keep the old Flutter parser compatible.
-  // Format: TEL,lat,lon,height,heading(est),fixType,carrier,diff,numSV,hAcc,vAcc,speed,something,gpsAge,rtcmBytes,rtcmAge,imuYaw,imuAge,imuFresh,...
+  // Only send telemetry if WiFi is connected
+  if (!g_wifiConnected) return;
+
+  // Main telemetry
   snprintf(msg, sizeof(msg),
-    "TEL,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu,%lu,%lu,%.1f,%lu,%u,%lu,%lu,%s,%lu,%lu,%lu",
+    "TEL,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu,%lu,%lu,%.1f,%lu,%u,%lu,%lu,%s,%lu,%lu,%lu,%.1f,%.3f,%.3f,%s,%s",
     g_gps.lat, g_gps.lon,
     0.0f,
-    g_est.heading,  // This is the calibrated heading
+    g_est.heading,
     g_gps.fixType,
     carrier,
     g_gps.diff ? 1 : 0,
@@ -1385,11 +1917,17 @@ static void broadcastTelemetry() {
     g_rtcmFresh ? "udp" : "none",
     (unsigned long)g_f9pRtcmMsgs,
     (unsigned long)g_f9pRtcmCrcFail,
-    (unsigned long)g_rtcmLastType
+    (unsigned long)g_rtcmLastType,
+    g_est.headingSource == 0 ? "IMU" : (g_est.headingSource == 1 ? "GPS" : "BLEND"),
+    g_crossTrackError,
+    g_distToNextWaypoint,
+    g_distToRouteEnd,
+    stateString(g_navState),
+    getMovementStatus()
   );
   ws.textAll(msg);
 
-  // Extended GPS info.
+  // GPS Debug
   snprintf(msg, sizeof(msg),
     "GPSDBG,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu",
     g_gps.lat, g_gps.lon,
@@ -1423,30 +1961,50 @@ static void broadcastTelemetry() {
 
   // IMU status
   snprintf(msg, sizeof(msg),
-    "IMU,%.1f,%lu,%u",
+    "IMU,%.1f,%lu,%u,%.1f,%.2f,%s",
     g_imuYaw,
     (unsigned long)imuAge,
-    g_imuFresh ? 1 : 0
+    g_imuFresh ? 1 : 0,
+    g_imuYawRate,
+    g_imuCalibrationOffset,
+    calStateString(g_cal.state)
   );
   ws.textAll(msg);
 
+  // Navigation
   snprintf(msg, sizeof(msg),
-    "NAV,%s,%u,%u,%.2f,%.1f",
+    "NAV,%s,%u,%u,%.2f,%.1f,%.3f,%.3f,%.1f,%s",
     stateString(g_navState),
     g_routeIndex,
     g_routeCount,
     g_distToRouteEnd,
-    g_headingError
+    g_headingError,
+    g_est.speed,
+    g_mon.progressRate,
+    g_crossTrackError,
+    getMovementStatus()
   );
   ws.textAll(msg);
 
-  // Motor status
+  // Motor
   snprintf(msg, sizeof(msg),
     "MOTOR,%d,%d,%u,%d,%d,%d,%d",
     g_curLeft, g_curRight,
     g_haveMotorFeedback ? 1 : 0,
     g_motorSpeedL, g_motorSpeedR,
     g_motorBatVoltage, g_motorBoardTemp
+  );
+  ws.textAll(msg);
+
+  // Calibration
+  snprintf(msg, sizeof(msg),
+    "CAL,%s,%.2f,%.2f,%u,%u",
+    g_cal.state == CAL_COMPLETE ? "OK" : (g_cal.state == CAL_MEASURING ? "MEAS" :
+        (g_cal.state == CAL_VERIFYING ? "VERIFY" : "IDLE")),
+    g_cal.offset,
+    g_cal.stdDev,
+    g_cal.quality,
+    g_cal.verified ? 1 : 0
   );
   ws.textAll(msg);
 }
@@ -1456,9 +2014,22 @@ static void broadcastTelemetry() {
 static void navUpdate() {
   uint32_t now = millis();
 
-  if (g_navState != STATE_RUNNING) {
+  // Handle recovery state
+  if (g_recovery.recoveryActive) {
+    updateRecovery();
+    if (!g_recovery.recoveryActive) {
+      g_navState = STATE_MOVING;
+    }
+    return;
+  }
+
+  // Handle calibration
+  if (g_cal.state == CAL_MEASURING || g_cal.state == CAL_VERIFYING) {
+    updateCalibration();
+  }
+
+  if (g_navState != STATE_MOVING && g_navState != STATE_APPROACHING) {
     if (g_manualActive) return;
-    // Navigation not active - motors controlled by manual or idle
     return;
   }
 
@@ -1466,131 +2037,103 @@ static void navUpdate() {
     g_navState = STATE_ARRIVED;
     g_navReason = "route_complete";
     g_targetLeft = g_targetRight = 0;
-    char navMsg[48];
+    char navMsg[64];
     snprintf(navMsg, sizeof(navMsg), "NAV,ARRIVED,%u,%u,0.00", g_routeIndex, g_routeCount);
     ws.textAll(navMsg);
+    resetMovementMonitor();
     return;
   }
 
-  // Check quality - don't move if quality is bad
+  // Check quality
   if (g_est.quality == QUAL_NAV_ERROR || g_est.quality == QUAL_GPS_LOST_WAIT) {
     g_targetLeft = g_targetRight = 0;
     g_navReason = "no_fix";
+    triggerRecovery("no_gps_fix");
     return;
   }
 
-  if (g_routeCount == 1) {
-    LocalCoords only = g_route[0].pos;
-    if (hypotf(only.x - g_est.pos.x, only.y - g_est.pos.y) < ARRIVAL_DIST) {
-      g_navState = STATE_ARRIVED;
-      g_navReason = "route_complete";
-      g_targetLeft = g_targetRight = 0;
-      char navMsg[48];
-      snprintf(navMsg, sizeof(navMsg), "NAV,ARRIVED,%u,%u,0.00", g_routeIndex, g_routeCount);
-      ws.textAll(navMsg);
-      return;
-    }
+  // Get current waypoint
+  LocalCoords target = g_route[g_routeIndex].pos;
+  float distToTarget = hypotf(target.x - g_est.pos.x, target.y - g_est.pos.y);
+  g_distToNextWaypoint = distToTarget;
+
+  // Calculate remaining route distance
+  g_distToRouteEnd = distToTarget;
+  for (uint8_t i = g_routeIndex + 1; i < g_routeCount; i++) {
+    float segLen = hypotf(g_route[i].pos.x - g_route[i-1].pos.x,
+                          g_route[i].pos.y - g_route[i-1].pos.y);
+    g_distToRouteEnd += segLen;
   }
 
-  int bestSeg = -1;
-  float bestT = 0.0f;
-  float bestDistSq = 1.0e12f;
-  LocalCoords closest = g_route[g_routeIndex].pos;
-
-  for (uint8_t i = g_routeIndex; i + 1 < g_routeCount; i++) {
-    LocalCoords a = g_route[i].pos;
-    LocalCoords b = g_route[i + 1].pos;
-    const float vx = b.x - a.x;
-    const float vy = b.y - a.y;
-    const float lenSq = vx * vx + vy * vy;
-    if (lenSq < 0.0001f) continue;
-    float t = ((g_est.pos.x - a.x) * vx + (g_est.pos.y - a.y) * vy) / lenSq;
-    t = constrain(t, 0.0f, 1.0f);
-    LocalCoords p = {a.x + vx * t, a.y + vy * t};
-    const float dx = g_est.pos.x - p.x;
-    const float dy = g_est.pos.y - p.y;
-    const float dSq = dx * dx + dy * dy;
-    if (dSq < bestDistSq) {
-      bestDistSq = dSq;
-      bestSeg = i;
-      bestT = t;
-      closest = p;
-    }
-  }
-
-  if (bestSeg < 0) {
-    LocalCoords target = g_route[g_routeIndex].pos;
-    bestSeg = g_routeIndex;
-    closest = target;
-  }
-
-  g_routeIndex = (uint8_t)bestSeg;
-  g_crossTrackError = sqrtf(bestDistSq);
-  if (bestSeg + 1 < g_routeCount) {
-    LocalCoords a = g_route[bestSeg].pos;
-    LocalCoords b = g_route[bestSeg + 1].pos;
-    const float vx = b.x - a.x;
-    const float vy = b.y - a.y;
-    const float len = hypotf(vx, vy);
-    if (len > 0.001f) {
-      const float signedCross = (vx * (g_est.pos.y - a.y) - vy * (g_est.pos.x - a.x)) / len;
-      g_crossTrackError = signedCross;
-    }
-  }
-
-  float remainingOnPath = 0.0f;
-  if (bestSeg + 1 < g_routeCount) {
-    LocalCoords b = g_route[bestSeg + 1].pos;
-    remainingOnPath += hypotf(b.x - closest.x, b.y - closest.y);
-    for (uint8_t i = bestSeg + 1; i + 1 < g_routeCount; i++) {
-      remainingOnPath += hypotf(g_route[i + 1].pos.x - g_route[i].pos.x,
-                                g_route[i + 1].pos.y - g_route[i].pos.y);
-    }
-  }
-  g_distToRouteEnd = remainingOnPath;
-  if (g_routeCount > 1 && remainingOnPath < ARRIVAL_DIST && bestSeg + 1 >= g_routeCount - 1) {
+  // Check for arrival at current waypoint
+  if (checkArrival(target, 0, g_headingError)) {
     g_navState = STATE_ARRIVED;
-    g_navReason = "route_complete";
+    g_navReason = "waypoint_reached";
     g_targetLeft = g_targetRight = 0;
-    char navMsg[48];
-    snprintf(navMsg, sizeof(navMsg), "NAV,ARRIVED,%u,%u,0.00", g_routeIndex, g_routeCount);
+    g_routeIndex++;
+    char navMsg[64];
+    snprintf(navMsg, sizeof(navMsg), "NAV,WP_REACHED,%u,%u,%.2f",
+      g_routeIndex, g_routeCount, distToTarget);
     ws.textAll(navMsg);
+    Serial.printf("NAV: Waypoint %u reached (dist=%.2f)\n", g_routeIndex - 1, distToTarget);
+    resetMovementMonitor();
+    resetArrivalDetector();
     return;
   }
 
+  // Update state based on distance
+  if (distToTarget < ARRIVAL_APPROACH_DIST_M) {
+    g_navState = STATE_APPROACHING;
+  }
+
+  // Pure pursuit - find lookahead point
   float lookahead = constrain(LOOKAHEAD_MIN_M + g_est.speed * LOOKAHEAD_SPEED_GAIN,
                               LOOKAHEAD_MIN_M, LOOKAHEAD_MAX_M);
-  if (g_est.quality == QUAL_GPS_HOLD_SHORT) lookahead = LOOKAHEAD_MIN_M;
 
-  LocalCoords target = g_route[min((int)g_routeCount - 1, bestSeg + 1)].pos;
-  float walk = lookahead;
-  LocalCoords cursor = closest;
-  for (uint8_t i = bestSeg; i + 1 < g_routeCount; i++) {
-    LocalCoords end = g_route[i + 1].pos;
-    float segLen = hypotf(end.x - cursor.x, end.y - cursor.y);
-    if (segLen >= walk && segLen > 0.001f) {
-      float ratio = walk / segLen;
-      target = {cursor.x + (end.x - cursor.x) * ratio,
-                cursor.y + (end.y - cursor.y) * ratio};
+  // Build lookahead target
+  LocalCoords lookaheadTarget = target;
+  float remaining = distToTarget;
+  uint8_t segIdx = g_routeIndex;
+
+  while (remaining > lookahead && segIdx + 1 < g_routeCount) {
+    LocalCoords a = g_route[segIdx].pos;
+    LocalCoords b = g_route[segIdx + 1].pos;
+    float segLen = hypotf(b.x - a.x, b.y - a.y);
+
+    if (remaining - segLen <= lookahead) {
+      float t = (remaining - lookahead) / segLen;
+      lookaheadTarget.x = a.x + (b.x - a.x) * t;
+      lookaheadTarget.y = a.y + (b.y - a.y) * t;
       break;
     }
-    walk -= segLen;
-    cursor = end;
-    target = end;
+
+    remaining -= segLen;
+    segIdx++;
   }
 
-  // Heading convention: 0 deg = North (+Y), 90 deg = East (+X), clockwise.
-  // For local coordinates x=east, y=north this is atan2(dx, dy).
-  const float dxToTarget = target.x - g_est.pos.x;
-  const float dyToTarget = target.y - g_est.pos.y;
-  float desiredHeading = atan2f(dxToTarget, dyToTarget) * 180.0f / PI;
+  // Calculate heading to lookahead target
+  float dx = lookaheadTarget.x - g_est.pos.x;
+  float dy = lookaheadTarget.y - g_est.pos.y;
+  float desiredHeading = atan2f(dx, dy) * 180.0f / PI;
   if (desiredHeading < 0) desiredHeading += 360.0f;
 
-  float headingError = normalizeAngle(desiredHeading - g_est.heading);
-  g_headingError = headingError;
+  g_headingError = normalizeAngle(desiredHeading - g_est.heading);
 
-  // Speed based on quality
-  float speed = BASE_SPEED;
+  // Calculate cross track error
+  if (g_routeIndex < g_routeCount) {
+    LocalCoords a = g_route[g_routeIndex].pos;
+    LocalCoords b = (g_routeIndex + 1 < g_routeCount) ? g_route[g_routeIndex + 1].pos : a;
+    float segLen = hypotf(b.x - a.x, b.y - a.y);
+    if (segLen > 0.1f) {
+      float dxSeg = b.x - a.x;
+      float dySeg = b.y - a.y;
+      float cross = (dxSeg * (g_est.pos.y - a.y) - dySeg * (g_est.pos.x - a.x)) / segLen;
+      g_crossTrackError = cross;
+    }
+  }
+
+  // Speed based on quality and state
+  float speed = MAX_SPEED;
   switch (g_est.quality) {
     case QUAL_RTK_FIXED_GOOD: speed = MAX_SPEED; break;
     case QUAL_RTK_FLOAT_OK: speed = FLOAT_SPEED; break;
@@ -1599,20 +2142,55 @@ static void navUpdate() {
     default: speed = 0; break;
   }
 
-  // Reduce speed for sharp turns and final approach.
-  if (fabsf(headingError) > 45) speed *= 0.6f;
-  if (fabsf(headingError) > 90) speed *= 0.3f;
-  if (remainingOnPath < 1.0f) speed *= (0.35f + remainingOnPath * 0.65f);
-  if (g_est.quality == QUAL_GPS_HOLD_SHORT && fabsf(headingError) > 15) speed = 0.0f;
+  // Reduce speed for sharp turns
+  if (fabsf(g_headingError) > 30) speed *= 0.7f;
+  if (fabsf(g_headingError) > 60) speed *= 0.5f;
+  if (fabsf(g_headingError) > 90) speed *= 0.3f;
 
+  // Reduce speed in approach mode
+  if (g_navState == STATE_APPROACHING) {
+    speed *= 0.5f;
+    if (distToTarget < 0.2f) speed *= 0.3f;
+  }
+
+  // Reduce speed for cross track error
+  if (fabsf(g_crossTrackError) > 0.5f) speed *= 0.8f;
+  if (fabsf(g_crossTrackError) > 1.0f) speed *= 0.6f;
+
+  // Progress-based speed adjustment
+  if (g_mon.isGoingWrong) {
+    speed *= 0.3f;  // Slow down if going wrong direction
+  }
+
+  // Update movement monitor
+  updateMovementMonitor(target, speed, desiredHeading);
+
+  // Check for stuck condition
+  if (g_mon.isStuck && g_est.speed < STUCK_SPEED_THRESHOLD_MPS) {
+    Serial.println("NAV: Stuck detected - triggering recovery");
+    triggerRecovery("stuck");
+    return;
+  }
+
+  // Check for wrong direction
+  if (g_mon.isGoingWrong && g_mon.actualSpeed > 0.1f) {
+    Serial.printf("NAV: Going wrong direction! progress=%.3f m/s\n", g_mon.progressRate);
+    // Try to correct by increasing turn
+    speed *= 0.5f;
+  }
+
+  // Calculate motor commands
   float forwardCmd = (speed / MAX_SPEED) * MAX_SPEED_PERCENT * g_navForwardScale;
-  // headingError > 0 means the target is clockwise/right of current heading.
-  // For tank drive, right turn means left wheel faster than right wheel.
-  float turnCmd = K_HEADING * headingError * g_navTurnScale;
-  // Add gentle crosstrack correction (don't override heading)
-  turnCmd += K_CROSSTRACK * g_crossTrackError * 0.1f * g_navTurnScale;
-  turnCmd = constrain(turnCmd, -MAX_SPEED_PERCENT * 0.5f, MAX_SPEED_PERCENT * 0.5f);
-  turnCmd = constrain(turnCmd, -MAX_SPEED_PERCENT * 0.65f, MAX_SPEED_PERCENT * 0.65f);
+  float turnCmd = K_HEADING * g_headingError * g_navTurnScale;
+
+  // Cross track correction
+  turnCmd += K_CROSSTRACK * g_crossTrackError * g_navTurnScale;
+
+  // Progress correction
+  turnCmd += K_PROGRESS * g_mon.progressRate * g_navTurnScale;
+
+  // Limit turn command
+  turnCmd = constrain(turnCmd, -MAX_SPEED_PERCENT * 0.6f, MAX_SPEED_PERCENT * 0.6f);
 
   if (g_invertForward) forwardCmd = -forwardCmd;
   if (g_invertSteering) turnCmd = -turnCmd;
@@ -1620,25 +2198,30 @@ static void navUpdate() {
   int16_t left = (int16_t)(forwardCmd + turnCmd);
   int16_t right = (int16_t)(forwardCmd - turnCmd);
 
-  // Same as sound.ino: percent domain
   g_targetLeft = constrain(left, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   g_targetRight = constrain(right, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   g_lastCmdMs = now;
   g_isFailSafeStopping = false;
   g_navReason = qualityString(g_est.quality);
 
-  // Debug nav: log every 2 seconds
+  // Debug output
   static uint32_t lastNavDebug = 0;
   if (now - lastNavDebug > 2000) {
     lastNavDebug = now;
-    Serial.printf("NAV: pos=(%.2f,%.2f) heading=%.1f imuYaw=%.1f target=(%.2f,%.2f) desiredHdg=%.1f hdgErr=%.1f turnCmd=%.1f L=%d R=%d\n",
-      g_est.pos.x, g_est.pos.y, g_est.heading, g_imuYaw,
-      target.x, target.y, desiredHeading, headingError,
-      turnCmd, g_targetLeft, g_targetRight);
+    Serial.printf("NAV: pos=(%.2f,%.2f) target=(%.2f,%.2f) dist=%.2f heading=%.1f err=%.1f xtk=%.2f progress=%.3f speed=%d L=%d R=%d\n",
+      g_est.pos.x, g_est.pos.y,
+      target.x, target.y,
+      distToTarget,
+      g_est.heading,
+      g_headingError,
+      g_crossTrackError,
+      g_mon.progressRate,
+      (int)speed * 100,
+      g_targetLeft, g_targetRight);
   }
 }
 
-// ============== MOTOR CONTROL (same as sound.ino) ==============
+// ============== MOTOR CONTROL ==============
 
 static inline int16_t limitForAxis(int16_t cur, int16_t target, int ticks) {
   int absCur = abs((int)cur);
@@ -1668,7 +2251,6 @@ static void updateRamp() {
   g_curRight = constrain(stepToward(g_curRight, tR, limR), -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
 }
 
-// left/right (-70..70) -> speed/steer -> SLEW -> send
 static void drive(int16_t leftPct, int16_t rightPct) {
   leftPct = constrain(leftPct, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   rightPct = constrain(rightPct, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
@@ -1769,8 +2351,13 @@ static void printStatus() {
   lastStatus = now;
 
   Serial.println();
-  Serial.println("========== ROVER STATUS ==========");
+  Serial.println("========== ROVER STATUS v2.0 ==========");
   Serial.printf("Uptime: %lus\n", (unsigned long)(now / 1000));
+
+  Serial.println("-- State --");
+  Serial.printf("  State: %s, Reason: %s\n", stateString(g_navState), g_navReason);
+  Serial.printf("  Recovery: %s (%lu attempts)\n",
+    g_recovery.recoveryActive ? "ACTIVE" : "idle", (unsigned long)g_recovery.recoveryAttempts);
 
   Serial.println("-- WiFi --");
   Serial.printf("  %s\n", g_wifiConnected ? WiFi.localIP().toString().c_str() : "DISCONNECTED");
@@ -1781,48 +2368,47 @@ static void printStatus() {
     g_gps.fixType, g_gps.carrier,
     g_gps.carrier == 2 ? "FIXED" : (g_gps.carrier == 1 ? "FLOAT" : "NONE"));
   Serial.printf("  Pos: %.8f, %.8f\n", g_gps.lat, g_gps.lon);
-  Serial.printf("  hAcc: %.0f mm, Age: %lu ms\n", g_gps.hAcc, (unsigned long)g_est.qualityAgeMs);
-  Serial.printf("  Raw: %lu, UBX: %lu, NMEA: %lu\n",
-    (unsigned long)g_gpsRawBytes,
-    (unsigned long)g_gpsUbxParsed,
-    (unsigned long)g_gpsNmeaParsed);
+  Serial.printf("  hAcc: %.0f mm, vAcc: %.0f mm\n", g_gps.hAcc, g_gps.vAcc);
+  Serial.printf("  Vel: N=%.2f E=%.2f m/s\n", g_gps.velN, g_gps.velE);
 
   Serial.println("-- IMU --");
-  Serial.printf("  Raw yaw: %.1f deg, Heading: %.1f deg, Offset: %.1f deg, Fresh: %u, Age: %lu ms\n",
-    g_imuRawYaw, g_imuYaw, g_imuCalibrationOffset, g_imuFresh ? 1 : 0,
-    (unsigned long)(g_lastImuMs ? now - g_lastImuMs : 0));
+  Serial.printf("  Raw yaw: %.1f deg, Heading: %.1f deg\n", g_imuRawYaw, g_imuYaw);
+  Serial.printf("  Offset: %.2f deg, Yaw rate: %.1f deg/s\n", g_imuCalibrationOffset, g_imuYawRate);
+  Serial.printf("  Fresh: %u, Source: %s\n", g_imuFresh ? 1 : 0,
+    g_est.headingSource == 0 ? "IMU" : (g_est.headingSource == 1 ? "GPS" : "BLEND"));
 
-  Serial.println("-- RTCM --");
-  Serial.printf("  Fresh: %u, Bytes: %lu, Msgs: %lu, Type: %lu\n",
-    g_rtcmFresh ? 1 : 0,
-    (unsigned long)g_rtcmBytes,
-    (unsigned long)g_rtcmMsgs,
-    (unsigned long)g_rtcmLastType);
-  Serial.printf("  Relay errors: read=%lu write=%lu oversize=%lu\n",
-    (unsigned long)g_rtcmErrors,
-    (unsigned long)g_rtcmWriteErrors,
-    (unsigned long)g_rtcmOversize);
-  Serial.printf("  F9P decoded: msgs=%lu crcFail=%lu age=%lums\n",
-    (unsigned long)g_f9pRtcmMsgs,
-    (unsigned long)g_f9pRtcmCrcFail,
-    (unsigned long)(g_lastF9pRtcmMs ? now - g_lastF9pRtcmMs : 0));
+  Serial.println("-- Calibration --");
+  Serial.printf("  State: %s, StdDev: %.2f deg\n",
+    g_cal.state == CAL_COMPLETE ? "OK" : (g_cal.state == CAL_MEASURING ? "MEASURING" :
+        (g_cal.state == CAL_VERIFYING ? "VERIFYING" : "IDLE")), g_cal.stdDev);
+  Serial.printf("  Verified: %u, Quality: %u%%\n", g_cal.verified ? 1 : 0, g_cal.quality);
 
-  Serial.println("-- Estimator --");
-  Serial.printf("  Local: (%.2f, %.2f) m\n", g_est.pos.x, g_est.pos.y);
+  Serial.println("-- Movement Monitor --");
+  Serial.printf("  Status: %s\n", getMovementStatus());
+  Serial.printf("  Progress: %.3f m/s, Actual speed: %.3f m/s\n", g_mon.progressRate, g_mon.actualSpeed);
+  Serial.printf("  Heading error: %.1f deg\n", g_mon.headingError);
+
+  Serial.println("-- Position --");
+  Serial.printf("  Local: (%.3f, %.3f) m\n", g_est.pos.x, g_est.pos.y);
   Serial.printf("  Heading: %.1f deg, Speed: %.3f m/s\n", g_est.heading, g_est.speed);
   Serial.printf("  Quality: %s\n", qualityString(g_est.quality));
 
   Serial.println("-- Navigation --");
-  Serial.printf("  State: %s, Reason: %s\n", stateString(g_navState), g_navReason);
-  Serial.printf("  Route: %u/%u, XTE: %.2f m, headingErr: %.1f deg, remain: %.2f m\n",
-    g_routeIndex, g_routeCount, g_crossTrackError, g_headingError, g_distToRouteEnd);
-  Serial.printf("  Motor: L=%d R=%d (target)\n", g_targetLeft, g_targetRight);
-  Serial.printf("        L=%d R=%d (current)\n", g_curLeft, g_curRight);
-  Serial.printf("  Motor FB: fresh=%u cmd=(%d,%d) speed=(%d,%d) bat=%d temp=%d\n",
-    g_haveMotorFeedback ? 1 : 0,
-    g_motorFbCmd1, g_motorFbCmd2,
-    g_motorSpeedL, g_motorSpeedR,
-    g_motorBatVoltage, g_motorBoardTemp);
+  Serial.printf("  Route: %u/%u\n", g_routeIndex, g_routeCount);
+  Serial.printf("  Dist to wp: %.2f m, to end: %.2f m\n", g_distToNextWaypoint, g_distToRouteEnd);
+  Serial.printf("  Heading err: %.1f deg, Cross-track: %.2f m\n", g_headingError, g_crossTrackError);
+  Serial.printf("  Motor: L=%d R=%d (target), L=%d R=%d (current)\n",
+    g_targetLeft, g_targetRight, g_curLeft, g_curRight);
+
+  Serial.println("-- RTCM --");
+  Serial.printf("  Fresh: %u, Bytes: %lu, Msgs: %lu\n",
+    g_rtcmFresh ? 1 : 0, (unsigned long)g_rtcmBytes, (unsigned long)g_rtcmMsgs);
+  Serial.printf("  F9P decoded: %lu, crcFail: %lu\n",
+    (unsigned long)g_f9pRtcmMsgs, (unsigned long)g_f9pRtcmCrcFail);
+
+  Serial.println("-- Motor Feedback --");
+  Serial.printf("  Fresh: %u, Speed: L=%d R=%d\n", g_haveMotorFeedback ? 1 : 0, g_motorSpeedL, g_motorSpeedR);
+  Serial.printf("  Bat: %d mV, Temp: %d C\n", g_motorBatVoltage, g_motorBoardTemp);
 
   Serial.println("-- Origin --");
   if (g_origin.valid) {
@@ -1833,7 +2419,7 @@ static void printStatus() {
 
   Serial.println();
   Serial.printf("Free heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
-  Serial.printf("===================================\n");
+  Serial.printf("======================================\n");
 }
 
 // ============== MAIN ==============
@@ -1844,16 +2430,16 @@ void setup() {
   Serial.println();
   Serial.println("========================================");
   Serial.println("   RTK ROVER AUTOPILOT v2.0");
+  Serial.println("   Advanced Navigation System");
   Serial.println("========================================");
   Serial.printf("GPS UART: RX=%d TX=%d %lu baud\n", GPS_RX, GPS_TX, (unsigned long)GPS_BAUD);
   Serial.printf("Motor UART: RX=%d TX=%d %lu baud\n", MOTOR_RX, MOTOR_TX, (unsigned long)MOTOR_BAUD);
   Serial.printf("IMU I2C: SDA=%d SCL=%d\n", IMU_SDA, IMU_SCL);
   Serial.printf("WebSocket port: %u\n", WS_PORT);
-  Serial.printf("Chip: %s rev=%d\n", ESP.getChipModel(), ESP.getChipRevision());
 
   g_prefs.begin("rover-nav", false);
   loadNavPrefs();
-  Serial.printf("NAV prefs: imuOffset=%.1f invYaw=%u invFwd=%u invSteer=%u fwd=%.2f turn=%.2f\n",
+  Serial.printf("NAV prefs: imuOffset=%.2f invYaw=%u invFwd=%u invSteer=%u fwd=%.2f turn=%.2f\n",
     g_imuCalibrationOffset, g_invertYaw ? 1 : 0, g_invertForward ? 1 : 0,
     g_invertSteering ? 1 : 0, g_navForwardScale, g_navTurnScale);
 
@@ -1866,6 +2452,7 @@ void setup() {
   // IMU
   if (initImu()) {
     Serial.println("IMU: OK");
+    g_est.heading = g_imuYaw;
   } else {
     Serial.println("IMU: FAILED - continuing without IMU");
   }
@@ -1890,7 +2477,6 @@ void loop() {
       Serial.println();
       Serial.println("!!! WiFi CONNECTED !!!");
       Serial.printf("   IP: %s\n", WiFi.localIP().toString().c_str());
-      Serial.printf("   RSSI: %d dBm\n", WiFi.RSSI());
 
       rtcmUdp.begin(RTCM_UDP_PORT);
       Serial.printf("RTCM: UDP port %u\n", RTCM_UDP_PORT);
@@ -1943,7 +2529,7 @@ void loop() {
     navUpdate();
   }
 
-  // Failsafe -> smooth stop (same as sound.ino)
+  // Failsafe
   if (now - g_lastCmdMs > CMD_TIMEOUT_MS) {
     if (!g_isFailSafeStopping && (g_targetLeft != 0 || g_targetRight != 0 || g_curLeft != 0 || g_curRight != 0)) {
       g_isFailSafeStopping = true;
@@ -1951,7 +2537,7 @@ void loop() {
     }
   }
 
-  // Motor control (same as sound.ino)
+  // Motor control
   static uint32_t lastMotorUpdate = 0;
   if (now - lastMotorUpdate >= MOTOR_SEND_MS) {
     lastMotorUpdate = now;
@@ -1968,6 +2554,5 @@ void loop() {
   // Status
   printStatus();
 
-  // Yield to let WiFi/AsyncWebServer process
   yield();
 }

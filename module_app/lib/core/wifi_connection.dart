@@ -48,6 +48,9 @@ class WifiConnectionState {
   final int? navWpIndex;
   final int? navWpTotal;
   final double? navDistToWp;
+  final double? movementProgressRate; // скорость изменения расстояния до цели (м/с)
+  final double? movementCrossTrack; // cross-track error (м)
+  final String? movementStatus; // OK, STUCK, WRONG_DIR, APPROACHING, STARTING
   final int? motorLeft;
   final int? motorRight;
   final bool? motorFeedback;
@@ -55,6 +58,13 @@ class WifiConnectionState {
   final int? motorSpeedRight;
   final int? motorBatteryRaw;
   final int? motorBoardTempRaw;
+
+  // Calibration data
+  final String? calState; // IDLE, MEAS, VERIFY, OK, FAILED
+  final double? calOffset; // IMU offset в градусах
+  final double? calStdDev; // standard deviation
+  final int? calQuality; // 0-100
+  final bool? calVerified; // verified flag
 
   const WifiConnectionState({
     required this.isConnecting,
@@ -92,6 +102,9 @@ class WifiConnectionState {
     this.navWpIndex,
     this.navWpTotal,
     this.navDistToWp,
+    this.movementProgressRate,
+    this.movementCrossTrack,
+    this.movementStatus,
     this.motorLeft,
     this.motorRight,
     this.motorFeedback,
@@ -99,6 +112,11 @@ class WifiConnectionState {
     this.motorSpeedRight,
     this.motorBatteryRaw,
     this.motorBoardTempRaw,
+    this.calState,
+    this.calOffset,
+    this.calStdDev,
+    this.calQuality,
+    this.calVerified,
   });
 
   factory WifiConnectionState.initial() => const WifiConnectionState(
@@ -137,6 +155,9 @@ class WifiConnectionState {
         navWpIndex: null,
         navWpTotal: null,
         navDistToWp: null,
+        movementProgressRate: null,
+        movementCrossTrack: null,
+        movementStatus: null,
         motorLeft: null,
         motorRight: null,
         motorFeedback: null,
@@ -144,6 +165,11 @@ class WifiConnectionState {
         motorSpeedRight: null,
         motorBatteryRaw: null,
         motorBoardTempRaw: null,
+        calState: null,
+        calOffset: null,
+        calStdDev: null,
+        calQuality: null,
+        calVerified: null,
       );
 
   WifiConnectionState copyWith({
@@ -182,6 +208,9 @@ class WifiConnectionState {
     int? navWpIndex,
     int? navWpTotal,
     double? navDistToWp,
+    double? movementProgressRate,
+    double? movementCrossTrack,
+    String? movementStatus,
     int? motorLeft,
     int? motorRight,
     bool? motorFeedback,
@@ -189,6 +218,11 @@ class WifiConnectionState {
     int? motorSpeedRight,
     int? motorBatteryRaw,
     int? motorBoardTempRaw,
+    String? calState,
+    double? calOffset,
+    double? calStdDev,
+    int? calQuality,
+    bool? calVerified,
   }) {
     return WifiConnectionState(
       isConnecting: isConnecting ?? this.isConnecting,
@@ -226,6 +260,9 @@ class WifiConnectionState {
       navWpIndex: navWpIndex ?? this.navWpIndex,
       navWpTotal: navWpTotal ?? this.navWpTotal,
       navDistToWp: navDistToWp ?? this.navDistToWp,
+      movementProgressRate: movementProgressRate ?? this.movementProgressRate,
+      movementCrossTrack: movementCrossTrack ?? this.movementCrossTrack,
+      movementStatus: movementStatus ?? this.movementStatus,
       motorLeft: motorLeft ?? this.motorLeft,
       motorRight: motorRight ?? this.motorRight,
       motorFeedback: motorFeedback ?? this.motorFeedback,
@@ -233,6 +270,11 @@ class WifiConnectionState {
       motorSpeedRight: motorSpeedRight ?? this.motorSpeedRight,
       motorBatteryRaw: motorBatteryRaw ?? this.motorBatteryRaw,
       motorBoardTempRaw: motorBoardTempRaw ?? this.motorBoardTempRaw,
+      calState: calState ?? this.calState,
+      calOffset: calOffset ?? this.calOffset,
+      calStdDev: calStdDev ?? this.calStdDev,
+      calQuality: calQuality ?? this.calQuality,
+      calVerified: calVerified ?? this.calVerified,
     );
   }
 
@@ -278,6 +320,9 @@ class WifiConnectionState {
       navWpIndex: null,
       navWpTotal: null,
       navDistToWp: null,
+      movementProgressRate: null,
+      movementCrossTrack: null,
+      movementStatus: null,
       motorLeft: null,
       motorRight: null,
       motorFeedback: null,
@@ -285,6 +330,11 @@ class WifiConnectionState {
       motorSpeedRight: null,
       motorBatteryRaw: null,
       motorBoardTempRaw: null,
+      calState: null,
+      calOffset: null,
+      calStdDev: null,
+      calQuality: null,
+      calVerified: null,
     );
   }
 }
@@ -849,7 +899,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
             }
           }
 
-          // Парсинг NAV,<state>,<wpIdx>,<wpTotal>,<distToWp>
+          // Парсинг NAV,<state>,<wpIdx>,<wpTotal>,<distToWp>[,<progressRate>,<crossTrack>,<movementStatus>]
           if (msgStr.startsWith("NAV,")) {
             try {
               final parts = msgStr.split(",");
@@ -864,6 +914,9 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                   navWpIndex: wpIdx,
                   navWpTotal: wpTotal,
                   navDistToWp: distToWp,
+                  movementProgressRate: parts.length > 5 ? double.tryParse(parts[5]) : null,
+                  movementCrossTrack: parts.length > 6 ? double.tryParse(parts[6]) : null,
+                  movementStatus: parts.length > 7 && parts[7].trim().isNotEmpty ? parts[7].trim() : null,
                 );
               }
             } catch (e) {
@@ -881,6 +934,24 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
               }
             } catch (e) {
               _log("× Failed to parse NAV_WP: $e");
+            }
+          }
+
+          // Парсинг CAL,<state>,<offset>,<stdDev>,<quality>,<verified>
+          if (msgStr.startsWith("CAL,")) {
+            try {
+              final parts = msgStr.split(",");
+              if (parts.length >= 6) {
+                state = state.copyWith(
+                  calState: parts[1].trim().isNotEmpty ? parts[1].trim() : null,
+                  calOffset: double.tryParse(parts[2]),
+                  calStdDev: double.tryParse(parts[3]),
+                  calQuality: int.tryParse(parts[4]),
+                  calVerified: parts[5].trim() == '1',
+                );
+              }
+            } catch (e) {
+              _log("× Failed to parse CAL: $e");
             }
           }
 
