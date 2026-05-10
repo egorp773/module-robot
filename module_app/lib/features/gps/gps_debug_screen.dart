@@ -535,11 +535,8 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       setState(() => _notice = 'Нет связи с роботом');
       return;
     }
-    // Calibrate IMU first
-    final nav = _calcNav(wifi);
-    if (nav.bearingText != '-') {
-      ref.read(wifiConnectionProvider.notifier).sendRaw('CAL_IMU,${nav.bearing ?? 0}');
-    }
+    // Calibrate IMU using its own IMU yaw (robot ignores any parameters)
+    ref.read(wifiConnectionProvider.notifier).sendRaw('CAL_IMU');
     // Send GO_TO command
     ref.read(wifiConnectionProvider.notifier).sendGoToTarget(_savedTarget!.lat, _savedTarget!.lon);
     setState(() {
@@ -557,10 +554,10 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   }
 
   void _calibrateImu(WifiConnectionState wifi) {
-    final nav = _calcNav(wifi);
-    if (nav.bearing == null) return;
-    ref.read(wifiConnectionProvider.notifier).sendRaw('CAL_IMU,${nav.bearing!.toStringAsFixed(1)}');
-    setState(() => _notice = 'IMU калиброван на ${nav.bearing!.toStringAsFixed(1)}°');
+    // Send CAL_IMU_SELF - robot sets heading = current IMU yaw
+    // Don't pass any bearing - robot uses its own IMU yaw
+    ref.read(wifiConnectionProvider.notifier).sendRaw('CAL_IMU_SELF');
+    setState(() => _notice = 'Калибровка отправлена...');
   }
 
   // Use IMU yaw if fresh, otherwise GPS heading
