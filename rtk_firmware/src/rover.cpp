@@ -1894,7 +1894,7 @@ static void broadcastTelemetry() {
 
   // Main telemetry
   snprintf(msg, sizeof(msg),
-    "TEL,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu,%lu,%lu,%.1f,%lu,%u,%lu,%lu,%s,%lu,%lu,%lu,%.1f,%.3f,%.3f,%s,%s",
+    "TEL,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu,%lu,%lu,%.1f,%lu,%u,%lu,%lu,%s,%lu,%lu,%lu,%s,%.3f,%.3f,%.3f,%s,%s",
     g_gps.lat, g_gps.lon,
     0.0f,
     g_est.heading,
