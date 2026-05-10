@@ -1355,12 +1355,15 @@ static void broadcastTelemetry() {
   );
   ws.textAll(msg);
 
+  // Calculate heading error: IMU_YAW - AZIMUT (normalized)
+  float headingError = normalizeAngle(g_imuYaw - g_est.heading);
   snprintf(msg, sizeof(msg),
-    "NAV,%s,%u,%u,%.2f",
+    "NAV,%s,%u,%u,%.2f,%.1f",
     stateString(g_navState),
     g_routeIndex,
     g_routeCount,
-    g_distToRouteEnd
+    g_distToRouteEnd,
+    headingError
   );
   ws.textAll(msg);
 
