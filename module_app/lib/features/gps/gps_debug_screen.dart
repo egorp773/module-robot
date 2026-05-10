@@ -294,7 +294,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
                                 icon: Icons.explore_rounded,
                                 label: 'Калибровать\nIMU',
                                 color: const Color(0xFFFFD166),
-                                enabled: _savedTarget != null && wifi.imuFresh == true,
+                                enabled: wifi.imuFresh == true,
                                 onTap: () => _calibrateImu(wifi),
                               ),
                             ),

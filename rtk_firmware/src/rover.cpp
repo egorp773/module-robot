@@ -660,23 +660,10 @@ static void updateImu() {
   }
 }
 
-// Check if IMU data is stable and reliable for calibration
+// Check if IMU data is available for calibration
 static bool imuReadyForCalibration() {
-  if (!g_imuFresh) return false;
-  uint32_t now = millis();
-  // Need at least 2 seconds of stable IMU data before calibration
-  if (g_imuFirstReadMs == 0 || now - g_imuFirstReadMs < 2000) {
-    return false;
-  }
-  // Check if IMU data is changing (should be stable for 500ms)
-  if (g_imuPrevYawMs > 0) {
-    float yawDelta = fabsf(normalizeAngle(g_imuYaw - g_imuPrevYaw));
-    // If yaw changed more than 5 degrees in last 500ms, IMU is moving
-    if (now - g_imuPrevYawMs < 500 && yawDelta > 5.0f) {
-      return false;
-    }
-  }
-  return true;
+  // Just check if IMU is fresh - robot uses its own IMU yaw
+  return g_imuFresh;
 }
 
 // ============== ESTIMATOR ==============
@@ -1330,11 +1317,12 @@ static void broadcastTelemetry() {
   const char* carrier = g_gps.carrier == 2 ? "fixed" : (g_gps.carrier == 1 ? "float" : "none");
 
   // Main telemetry: keep the old Flutter parser compatible.
+  // Format: TEL,lat,lon,height,heading(est),fixType,carrier,diff,numSV,hAcc,vAcc,speed,something,gpsAge,rtcmBytes,rtcmAge,imuYaw,imuAge,imuFresh,...
   snprintf(msg, sizeof(msg),
     "TEL,%.8f,%.8f,%.2f,%.1f,%u,%s,%u,%u,%.0f,%.0f,%.3f,%.2f,%lu,%lu,%lu,%.1f,%lu,%u,%lu,%lu,%s,%lu,%lu,%lu",
     g_gps.lat, g_gps.lon,
     0.0f,
-    g_est.heading,
+    g_est.heading,  // This is the calibrated heading
     g_gps.fixType,
     carrier,
     g_gps.diff ? 1 : 0,
