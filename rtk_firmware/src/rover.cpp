@@ -56,6 +56,7 @@ static const IPAddress SUBNET(255, 255, 255, 0);
 // Network
 static constexpr uint16_t WS_PORT = 81;
 static constexpr uint16_t RTCM_UDP_PORT = 2101;
+static constexpr uint32_t WIFI_RECONNECT_MS = 5000;
 
 // GPS
 static constexpr int GPS_RX = 4;
@@ -1006,6 +1007,7 @@ static AsyncWebServer server(WS_PORT);
 static AsyncWebSocket ws("/ws");
 static bool g_wifiConnected = false;
 static bool g_serverStarted = false;
+static uint32_t g_lastWifiReconnectMs = 0;
 
 static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
                          AwsEventType type, void* arg, uint8_t* data, size_t len) {
@@ -1870,6 +1872,8 @@ void setup() {
 
   // WiFi
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
   WiFi.config(ROVER_IP, GATEWAY, SUBNET);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -1904,6 +1908,13 @@ void loop() {
     if (g_wifiConnected) {
       g_wifiConnected = false;
       Serial.println("!!! WiFi DISCONNECTED !!!");
+    }
+    if (now - g_lastWifiReconnectMs >= WIFI_RECONNECT_MS) {
+      g_lastWifiReconnectMs = now;
+      Serial.println("WiFi: reconnecting...");
+      WiFi.disconnect(false);
+      WiFi.config(ROVER_IP, GATEWAY, SUBNET);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
     }
   }
 

@@ -15,6 +15,7 @@
 static constexpr char WIFI_SSID[] = RTK_ROUTER_WIFI_SSID;
 static constexpr char WIFI_PASS[] = RTK_ROUTER_WIFI_PASS;
 static constexpr uint16_t UDP_PORT = 2101;
+static constexpr uint32_t WIFI_RECONNECT_MS = 5000;
 
 #ifndef RTK_ROUTER_GATEWAY_A
 #define RTK_ROUTER_GATEWAY_A 192
@@ -122,6 +123,7 @@ static constexpr uint32_t CFG_SIGNAL_GLO_L2_ENA = 0x1031001A;
 // Состояние
 static bool wifiConnected = false;
 static bool gpsConfigured = false;
+static uint32_t lastWifiReconnectMs = 0;
 static uint32_t svinValid = 0;
 static uint32_t svinDur = 0;
 static uint32_t svinAcc = 0;
@@ -657,6 +659,8 @@ void setup() {
 
   // WiFi
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.println("WiFi: connecting...");
@@ -686,6 +690,12 @@ void loop() {
     if (wifiConnected) {
       wifiConnected = false;
       Serial.println("!!! WiFi DISCONNECTED !!!");
+    }
+    if (now - lastWifiReconnectMs >= WIFI_RECONNECT_MS) {
+      lastWifiReconnectMs = now;
+      Serial.println("WiFi: reconnecting...");
+      WiFi.disconnect(false);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
     }
   }
 
