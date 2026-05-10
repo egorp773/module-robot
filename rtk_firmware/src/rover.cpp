@@ -1550,7 +1550,9 @@ static void navUpdate() {
     target = end;
   }
 
-  float desiredHeading = atan2f(target.x - g_est.pos.x, target.y - g_est.pos.y) * 180.0f / PI;
+  // IMU yaw: 0° = North, 90° = East, clockwise
+  // atan2(dy, dx) gives: 0° = North, 90° = East (matches IMU convention!)
+  float desiredHeading = atan2f(target.y - g_est.pos.y, target.x - g_est.pos.x) * 180.0f / PI;
   if (desiredHeading < 0) desiredHeading += 360.0f;
 
   float headingError = normalizeAngle(desiredHeading - g_est.heading);
@@ -1567,18 +1569,18 @@ static void navUpdate() {
   }
 
   // Reduce speed for sharp turns and final approach.
-  if (fabsf(headingError) > 30) speed *= 0.5f;
-  if (fabsf(headingError) > 60) speed *= 0.3f;
+  if (fabsf(headingError) > 45) speed *= 0.6f;
+  if (fabsf(headingError) > 90) speed *= 0.3f;
   if (remainingOnPath < 1.0f) speed *= (0.35f + remainingOnPath * 0.65f);
   if (g_est.quality == QUAL_GPS_HOLD_SHORT && fabsf(headingError) > 15) speed = 0.0f;
 
   float forwardCmd = (speed / MAX_SPEED) * MAX_SPEED_PERCENT * g_navForwardScale;
-  if (fabsf(headingError) > 70.0f) forwardCmd = 0.0f;
-  // headingError = desiredHeading - heading: positive = target LEFT, negative = target RIGHT
-  // Positive turnCmd should create LEFT turn: left = forwardCmd + turnCmd, right = forwardCmd - turnCmd
-  // But current mixing does: left = forwardCmd - turnCmd, right = forwardCmd + turnCmd (right turn for positive)
-  // So we need to INVERT turnCmd to get correct behavior
-  float turnCmd = -(K_HEADING * headingError + K_CROSSTRACK * g_crossTrackError) * g_navTurnScale;
+  // headingError > 0: target is LEFT of current heading → need to turn left
+  // turnCmd > 0: right wheel faster → left turn
+  float turnCmd = K_HEADING * headingError * g_navTurnScale;
+  // Add gentle crosstrack correction (don't override heading)
+  turnCmd += K_CROSSTRACK * g_crossTrackError * 0.1f * g_navTurnScale;
+  turnCmd = constrain(turnCmd, -MAX_SPEED_PERCENT * 0.5f, MAX_SPEED_PERCENT * 0.5f);
   turnCmd = constrain(turnCmd, -MAX_SPEED_PERCENT * 0.65f, MAX_SPEED_PERCENT * 0.65f);
 
   if (g_invertForward) forwardCmd = -forwardCmd;
