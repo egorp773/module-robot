@@ -590,6 +590,9 @@ static bool g_imuFresh = false;
 static bool g_imuOk = false;
 static float g_imuCalibrationOffset = 0;
 static bool g_invertYaw = false;
+static uint32_t g_imuFirstReadMs = 0;  // When IMU first gave valid data
+static float g_imuPrevYaw = 0;          // Previous yaw for stability check
+static uint32_t g_imuPrevYawMs = 0;     // When previous yaw was recorded
 
 static bool initImu() {
   Serial.println("IMU: initializing BNO085...");
@@ -637,17 +640,43 @@ static void updateImu() {
       g_lastImuMs = millis();
       g_imuFresh = true;
 
+      // Track first valid read time
+      if (g_imuFirstReadMs == 0) {
+        g_imuFirstReadMs = millis();
+        g_imuPrevYaw = g_imuYaw;
+        g_imuPrevYawMs = millis();
+      }
+
       // Debug every 2 seconds
       uint32_t now = millis();
       if (now - lastDebugMs > 2000) {
         lastDebugMs = now;
-        Serial.printf("IMU: yaw=%.1f fresh=1\n", g_imuYaw);
+        Serial.printf("IMU: yaw=%.1f fresh=1 age=%lu\n", g_imuYaw, (unsigned long)(now - g_imuFirstReadMs));
       }
     }
   }
   if (g_lastImuMs > 0 && millis() - g_lastImuMs > IMU_TIMEOUT_MS) {
     g_imuFresh = false;
   }
+}
+
+// Check if IMU data is stable and reliable for calibration
+static bool imuReadyForCalibration() {
+  if (!g_imuFresh) return false;
+  uint32_t now = millis();
+  // Need at least 2 seconds of stable IMU data before calibration
+  if (g_imuFirstReadMs == 0 || now - g_imuFirstReadMs < 2000) {
+    return false;
+  }
+  // Check if IMU data is changing (should be stable for 500ms)
+  if (g_imuPrevYawMs > 0) {
+    float yawDelta = fabsf(normalizeAngle(g_imuYaw - g_imuPrevYaw));
+    // If yaw changed more than 5 degrees in last 500ms, IMU is moving
+    if (now - g_imuPrevYawMs < 500 && yawDelta > 5.0f) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ============== ESTIMATOR ==============
@@ -1230,31 +1259,34 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   // Calibrate IMU: set heading = current IMU yaw (no GPS needed)
   // IMPORTANT: check CAL_IMU_SELF FIRST because "CAL_IMU_SELF".startsWith("CAL_IMU") = true
   if (cmd == "CAL_IMU_SELF") {
-    Serial.printf("CAL: imuYaw=%.1f imuFresh=%u headingBefore=%.1f\n",
-      g_imuYaw, g_imuFresh ? 1 : 0, g_est.heading);
-    if (g_imuFresh) {
+    Serial.printf("CAL: imuYaw=%.1f ready=%u headingBefore=%.1f\n",
+      g_imuYaw, imuReadyForCalibration() ? 1 : 0, g_est.heading);
+    if (imuReadyForCalibration()) {
+      float oldHeading = g_est.heading;
       g_est.heading = g_imuYaw;
-      Serial.printf("CAL: headingAfter=%.1f\n", g_est.heading);
+      Serial.printf("CAL: SUCCESS heading %.1f -> %.1f\n", oldHeading, g_est.heading);
       char resp[64];
-      snprintf(resp, sizeof(resp), "CAL_IMU_SELF,heading=%.1f", g_imuYaw);
+      snprintf(resp, sizeof(resp), "CAL_OK,heading=%.1f", g_est.heading);
       client->text(resp);
       return;
     }
-    client->text("ERR,NO_IMU");
+    client->text("ERR,CAL_NOT_READY");
     return;
   }
   // Calibrate IMU: heading = current IMU yaw (ignore any parameters)
   if (cmd.startsWith("CAL_IMU")) {
-    Serial.printf("CAL_IMU: imuYaw=%.1f imuFresh=%u\n", g_imuYaw, g_imuFresh ? 1 : 0);
-    if (g_imuFresh) {
+    Serial.printf("CAL_IMU: imuYaw=%.1f ready=%u headingBefore=%.1f\n",
+      g_imuYaw, imuReadyForCalibration() ? 1 : 0, g_est.heading);
+    if (imuReadyForCalibration()) {
+      float oldHeading = g_est.heading;
       g_est.heading = g_imuYaw;
-      Serial.printf("CAL_IMU: heading set to %.1f\n", g_imuYaw);
+      Serial.printf("CAL_IMU: SUCCESS heading %.1f -> %.1f\n", oldHeading, g_est.heading);
       char resp[64];
-      snprintf(resp, sizeof(resp), "CAL_IMU,heading=%.1f,imuYaw=%.1f", g_est.heading, g_imuYaw);
+      snprintf(resp, sizeof(resp), "CAL_OK,heading=%.1f,imuYaw=%.1f", g_est.heading, g_imuYaw);
       client->text(resp);
       return;
     }
-    client->text("ERR,NO_IMU");
+    client->text("ERR,CAL_NOT_READY");
     return;
   }
   if (cmd.startsWith("NAV_CFG,")) {
