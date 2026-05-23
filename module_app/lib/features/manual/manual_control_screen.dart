@@ -16,7 +16,7 @@ import 'package:hello_flutter/features/home/home_screen.dart'
 /// ============================================================================
 /// ✅ Speed настройки (1.0 = базовая скорость, 0.33 = ~в 3 раза медленнее)
 /// ============================================================================
-final manualSpeedProvider = StateProvider<double>((ref) => 0.33);
+final manualSpeedProvider = StateProvider<double>((ref) => 0.65);
 
 /// ============================================================================
 /// ✅ Режим управления
@@ -429,21 +429,6 @@ class ManualMapController extends StateNotifier<ManualMapState> {
       return;
     }
 
-    // Обновляем позицию робота на карте (для визуализации)
-    // Используем небольшой шаг для плавного движения
-    final stepSize = 0.15 * ref.read(manualSpeedProvider);
-    final deltaCells = Offset(
-      direction.dx * stepSize,
-      direction.dy * stepSize,
-    );
-    final next = state.robot + deltaCells;
-    if (state.coordinateType != 'gps') {
-      state = state.copyWith(robot: next);
-      if (state.stage == ManualStage.drawing) {
-        _appendStroke(next);
-      }
-    }
-
     // Преобразуем нормализованное направление в дифференциальные значения left/right
     // Координаты: dx - это движение влево/вправо (поворот),
     // dy - это движение вверх/вниз (вперёд/назад)
@@ -463,6 +448,10 @@ class ManualMapController extends StateNotifier<ManualMapState> {
 
     // Отправляем команду в формате M,left,right
     ref.read(wifiConnectionProvider.notifier).sendMove(left, right);
+  }
+
+  void updateRobotFromGps() {
+    syncRobotFromGps(ref.read(wifiConnectionProvider));
   }
 
   void _appendStroke(Offset p) {
@@ -1722,40 +1711,7 @@ class _ArrowControlsState extends ConsumerState<_ArrowControls> {
         return;
       }
       if (_currentLeft != null && _currentRight != null) {
-        // Преобразуем команды left/right в направление движения на карте
-        // left и right - это скорости моторов от -100 до 100
-        final left = _currentLeft! / 100.0; // -1.0 до 1.0
-        final right = _currentRight! / 100.0; // -1.0 до 1.0
-
-        // Вычисляем скорость вперед/назад
-        final forwardSpeed =
-            (left + right) / 2.0; // средняя скорость вперед/назад
-
-        // Вычисляем угловую скорость (разница между моторами)
-        final angularSpeed = (right - left) / 2.0; // -1.0 до 1.0
-
-        // Для движения на карте:
-        // - Вперед/назад: по оси Y (вперед = отрицательный Y, назад = положительный Y)
-        // - Поворот влево/вправо: по оси X (влево = отрицательный X, вправо = положительный X)
-        // Скорость увеличена в 2.5 раза: 0.15 * 2.5 = 0.375
-        const stepSize = 0.375;
-
-        Offset direction;
-        if ((left > 0 && right < 0) || (left < 0 && right > 0)) {
-          // Поворот на месте - двигаемся вбок
-          // Влево: left < 0, right > 0 -> angularSpeed > 0 -> движение влево (отрицательный X)
-          // Вправо: left > 0, right < 0 -> angularSpeed < 0 -> движение вправо (положительный X)
-          direction = Offset(-angularSpeed * stepSize, 0);
-        } else {
-          // Движение вперед (forwardSpeed > 0) или назад (forwardSpeed < 0)
-          // На карте: вперед = отрицательное Y (вверх), назад = положительное Y (вниз)
-          direction = Offset(0, -forwardSpeed * stepSize);
-        }
-
-        // Обновляем позицию робота на карте
-        if (direction.distance > 0.001) {
-          ref.read(manualMapProvider.notifier).moveRobot(direction);
-        }
+        ref.read(manualMapProvider.notifier).updateRobotFromGps();
       } else {
         timer.cancel();
         _positionUpdateTimer = null;
