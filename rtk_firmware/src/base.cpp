@@ -65,6 +65,7 @@ static uint32_t lastRtcmMs = 0;
 static uint32_t lastRtcmSendMs = 0;
 static uint32_t lastRtcmByteMs = 0;
 static bool rtcmRawForwarding = false;
+static bool rtcmFrameForwarding = false;
 static constexpr uint16_t RAW_RTCM_UDP_BUF_SIZE = 512;
 static constexpr uint32_t RAW_RTCM_FLUSH_MS = 20;
 static uint8_t rawRtcmUdpBuf[RAW_RTCM_UDP_BUF_SIZE];
@@ -801,6 +802,9 @@ void loop() {
       gpsRawBytes++;
       queueRawRtcmByte(b);
       feedRtcmByte(b, false);
+    } else if (rtcmFrameForwarding) {
+      gpsRawBytes++;
+      feedRtcmByte(b, true);
     } else if (rtcmLen > 0) {
       feedRtcmByte(b);
     } else if (!parseUbx(b)) {
@@ -854,8 +858,9 @@ void loop() {
     rtcmExpectedLen = 0;
     rawRtcmUdpLen = 0;
     rawRtcmLastFlushMs = millis();
-    rtcmRawForwarding = true;
-    Serial.println("BASE: RTCM raw forwarding enabled");
+    rtcmRawForwarding = false;
+    rtcmFrameForwarding = true;
+    Serial.println("BASE: RTCM frame forwarding enabled");
     svinPollingEnabled = false;
   }
 

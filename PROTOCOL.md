@@ -154,12 +154,13 @@ RTK/autopilot route commands use local-meter coordinates. The app sends the
 GPS origin once, then sends each waypoint as local `x/y` meters relative to
 that origin.
 
-Preferred current flow is robot-side planning: the app sends a cleaning zone
-polygon and the rover builds the snake route onboard. Direct waypoint upload is
-kept only as a lower-level fallback. The app must not compute autonomous motor
-commands.
+Preferred current flow is app-side route planning: the app builds the exact
+perimeter plus snake waypoint route from the saved map, forbidden zones, and the
+current robot position, then uploads that route with `ROUTE_*`. `AREA_*` remains
+available as a lower-level firmware planner path. The app must not compute
+autonomous motor commands.
 
-### Robot-side area planning
+### Robot-side area planning fallback
 
 ```text
 AREA_BEGIN,<count>,<originLat>,<originLon>,<lineStepMeters>
@@ -195,12 +196,14 @@ Rules:
 - the rover starts the generated route from its current estimated local position.
 - the generated route is stored inside rover firmware and then started with `NAV_START`.
 
+### App-side exact route upload
+
 ```text
 ROUTE_BEGIN,<count>,<originLat>,<originLon>
 ```
 
-`ROUTE_*` is a rover firmware diagnostic/fallback protocol. The Flutter app
-does not send these commands in the normal autonomous flow.
+`ROUTE_*` is the normal autonomous upload path. Waypoints are local-meter points
+relative to the GPS origin saved with the map.
 
 ```text
 ROUTE_WP,<index>,<x_m>,<y_m>
@@ -231,10 +234,29 @@ ERR,ROUTE_INCOMPLETE
 
 Rules:
 
-- `count` must be `1..160`.
+- `count` must be `1..254`.
 - `originLat` and `originLon` must be non-zero.
 - waypoint indexes outside `0..count-1` are rejected.
 - `NAV_START` is accepted only after every waypoint has been received.
+
+### Runtime forbidden zones
+
+```text
+FORBID_BEGIN,<polygonCount>
+FORBID_PT,<polygonIndex>,<pointIndex>,<x_m>,<y_m>
+FORBID_END
+```
+
+The app sends the map's red forbidden polygons before `ROUTE_BEGIN`. Points use
+the same local-meter origin as the route. Sending `FORBID_BEGIN,0` clears any
+old forbidden zones in firmware.
+
+Rules:
+
+- `polygonCount` must be `0..8`.
+- each polygon must contain `3..24` points.
+- during autonomous movement the rover slows near a forbidden polygon and stops
+  if the robot center enters the robot-radius clearance around it.
 
 ### NAV control
 

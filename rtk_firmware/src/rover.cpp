@@ -19,6 +19,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <Adafruit_BNO08x.h>
+#include "NavigationCore.h"
 
 #if __has_include("rtk_config_private.h")
 #include "rtk_config_private.h"
@@ -70,6 +71,10 @@ static constexpr int MOTOR_RX = 16;
 static constexpr int MOTOR_TX = 17;
 static constexpr uint32_t MOTOR_BAUD = 115200;
 
+// Relays from the previous manual-control firmware.
+static constexpr int PIN_RELAY_ATTACHMENT = 32;
+static constexpr int PIN_RELAY_MOUNT = 33;
+
 // IMU
 static constexpr int IMU_SDA = 21;
 static constexpr int IMU_SCL = 22;
@@ -111,22 +116,26 @@ static constexpr uint32_t MANUAL_CMD_TIMEOUT_MS = 400;
 
 // ============== MOTOR CONTROL ==============
 
-static constexpr int MAX_SPEED_PERCENT = 70;
+static constexpr int MAX_SPEED_PERCENT = 60;
 static constexpr int16_t HOVER_MAX_CMD = 300;
 static constexpr int INPUT_DIV = 2;
 static constexpr uint32_t HOVER_SEND_MS = 20;
 static constexpr uint32_t CMD_TIMEOUT_MS = 400;
 static constexpr uint32_t RAMP_UPDATE_MS = 20;
-static constexpr int RAMP_STEP_UP_PER_TICK = 1;
-static constexpr int RAMP_STEP_DOWN_PER_TICK = 1;
+// CRITICAL FIX: was 1, caused 1.4s delay from 0 to 70%. Now 5 = 280ms total ramp.
+static constexpr int RAMP_STEP_UP_PER_TICK = 5;
+static constexpr int RAMP_STEP_DOWN_PER_TICK = 8;  // Stop faster than accelerate
 static constexpr int16_t SLEW_SPEED_PER_SEND = 4;
 static constexpr int16_t SLEW_STEER_PER_SEND = 6;
 
 // ============== NAVIGATION CONSTANTS ==============
 
-static constexpr float ARRIVAL_DIST_M = 0.1f;           // 10cm - target accuracy
-static constexpr float ARRIVAL_CONFIRM_TIME_S = 2.0f;   // Must be within 10cm for 2 seconds
+// Target accuracy 2-5cm
+static constexpr float ARRIVAL_DIST_M = 0.05f;           // 5cm - target accuracy
+// CRITICAL FIX: was 2.0s, caused overshoot. Now 0.3s for responsive stopping.
+static constexpr float ARRIVAL_CONFIRM_TIME_S = 0.3f;   // Must be within 5cm for 0.3 seconds
 static constexpr float ARRIVAL_APPROACH_DIST_M = 0.3f;  // Start approach mode at this distance
+static constexpr float INTERMEDIATE_ADVANCE_MAX_M = 0.35f;  // Segment handoff distance for long mowing rows
 
 // Movement Monitor
 static constexpr float PROGRESS_RATE_MIN_MPS = -0.05f;  // Must be approaching faster than this
@@ -149,6 +158,14 @@ static constexpr float GPS_HEADING_BLEND_FACTOR = 0.3f;  // Weight for GPS headi
 
 // Cross track
 static constexpr float CROSS_TRACK_LIMIT_M = 1.0f;      // Max allowed cross track error
+static constexpr float CROSS_TRACK_SLOW_M = 0.18f;
+static constexpr float CROSS_TRACK_STOP_M = 0.45f;
+static constexpr uint32_t CROSS_TRACK_STOP_CONFIRM_MS = 1200;
+static constexpr float SEGMENT_ENTRY_SLOW_M = 0.60f;
+static constexpr uint32_t SEGMENT_ENTRY_SLOW_MS = 2500;
+static constexpr float ROBOT_RADIUS_M = 0.20f;  // Physical robot radius ~15cm, clearance for path planning
+static constexpr float FORBIDDEN_STOP_CLEARANCE_M = 0.04f;  // Allow 5cm passes; stop only inside or below 4cm
+static constexpr float FORBIDDEN_SLOW_CLEARANCE_M = 0.05f;  // Slow only at the requested 5cm near-contour band
 
 // ============== MOTOR STATE ==============
 
@@ -691,7 +708,10 @@ static uint32_t g_lastImuMs = 0;
 static bool g_imuFresh = false;
 static bool g_imuOk = false;
 static float g_imuCalibrationOffset = 0;
-static bool g_invertYaw = false;
+// This robot's BNO085 mounting reports decreasing yaw during a physical
+// clockwise/right turn. Navigation uses compass heading convention where
+// clockwise/right turns increase heading, so invert yaw by default.
+static bool g_invertYaw = true;
 static uint32_t g_imuFirstReadMs = 0;
 
 static bool initImu() {
@@ -1038,8 +1058,11 @@ static void updateEstimator() {
     g_est.speed = sqrt(g_est.vel.x * g_est.vel.x + g_est.vel.y * g_est.vel.y);
     g_est.pos = local;
     g_est.lastUpdateMs = now;
-    g_lastGoodRtkMs = now;
-    g_haveRtkFix = (qual == QUAL_RTK_FIXED_GOOD || qual == QUAL_RTK_FLOAT_OK);
+    const bool rtkUsable = (qual == QUAL_RTK_FIXED_GOOD || qual == QUAL_RTK_FLOAT_OK);
+    if (rtkUsable) {
+      g_lastGoodRtkMs = now;
+      g_haveRtkFix = true;
+    }
     g_est.rtkFixed = (g_gps.carrier == 2);
 
     // Update heading from GPS velocity if moving
@@ -1150,7 +1173,7 @@ static void updateMovementMonitor(LocalCoords target, float cmdSpeed, float cmdH
 
     float oldestDist = g_mon.distHistory[oldestIdx];
     float newestDist = g_mon.distHistory[newestIdx];
-    uint32_t timeDiff = (g_mon.timeHistory[newestIdx] - g_mon.timeHistory[oldestIdx]) / 1000.0f;
+    float timeDiff = (g_mon.timeHistory[newestIdx] - g_mon.timeHistory[oldestIdx]) / 1000.0f;
 
     if (timeDiff > 0.5f) {
       g_mon.progressRate = (newestDist - oldestDist) / timeDiff;
@@ -1213,9 +1236,7 @@ static bool checkArrival(LocalCoords target, float commandedSpeed, float heading
   // Check if we meet arrival criteria
   bool withinThreshold = dist < ARRIVAL_DIST_M;
   bool stopped = speed < 0.03f;
-  bool headingOk = fabsf(headingError) < 15.0f;
-
-  if (withinThreshold && stopped && headingOk) {
+  if (withinThreshold && stopped) {
     g_arrival.arrivalTimer += NAV_LOOP_MS / 1000.0f;
     g_arrival.distanceAtArrival = dist;
 
@@ -1316,8 +1337,10 @@ static void updateRecovery() {
 
 // ============== ROUTE ==============
 
-static constexpr uint8_t MAX_WAYPOINTS = 160;
+static constexpr uint8_t MAX_WAYPOINTS = 254;
 static constexpr uint8_t MAX_AREA_POINTS = 32;
+static constexpr uint8_t MAX_FORBIDDEN_POLYGONS = 8;
+static constexpr uint8_t MAX_FORBIDDEN_POINTS = 24;
 
 struct Waypoint {
   LocalCoords pos;
@@ -1332,17 +1355,26 @@ static bool g_areaReceived[MAX_AREA_POINTS];
 static uint8_t g_areaCount = 0;
 static float g_areaLineStep = 0.42f;
 static bool g_areaReady = false;
+static LocalCoords g_forbidden[MAX_FORBIDDEN_POLYGONS][MAX_FORBIDDEN_POINTS];
+static bool g_forbiddenReceived[MAX_FORBIDDEN_POLYGONS][MAX_FORBIDDEN_POINTS];
+static uint8_t g_forbiddenPointCount[MAX_FORBIDDEN_POLYGONS];
+static uint8_t g_forbiddenCount = 0;
+static bool g_forbiddenReady = true;
+static float g_forbiddenClearanceM = NAN;
+static uint32_t g_segmentStartMs = 0;
+static uint8_t g_segmentStartIndex = 0;
+static uint32_t g_offRouteSinceMs = 0;
 
 static NavState g_navState = STATE_IDLE;
 static const char* g_navReason = "idle";
 
 // Pure pursuit
-static constexpr float LOOKAHEAD_MIN_M = 0.5f;
-static constexpr float LOOKAHEAD_MAX_M = 1.2f;
-static constexpr float LOOKAHEAD_SPEED_GAIN = 1.5f;
-static constexpr float K_HEADING = 0.5f;
-static constexpr float K_CROSSTRACK = 15.0f;
-static constexpr float K_PROGRESS = 5.0f;
+static constexpr float LOOKAHEAD_MIN_M = 0.22f;
+static constexpr float LOOKAHEAD_MAX_M = 0.60f;
+static constexpr float LOOKAHEAD_SPEED_GAIN = 0.55f;
+// Runtime tunable gains (changed via SIM_SETPARAMS or WebSocket)
+static float g_kHeading = 0.85f;
+static float g_kCrossTrack = 30.0f;
 
 static float g_navForwardScale = 1.0f;
 static float g_navTurnScale = 1.0f;
@@ -1362,6 +1394,58 @@ static float g_crossTrackError = 0;
 static float g_headingError = 0;
 static float g_distToRouteEnd = 0;
 static float g_distToNextWaypoint = 0;
+static navcore::NavigationCore g_navCore;
+
+// USB hardware-in-the-loop mode. The ESP32 still runs rover.cpp and
+// NavigationCore, while the PC supplies simulated sensors over Serial.
+static bool g_simulationMode = false;
+static bool g_simVerbose = false;
+static char g_simSerialLine[160];
+static uint8_t g_simSerialLen = 0;
+static uint32_t g_simTick = 0;
+
+static navcore::NavQuality toCoreQuality(NavQuality quality) {
+  switch (quality) {
+    case QUAL_RTK_FIXED_GOOD: return navcore::NavQuality::Fixed;
+    case QUAL_RTK_FLOAT_OK: return navcore::NavQuality::FloatOk;
+    case QUAL_GPS_DEGRADED: return navcore::NavQuality::Degraded;
+    case QUAL_GPS_HOLD_SHORT: return navcore::NavQuality::GpsHold;
+    default: return navcore::NavQuality::None;
+  }
+}
+
+static navcore::NavConfig makeNavCoreConfig() {
+  navcore::NavConfig config;
+  config.maxSpeedMps = MAX_SPEED;
+  config.floatSpeedMps = FLOAT_SPEED;
+  config.degradedSpeedMps = DEGRADED_SPEED;
+  config.holdSpeedMps = HOLD_SPEED;
+  config.maxSpeedPercent = MAX_SPEED_PERCENT;
+  config.arrivalDistanceM = ARRIVAL_DIST_M;
+  config.arrivalApproachDistanceM = ARRIVAL_APPROACH_DIST_M;
+  config.enableArrivalAdvance = false;
+  config.lookaheadMinM = LOOKAHEAD_MIN_M;
+  config.lookaheadMaxM = LOOKAHEAD_MAX_M;
+  config.lookaheadSpeedGain = LOOKAHEAD_SPEED_GAIN;
+  config.headingGain = g_kHeading;
+  config.crossTrackGain = g_kCrossTrack;
+  config.alignFirst = true;
+  config.alignFirstThresholdDeg = 35.0f;
+  config.forwardScale = g_navForwardScale;
+  config.turnScale = g_navTurnScale;
+  config.invertForward = g_invertForward;
+  config.invertSteering = g_invertSteering;
+  return config;
+}
+
+static void syncNavCoreRoute() {
+  g_navCore.clearRoute();
+  for (uint8_t i = 0; i < g_routeCount; i++) {
+    g_navCore.setWaypoint(i, g_route[i].pos.x, g_route[i].pos.y, g_routeReceived[i]);
+  }
+  g_navCore.setWaypointCount(g_routeCount);
+  g_navCore.setCurrentWaypointIndex(g_routeIndex);
+}
 
 struct __attribute__((packed)) SerialCommand {
   uint16_t start;
@@ -1396,6 +1480,95 @@ static bool areaReady() {
     if (!g_areaReceived[i]) return false;
   }
   return true;
+}
+
+static void clearForbiddenZones() {
+  g_forbiddenCount = 0;
+  g_forbiddenReady = true;
+  g_forbiddenClearanceM = NAN;
+  memset(g_forbiddenReceived, 0, sizeof(g_forbiddenReceived));
+  memset(g_forbiddenPointCount, 0, sizeof(g_forbiddenPointCount));
+}
+
+static bool forbiddenReady() {
+  if (g_forbiddenCount == 0) return true;
+  for (uint8_t poly = 0; poly < g_forbiddenCount; poly++) {
+    const uint8_t count = g_forbiddenPointCount[poly];
+    if (count < 3) return false;
+    for (uint8_t i = 0; i < count; i++) {
+      if (!g_forbiddenReceived[poly][i]) return false;
+    }
+  }
+  return true;
+}
+
+static float pointSegmentDistance(LocalCoords p, LocalCoords a, LocalCoords b) {
+  const float dx = b.x - a.x;
+  const float dy = b.y - a.y;
+  const float len2 = dx * dx + dy * dy;
+  if (len2 < 1e-6f) return hypotf(p.x - a.x, p.y - a.y);
+  float t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+  t = constrain(t, 0.0f, 1.0f);
+  const float px = a.x + t * dx;
+  const float py = a.y + t * dy;
+  return hypotf(p.x - px, p.y - py);
+}
+
+static bool pointInPolygon(LocalCoords p, const LocalCoords* poly, uint8_t count) {
+  bool inside = false;
+  for (uint8_t i = 0, j = count - 1; i < count; j = i++) {
+    const LocalCoords pi = poly[i];
+    const LocalCoords pj = poly[j];
+    const bool crosses = ((pi.y > p.y) != (pj.y > p.y)) &&
+      (p.x < (pj.x - pi.x) * (p.y - pi.y) / ((pj.y - pi.y) + 1e-6f) + pi.x);
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+static float polygonDistance(LocalCoords p, const LocalCoords* poly, uint8_t count) {
+  float best = 1e6f;
+  for (uint8_t i = 0; i < count; i++) {
+    const LocalCoords a = poly[i];
+    const LocalCoords b = poly[(i + 1) % count];
+    best = min(best, pointSegmentDistance(p, a, b));
+  }
+  return best;
+}
+
+static float forbiddenClearance(LocalCoords p, bool* insideAny) {
+  if (insideAny != nullptr) *insideAny = false;
+  if (!g_forbiddenReady || g_forbiddenCount == 0) return NAN;
+
+  float best = 1e6f;
+  for (uint8_t poly = 0; poly < g_forbiddenCount; poly++) {
+    const uint8_t count = g_forbiddenPointCount[poly];
+    if (count < 3) continue;
+    if (pointInPolygon(p, g_forbidden[poly], count)) {
+      if (insideAny != nullptr) *insideAny = true;
+      return 0.0f;
+    }
+    best = min(best, polygonDistance(p, g_forbidden[poly], count));
+  }
+  return best;
+}
+
+static void markSegmentStart() {
+  g_segmentStartMs = millis();
+  g_segmentStartIndex = g_routeIndex;
+}
+
+static float currentSegmentProgressM() {
+  if (g_routeIndex == 0 || g_routeIndex >= g_routeCount) return 1e6f;
+
+  const LocalCoords a = g_route[g_routeIndex - 1].pos;
+  const LocalCoords b = g_route[g_routeIndex].pos;
+  const float dx = b.x - a.x;
+  const float dy = b.y - a.y;
+  const float len = hypotf(dx, dy);
+  if (len < 1e-6f) return 1e6f;
+  const float progress = ((g_est.pos.x - a.x) * dx + (g_est.pos.y - a.y) * dy) / len;
+  return constrain(progress, 0.0f, len);
 }
 
 static bool addRoutePoint(LocalCoords p) {
@@ -1537,7 +1710,7 @@ static void loadNavPrefs() {
     Serial.printf("NAV PREFS: WARNING - saved IMU offset %.1f is large, recalibration recommended\n", g_imuCalibrationOffset);
   }
 
-  g_invertYaw = g_prefs.getBool("invYaw", false);
+  g_invertYaw = true;
   g_invertForward = g_prefs.getBool("invFwd", false);
   g_invertSteering = g_prefs.getBool("invSteer", false);
   g_navForwardScale = g_prefs.getFloat("fwdScale", 1.0f);
@@ -1574,6 +1747,16 @@ static AsyncWebSocket ws("/ws");
 static bool g_wifiConnected = false;
 static bool g_serverStarted = false;
 static uint32_t g_lastWifiReconnectMs = 0;
+
+static void setAttachmentRelay(bool on) {
+  digitalWrite(PIN_RELAY_ATTACHMENT, on ? HIGH : LOW);
+  Serial.printf("ATTACHMENT %s\n", on ? "ON" : "OFF");
+}
+
+static void setMountRelay(bool on) {
+  digitalWrite(PIN_RELAY_MOUNT, on ? HIGH : LOW);
+  Serial.printf("MOUNT %s\n", on ? "ON" : "OFF");
+}
 
 static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
                          AwsEventType type, void* arg, uint8_t* data, size_t len) {
@@ -1647,6 +1830,27 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     return;
   }
 
+  if (cmd == "ATTACHMENT_ON") {
+    setAttachmentRelay(true);
+    client->text("OK");
+    return;
+  }
+  if (cmd == "ATTACHMENT_OFF") {
+    setAttachmentRelay(false);
+    client->text("OK");
+    return;
+  }
+  if (cmd == "MOUNT_ON") {
+    setMountRelay(true);
+    client->text("OK");
+    return;
+  }
+  if (cmd == "MOUNT_OFF") {
+    setMountRelay(false);
+    client->text("OK");
+    return;
+  }
+
   if (cmd == "CAL_IMU") {
     // Manual calibration command
     if (imuReadyForCalibration()) {
@@ -1663,12 +1867,65 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
       g_navState = STATE_MOVING;
       g_navReason = "started";
       g_manualActive = false;
+      markSegmentStart();
+      g_offRouteSinceMs = 0;
       resetMovementMonitor();
       resetArrivalDetector();
       client->text("OK");
       Serial.printf("NAV: Started, route %u/%u\n", g_routeIndex, g_routeCount);
     } else {
       client->text("ERR,NO_ROUTE");
+    }
+    return;
+  }
+
+  if (cmd.startsWith("FORBID_BEGIN,")) {
+    const int count = cmd.substring(13).toInt();
+    if (count >= 0 && count <= MAX_FORBIDDEN_POLYGONS) {
+      clearForbiddenZones();
+      g_forbiddenCount = (uint8_t)count;
+      g_forbiddenReady = (count == 0);
+      client->text("OK");
+      Serial.printf("WS: forbidden begin %d polygons\n", count);
+      return;
+    }
+    client->text("ERR,FORBID_BEGIN");
+    return;
+  }
+
+  if (cmd.startsWith("FORBID_PT,")) {
+    int first = 10;
+    int p1 = cmd.indexOf(',', first);
+    int p2 = cmd.indexOf(',', p1 + 1);
+    int p3 = cmd.indexOf(',', p2 + 1);
+    if (p1 > first && p2 > p1 && p3 > p2) {
+      const int poly = cmd.substring(first, p1).toInt();
+      const int idx = cmd.substring(p1 + 1, p2).toInt();
+      const float x = cmd.substring(p2 + 1, p3).toFloat();
+      const float y = cmd.substring(p3 + 1).toFloat();
+      if (poly >= 0 && poly < g_forbiddenCount &&
+          idx >= 0 && idx < MAX_FORBIDDEN_POINTS &&
+          isfinite(x) && isfinite(y)) {
+        g_forbidden[poly][idx] = {x, y};
+        g_forbiddenReceived[poly][idx] = true;
+        if ((uint8_t)(idx + 1) > g_forbiddenPointCount[poly]) {
+          g_forbiddenPointCount[poly] = (uint8_t)(idx + 1);
+        }
+        client->text("OK");
+        return;
+      }
+    }
+    client->text("ERR,FORBID_PT");
+    return;
+  }
+
+  if (cmd == "FORBID_END") {
+    g_forbiddenReady = forbiddenReady();
+    if (g_forbiddenReady) {
+      client->text("OK");
+      Serial.printf("WS: forbidden ready %u polygons\n", g_forbiddenCount);
+    } else {
+      client->text("ERR,FORBID_INCOMPLETE");
     }
     return;
   }
@@ -1798,13 +2055,11 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
           return;
         }
         LocalCoords target = toLocal(lat, lon);
-        g_routeCount = 2;
+        g_routeCount = 1;
         g_routeIndex = 0;
         memset(g_routeReceived, 0, sizeof(g_routeReceived));
         g_routeReceived[0] = true;
-        g_routeReceived[1] = true;
-        g_route[0].pos = g_est.pos;
-        g_route[1].pos = target;
+        g_route[0].pos = target;
         g_navState = STATE_MOVING;
         g_navReason = "go_to";
         g_manualActive = false;
@@ -2044,11 +2299,36 @@ static void navUpdate() {
     return;
   }
 
-  // Check quality
-  if (g_est.quality == QUAL_NAV_ERROR || g_est.quality == QUAL_GPS_LOST_WAIT) {
+  // Check quality. Autonomous point-to-point navigation needs RTK precision.
+  // A short hold is allowed only after a recent RTK fix, so a small bump or
+  // brief correction dropout does not immediately abort the run.
+  const bool preciseFix =
+    g_est.quality == QUAL_RTK_FIXED_GOOD ||
+    g_est.quality == QUAL_RTK_FLOAT_OK;
+  const bool shortRtkHold =
+    g_est.quality == QUAL_GPS_HOLD_SHORT &&
+    g_haveRtkFix &&
+    (now - g_lastGoodRtkMs) <= GPS_HOLD_AGE_MS;
+  if (!g_simulationMode && !preciseFix && !shortRtkHold) {
     g_targetLeft = g_targetRight = 0;
-    g_navReason = "no_fix";
-    triggerRecovery("no_gps_fix");
+    g_navReason = "no_rtk_fix";
+    triggerRecovery("no_rtk_fix");
+    return;
+  }
+
+  bool insideForbidden = false;
+  g_forbiddenClearanceM = forbiddenClearance(g_est.pos, &insideForbidden);
+  if (g_forbiddenReady && g_forbiddenCount > 0 &&
+      (insideForbidden || g_forbiddenClearanceM <= FORBIDDEN_STOP_CLEARANCE_M)) {
+    g_targetLeft = g_targetRight = 0;
+    g_navState = STATE_ERROR;
+    g_navReason = "forbidden_stop";
+    char navMsg[96];
+    snprintf(navMsg, sizeof(navMsg), "NAV,FORBIDDEN_STOP,%u,%u,%.2f",
+      g_routeIndex, g_routeCount, g_forbiddenClearanceM);
+    ws.textAll(navMsg);
+    Serial.printf("NAV: Forbidden stop, clearance=%.2f m\n", g_forbiddenClearanceM);
+    resetMovementMonitor();
     return;
   }
 
@@ -2065,11 +2345,27 @@ static void navUpdate() {
     g_distToRouteEnd += segLen;
   }
 
-  // Check for arrival at current waypoint
-  if (checkArrival(target, 0, g_headingError)) {
-    g_navState = STATE_ARRIVED;
-    g_navReason = "waypoint_reached";
-    g_targetLeft = g_targetRight = 0;
+  // Intermediate waypoints are segment handoffs, not final parking points.
+  // Advance them without requiring a full stop; keep strict confirmation only
+  // for the final waypoint.
+  const bool finalWaypoint = (g_routeIndex + 1) >= g_routeCount;
+  float intermediateAdvanceM = ARRIVAL_DIST_M * 3.0f;
+  if (g_routeIndex > 0) {
+    const LocalCoords prev = g_route[g_routeIndex - 1].pos;
+    const float segLen = hypotf(target.x - prev.x, target.y - prev.y);
+    // Intermediate points are handoff points. Long mowing rows switch early;
+    // short connectors keep a tighter radius so turns do not get skipped.
+    intermediateAdvanceM = constrain(
+      segLen * 0.08f,
+      ARRIVAL_DIST_M * 3.0f,
+      INTERMEDIATE_ADVANCE_MAX_M
+    );
+  }
+
+  const bool intermediateReached =
+    !finalWaypoint && distToTarget < intermediateAdvanceM;
+
+  if (intermediateReached || checkArrival(target, 0, g_headingError)) {
     g_routeIndex++;
     char navMsg[64];
     snprintf(navMsg, sizeof(navMsg), "NAV,WP_REACHED,%u,%u,%.2f",
@@ -2078,6 +2374,17 @@ static void navUpdate() {
     Serial.printf("NAV: Waypoint %u reached (dist=%.2f)\n", g_routeIndex - 1, distToTarget);
     resetMovementMonitor();
     resetArrivalDetector();
+
+    if (g_routeIndex >= g_routeCount) {
+      g_navState = STATE_ARRIVED;
+      g_navReason = "route_complete";
+      g_targetLeft = g_targetRight = 0;
+    } else {
+      g_navState = STATE_MOVING;
+      g_navReason = "next_waypoint";
+      markSegmentStart();
+      g_offRouteSinceMs = 0;
+    }
     return;
   }
 
@@ -2086,87 +2393,39 @@ static void navUpdate() {
     g_navState = STATE_APPROACHING;
   }
 
-  // Pure pursuit - find lookahead point
-  float lookahead = constrain(LOOKAHEAD_MIN_M + g_est.speed * LOOKAHEAD_SPEED_GAIN,
-                              LOOKAHEAD_MIN_M, LOOKAHEAD_MAX_M);
+  syncNavCoreRoute();
+  g_navCore.setConfig(makeNavCoreConfig());
 
-  // Build lookahead target
-  LocalCoords lookaheadTarget = target;
-  float remaining = distToTarget;
-  uint8_t segIdx = g_routeIndex;
+  navcore::NavInput navInput;
+  navInput.position = navcore::LocalCoords(g_est.pos.x, g_est.pos.y);
+  navInput.headingDeg = g_est.heading;
+  navInput.speedMps = g_est.speed;
+  navInput.quality = toCoreQuality(g_est.quality);
+  navInput.goingWrong = g_mon.isGoingWrong;
 
-  while (remaining > lookahead && segIdx + 1 < g_routeCount) {
-    LocalCoords a = g_route[segIdx].pos;
-    LocalCoords b = g_route[segIdx + 1].pos;
-    float segLen = hypotf(b.x - a.x, b.y - a.y);
+  navcore::NavOutput navOutput = g_navCore.update(navInput, NAV_LOOP_MS / 1000.0f);
+  g_headingError = navOutput.headingErrorDeg;
+  g_crossTrackError = navOutput.crossTrackErrorM;
+  float desiredHeading = navOutput.desiredHeadingDeg;
+  float speed = navOutput.commandSpeedMps;
 
-    if (remaining - segLen <= lookahead) {
-      float t = (remaining - lookahead) / segLen;
-      lookaheadTarget.x = a.x + (b.x - a.x) * t;
-      lookaheadTarget.y = a.y + (b.y - a.y) * t;
-      break;
-    }
-
-    remaining -= segLen;
-    segIdx++;
+  if (navOutput.state == navcore::NavState::Approaching) {
+    g_navState = STATE_APPROACHING;
+  } else {
+    g_navState = STATE_MOVING;
   }
 
-  // Calculate heading to lookahead target
-  float dx = lookaheadTarget.x - g_est.pos.x;
-  float dy = lookaheadTarget.y - g_est.pos.y;
-  float desiredHeading = atan2f(dx, dy) * 180.0f / PI;
-  if (desiredHeading < 0) desiredHeading += 360.0f;
-
-  g_headingError = normalizeAngle(desiredHeading - g_est.heading);
-
-  // Calculate cross track error
-  if (g_routeIndex < g_routeCount) {
-    LocalCoords a = g_route[g_routeIndex].pos;
-    LocalCoords b = (g_routeIndex + 1 < g_routeCount) ? g_route[g_routeIndex + 1].pos : a;
-    float segLen = hypotf(b.x - a.x, b.y - a.y);
-    if (segLen > 0.1f) {
-      float dxSeg = b.x - a.x;
-      float dySeg = b.y - a.y;
-      float cross = (dxSeg * (g_est.pos.y - a.y) - dySeg * (g_est.pos.x - a.x)) / segLen;
-      g_crossTrackError = cross;
-    }
-  }
-
-  // Speed based on quality and state
-  float speed = MAX_SPEED;
-  switch (g_est.quality) {
-    case QUAL_RTK_FIXED_GOOD: speed = MAX_SPEED; break;
-    case QUAL_RTK_FLOAT_OK: speed = FLOAT_SPEED; break;
-    case QUAL_GPS_DEGRADED: speed = DEGRADED_SPEED; break;
-    case QUAL_GPS_HOLD_SHORT: speed = HOLD_SPEED; break;
-    default: speed = 0; break;
-  }
-
-  // Reduce speed for sharp turns
-  if (fabsf(g_headingError) > 30) speed *= 0.7f;
-  if (fabsf(g_headingError) > 60) speed *= 0.5f;
-  if (fabsf(g_headingError) > 90) speed *= 0.3f;
-
-  // Reduce speed in approach mode
-  if (g_navState == STATE_APPROACHING) {
-    speed *= 0.5f;
-    if (distToTarget < 0.2f) speed *= 0.3f;
-  }
-
-  // Reduce speed for cross track error
-  if (fabsf(g_crossTrackError) > 0.5f) speed *= 0.8f;
-  if (fabsf(g_crossTrackError) > 1.0f) speed *= 0.6f;
-
-  // Progress-based speed adjustment
-  if (g_mon.isGoingWrong) {
-    speed *= 0.3f;  // Slow down if going wrong direction
+  if (navOutput.alignOnly) {
+    resetMovementMonitor();
   }
 
   // Update movement monitor
   updateMovementMonitor(target, speed, desiredHeading);
 
-  // Check for stuck condition
-  if (g_mon.isStuck && g_est.speed < STUCK_SPEED_THRESHOLD_MPS) {
+  // Check for stuck condition - but allow for active turning
+  // If heading error is large, robot is legitimately turning in place
+  const bool isActivelyTurning = fabsf(g_headingError) > 60.0f || navOutput.alignOnly;
+  if (!g_simulationMode && g_mon.isStuck && speed > STUCK_SPEED_THRESHOLD_MPS && g_est.speed < STUCK_SPEED_THRESHOLD_MPS && !isActivelyTurning) {
     Serial.println("NAV: Stuck detected - triggering recovery");
     triggerRecovery("stuck");
     return;
@@ -2175,31 +2434,53 @@ static void navUpdate() {
   // Check for wrong direction
   if (g_mon.isGoingWrong && g_mon.actualSpeed > 0.1f) {
     Serial.printf("NAV: Going wrong direction! progress=%.3f m/s\n", g_mon.progressRate);
-    // Try to correct by increasing turn
-    speed *= 0.5f;
+    navInput.goingWrong = true;
+    navOutput = g_navCore.update(navInput, NAV_LOOP_MS / 1000.0f);
+    speed = navOutput.commandSpeedMps;
+    g_headingError = navOutput.headingErrorDeg;
+    g_crossTrackError = navOutput.crossTrackErrorM;
   }
 
-  // Calculate motor commands
-  float forwardCmd = (speed / MAX_SPEED) * MAX_SPEED_PERCENT * g_navForwardScale;
-  float turnCmd = K_HEADING * g_headingError * g_navTurnScale;
+  if (!navOutput.alignOnly && fabsf(g_crossTrackError) > CROSS_TRACK_STOP_M) {
+    if (g_offRouteSinceMs == 0) g_offRouteSinceMs = now;
+    if (!g_simulationMode && (now - g_offRouteSinceMs) >= CROSS_TRACK_STOP_CONFIRM_MS) {
+      g_targetLeft = g_targetRight = 0;
+      g_navState = STATE_ERROR;
+      g_navReason = "off_route_stop";
+      char navMsg[96];
+      snprintf(navMsg, sizeof(navMsg), "NAV,OFF_ROUTE_STOP,%u,%u,%.2f",
+        g_routeIndex, g_routeCount, g_crossTrackError);
+      ws.textAll(navMsg);
+      Serial.printf("NAV: Off-route stop, cross-track=%.2f m\n", g_crossTrackError);
+      resetMovementMonitor();
+      return;
+    }
+  } else {
+    g_offRouteSinceMs = 0;
+  }
 
-  // Cross track correction
-  turnCmd += K_CROSSTRACK * g_crossTrackError * g_navTurnScale;
+  float safetyScale = 1.0f;
+  if (g_forbiddenReady && g_forbiddenCount > 0 &&
+      g_forbiddenClearanceM <= FORBIDDEN_SLOW_CLEARANCE_M) {
+    safetyScale = min(safetyScale, 0.45f);
+  }
+  if (!navOutput.alignOnly && fabsf(g_crossTrackError) > CROSS_TRACK_SLOW_M) {
+    safetyScale = min(safetyScale, 0.55f);
+  }
+  if (g_routeIndex != g_segmentStartIndex) {
+    markSegmentStart();
+  }
+  const bool segmentEntrySlow =
+    (now - g_segmentStartMs) < SEGMENT_ENTRY_SLOW_MS ||
+    currentSegmentProgressM() < SEGMENT_ENTRY_SLOW_M;
+  if (!navOutput.alignOnly && segmentEntrySlow) {
+    safetyScale = min(safetyScale, 0.55f);
+  }
 
-  // Progress correction
-  turnCmd += K_PROGRESS * g_mon.progressRate * g_navTurnScale;
-
-  // Limit turn command
-  turnCmd = constrain(turnCmd, -MAX_SPEED_PERCENT * 0.6f, MAX_SPEED_PERCENT * 0.6f);
-
-  if (g_invertForward) forwardCmd = -forwardCmd;
-  if (g_invertSteering) turnCmd = -turnCmd;
-
-  int16_t left = (int16_t)(forwardCmd + turnCmd);
-  int16_t right = (int16_t)(forwardCmd - turnCmd);
-
-  g_targetLeft = constrain(left, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
-  g_targetRight = constrain(right, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  const int16_t safeLeft = (int16_t)lroundf(navOutput.leftCmd * safetyScale);
+  const int16_t safeRight = (int16_t)lroundf(navOutput.rightCmd * safetyScale);
+  g_targetLeft = constrain(safeLeft, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
+  g_targetRight = constrain(safeRight, -MAX_SPEED_PERCENT, MAX_SPEED_PERCENT);
   g_lastCmdMs = now;
   g_isFailSafeStopping = false;
   g_navReason = qualityString(g_est.quality);
@@ -2342,6 +2623,462 @@ static void motorsReceiveFeedback() {
   }
 }
 
+// ============== USB HITL SIMULATION ==============
+
+static NavQuality simQualityFromToken(String token) {
+  token.trim();
+  token.toUpperCase();
+  if (token == "FIXED" || token == "RTK_FIXED" || token == "4") return QUAL_RTK_FIXED_GOOD;
+  if (token == "FLOAT" || token == "RTK_FLOAT" || token == "5") return QUAL_RTK_FLOAT_OK;
+  if (token == "DEGRADED" || token == "DGPS" || token == "2") return QUAL_GPS_DEGRADED;
+  if (token == "HOLD" || token == "GPS_HOLD") return QUAL_GPS_HOLD_SHORT;
+  return QUAL_NAV_ERROR;
+}
+
+static void startSimulationMode(float targetX, float targetY) {
+  const uint32_t now = millis();
+
+  g_simulationMode = true;
+  g_simTick = 0;
+  g_simSerialLen = 0;
+
+  g_routeCount = 1;
+  g_routeIndex = 0;
+  memset(g_routeReceived, 0, sizeof(g_routeReceived));
+  g_route[0].pos = {targetX, targetY};
+  g_routeReceived[0] = true;
+
+  g_navState = STATE_MOVING;
+  g_navReason = "simulation";
+  g_manualActive = false;
+  g_recovery.recoveryActive = false;
+  g_targetLeft = g_targetRight = 0;
+  g_curLeft = g_curRight = 0;
+  g_cmdSpeed = g_cmdSteer = 0;
+  g_lastCmdMs = now;
+  g_lastRampMs = now;
+  g_isFailSafeStopping = false;
+
+  g_est.pos = {0, 0};
+  g_est.vel = {0, 0};
+  g_est.heading = 0;
+  g_est.headingSource = 0;
+  g_est.speed = 0;
+  g_est.lastUpdateMs = now;
+  g_est.quality = QUAL_RTK_FIXED_GOOD;
+  g_est.qualityAgeMs = 0;
+  g_est.rtkFixed = true;
+
+  g_gps.valid = true;
+  g_gps.fixType = 3;
+  g_gps.carrier = 2;
+  g_gps.diff = true;
+  g_gps.hAcc = 15.0f;
+  g_gps.vAcc = 25.0f;
+  g_gps.speed = 0;
+  g_gps.velN = 0;
+  g_gps.velE = 0;
+  g_gps.lastMs = now;
+  g_lastGoodRtkMs = now;
+  g_lastF9pRtcmMs = now;
+  g_haveRtkFix = true;
+
+  g_imuRawYaw = 0;
+  g_imuYaw = 0;
+  g_imuYawRate = 0;
+  g_lastImuMs = now;
+  g_imuFresh = true;
+
+  resetGpsFilter();
+  resetMovementMonitor();
+  resetArrivalDetector();
+  syncNavCoreRoute();
+  g_navCore.setConfig(makeNavCoreConfig());
+  g_navCore.reset();
+
+  Serial.printf("SIM_OK,%.3f,%.3f\n", targetX, targetY);
+}
+
+static void restartSimulationWithCurrentRoute(float ackX, float ackY) {
+  const uint32_t now = millis();
+
+  g_simulationMode = true;
+  g_simTick = 0;
+  g_simSerialLen = 0;
+  g_routeIndex = 0;  // Start from first waypoint
+
+  g_navState = STATE_MOVING;
+  g_navReason = "simulation_route";
+  g_manualActive = false;
+  g_recovery.recoveryActive = false;
+  g_targetLeft = g_targetRight = 0;
+  g_curLeft = g_curRight = 0;
+  g_cmdSpeed = g_cmdSteer = 0;
+  g_lastCmdMs = now;
+  g_lastRampMs = now;
+  g_isFailSafeStopping = false;
+
+  g_est.pos = {0, 0};
+  g_est.vel = {0, 0};
+  g_est.heading = 0;
+  g_est.headingSource = 0;
+  g_est.speed = 0;
+  g_est.lastUpdateMs = now;
+  g_est.quality = QUAL_RTK_FIXED_GOOD;
+  g_est.qualityAgeMs = 0;
+  g_est.rtkFixed = true;
+
+  g_gps.valid = true;
+  g_gps.fixType = 3;
+  g_gps.carrier = 2;
+  g_gps.diff = true;
+  g_gps.hAcc = 15.0f;
+  g_gps.vAcc = 25.0f;
+  g_gps.speed = 0;
+  g_gps.velN = 0;
+  g_gps.velE = 0;
+  g_gps.lastMs = now;
+  g_lastGoodRtkMs = now;
+  g_lastF9pRtcmMs = now;
+  g_haveRtkFix = true;
+
+  g_imuRawYaw = 0;
+  g_imuYaw = 0;
+  g_imuYawRate = 0;
+  g_lastImuMs = now;
+  g_imuFresh = true;
+
+  resetGpsFilter();
+  resetMovementMonitor();
+  resetArrivalDetector();
+  syncNavCoreRoute();
+  g_navCore.setConfig(makeNavCoreConfig());
+  g_navCore.reset();
+
+  Serial.printf("SIM_ROUTE_OK,%u,%u,%.3f,%.3f\n", g_routeCount, g_routeIndex, ackX, ackY);
+}
+
+static bool startSimulationRoute(String spec) {
+  spec.trim();
+  if (spec.length() == 0) return false;
+
+  g_routeCount = 0;
+  g_routeIndex = 0;
+  memset(g_routeReceived, 0, sizeof(g_routeReceived));
+
+  float lastX = 0.0f;
+  float lastY = 0.0f;
+  int tokenStart = 0;
+  while (tokenStart < spec.length() && g_routeCount < MAX_WAYPOINTS) {
+    int tokenEnd = spec.indexOf(';', tokenStart);
+    if (tokenEnd < 0) tokenEnd = spec.length();
+
+    String token = spec.substring(tokenStart, tokenEnd);
+    token.trim();
+    const int comma = token.indexOf(',');
+    if (comma <= 0) return false;
+
+    const float x = token.substring(0, comma).toFloat();
+    const float y = token.substring(comma + 1).toFloat();
+    g_route[g_routeCount].pos = {x, y};
+    g_routeReceived[g_routeCount] = true;
+    g_routeCount++;
+    lastX = x;
+    lastY = y;
+
+    tokenStart = tokenEnd + 1;
+  }
+
+  if (g_routeCount < 2) return false;
+  restartSimulationWithCurrentRoute(lastX, lastY);
+  return true;
+}
+
+static bool beginSimulationRouteUpload(uint8_t count) {
+  if (count < 2 || count > MAX_WAYPOINTS) return false;
+  g_routeCount = count;
+  g_routeIndex = 0;
+  memset(g_routeReceived, 0, sizeof(g_routeReceived));
+  g_simulationMode = false;
+  Serial.printf("SIM_ROUTE_BEGIN_OK,%u\n", g_routeCount);
+  return true;
+}
+
+static bool setSimulationRouteWaypoint(String spec) {
+  spec.trim();
+  const int comma1 = spec.indexOf(',');
+  const int comma2 = spec.indexOf(',', comma1 + 1);
+  if (comma1 <= 0 || comma2 <= comma1) return false;
+
+  const int idx = spec.substring(0, comma1).toInt();
+  if (idx < 0 || idx >= g_routeCount) return false;
+
+  const float x = spec.substring(comma1 + 1, comma2).toFloat();
+  const float y = spec.substring(comma2 + 1).toFloat();
+  g_route[idx].pos = {x, y};
+  g_routeReceived[idx] = true;
+  return true;
+}
+
+static bool finishSimulationRouteUpload() {
+  if (!routeReady()) return false;
+  const LocalCoords last = g_route[g_routeCount - 1].pos;
+  restartSimulationWithCurrentRoute(last.x, last.y);
+  return true;
+}
+
+static void applySimulationGps(float x, float y, float headingDeg, float speedMps, NavQuality quality) {
+  const uint32_t now = millis();
+  const float headingRad = degToRad(headingDeg);
+
+  // Apply GPS filtering to reduce noise (same as in updateEstimator)
+  LocalCoords rawPos = {x, y};
+  updateGpsFilter(rawPos, quality == QUAL_RTK_FIXED_GOOD ? 15.0f : 250.0f);
+
+  g_est.pos = g_gpsFilter.filteredPos;
+  g_est.vel = {speedMps * sinf(headingRad), speedMps * cosf(headingRad)};
+  g_est.heading = normalizeAngle360(headingDeg);
+  g_est.headingSource = 0;
+  g_est.speed = fabsf(speedMps);
+  g_est.lastUpdateMs = now;
+  g_est.quality = quality;
+  g_est.qualityAgeMs = 0;
+  g_est.rtkFixed = quality == QUAL_RTK_FIXED_GOOD;
+
+  g_gps.valid = quality != QUAL_NAV_ERROR;
+  g_gps.fixType = g_gps.valid ? 3 : 0;
+  g_gps.carrier = quality == QUAL_RTK_FIXED_GOOD ? 2 : (quality == QUAL_RTK_FLOAT_OK ? 1 : 0);
+  g_gps.diff = quality == QUAL_RTK_FIXED_GOOD || quality == QUAL_RTK_FLOAT_OK;
+  g_gps.hAcc = quality == QUAL_RTK_FIXED_GOOD ? 15.0f : 250.0f;
+  g_gps.vAcc = 25.0f;
+  g_gps.speed = fabsf(speedMps);
+  g_gps.heading = normalizeAngle360(headingDeg);
+  g_gps.velE = g_est.vel.x;
+  g_gps.velN = g_est.vel.y;
+  g_gps.lastMs = now;
+
+  g_imuRawYaw = normalizeAngle360(headingDeg);
+  g_imuYaw = g_imuRawYaw;
+  g_lastImuMs = now;
+  g_imuFresh = true;
+
+  if (quality == QUAL_RTK_FIXED_GOOD || quality == QUAL_RTK_FLOAT_OK) {
+    g_lastGoodRtkMs = now;
+    g_lastF9pRtcmMs = now;
+    g_haveRtkFix = true;
+  }
+}
+
+static void runSimulationNavigationTick() {
+  navUpdate();
+  // HITL can run faster than wall-clock time. The normal motor ramp is based
+  // on millis(), so using it here creates false "stuck" detections when the
+  // PC advances simulated physics faster than real time. TrackPhysics already
+  // models command delay and motor inertia, so expose the navigation target
+  // command directly in simulation mode.
+  g_curLeft = g_targetLeft;
+  g_curRight = g_targetRight;
+  if (g_simVerbose) {
+    Serial.printf("SIM_DBG,%u,%u,%d,%.3f,%.1f,%.3f,%d,%d,%d,%d\n",
+      g_routeIndex,
+      g_routeCount,
+      (int)g_navState,
+      g_distToNextWaypoint,
+      g_headingError,
+      g_crossTrackError,
+      (int)g_targetLeft,
+      (int)g_targetRight,
+      (int)g_curLeft,
+      (int)g_curRight);
+  }
+  Serial.printf("MOTORS,%d,%d\n", (int)g_curLeft, (int)g_curRight);
+  g_simTick++;
+}
+
+static void handleSimulationLine(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  if (line.startsWith("SIM_START")) {
+    float targetX = 5.0f;
+    float targetY = 0.0f;
+    const int comma1 = line.indexOf(',');
+    if (comma1 > 0) {
+      const int comma2 = line.indexOf(',', comma1 + 1);
+      if (comma2 > comma1) {
+        targetX = line.substring(comma1 + 1, comma2).toFloat();
+        targetY = line.substring(comma2 + 1).toFloat();
+      }
+    }
+    startSimulationMode(targetX, targetY);
+    return;
+  }
+
+  if (line.startsWith("SIM_ROUTE,")) {
+    if (!startSimulationRoute(line.substring(10))) {
+      Serial.println("SIM_ERR,ROUTE_FORMAT");
+    }
+    return;
+  }
+
+  if (line.startsWith("SIM_ROUTE_BEGIN,")) {
+    const int count = line.substring(16).toInt();
+    if (!beginSimulationRouteUpload((uint8_t)count)) {
+      Serial.println("SIM_ERR,ROUTE_BEGIN");
+    }
+    return;
+  }
+
+  if (line.startsWith("SIM_ROUTE_WP,")) {
+    if (!setSimulationRouteWaypoint(line.substring(13))) {
+      Serial.println("SIM_ERR,ROUTE_WP");
+    }
+    return;
+  }
+
+  if (line == "SIM_ROUTE_END") {
+    if (!finishSimulationRouteUpload()) {
+      Serial.println("SIM_ERR,ROUTE_INCOMPLETE");
+    }
+    return;
+  }
+
+  // SIM_FORBID,count - clear old forbidden and set polygon count
+  if (line.startsWith("SIM_FORBID,")) {
+    const int count = line.substring(11).toInt();
+    if (count >= 0 && count <= MAX_FORBIDDEN_POLYGONS) {
+      clearForbiddenZones();
+      g_forbiddenCount = (uint8_t)count;
+      g_forbiddenReady = (count == 0);
+      Serial.printf("SIM_FORBID_OK,%u\n", count);
+      return;
+    }
+    Serial.println("SIM_ERR,FORBID_COUNT");
+    return;
+  }
+
+  // SIM_FORBID_PT,polyIdx,ptIdx,x,y
+  if (line.startsWith("SIM_FORBID_PT,")) {
+    const char* p = line.c_str() + 14;  // skip "SIM_FORBID_PT,"
+    int comma1 = -1, comma2 = -1, comma3 = -1;
+    for (int i = 0; p[i]; i++) {
+      if (p[i] == ',') {
+        if (comma1 < 0) comma1 = i;
+        else if (comma2 < 0) comma2 = i;
+        else if (comma3 < 0) comma3 = i;
+      }
+    }
+    if (comma1 > 0 && comma2 > comma1 && comma3 > comma2) {
+      char buf[32];
+      strncpy(buf, p, comma1); buf[comma1] = '\0';
+      const int poly = atoi(buf);
+      strncpy(buf, p + comma1 + 1, comma2 - comma1 - 1); buf[comma2 - comma1 - 1] = '\0';
+      const int idx = atoi(buf);
+      strncpy(buf, p + comma2 + 1, comma3 - comma2 - 1); buf[comma3 - comma2 - 1] = '\0';
+      const float x = atof(buf);
+      strncpy(buf, p + comma3 + 1, 31);  // y is last field
+      const float y = atof(buf);
+      if (poly >= 0 && poly < MAX_FORBIDDEN_POLYGONS &&
+          idx >= 0 && idx < MAX_FORBIDDEN_POINTS &&
+          isfinite(x) && isfinite(y)) {
+        g_forbidden[poly][idx] = {x, y};
+        g_forbiddenReceived[poly][idx] = true;
+        if ((uint8_t)(idx + 1) > g_forbiddenPointCount[poly]) {
+          g_forbiddenPointCount[poly] = (uint8_t)(idx + 1);
+        }
+        Serial.println("SIM_FORBID_PT_OK");
+        return;
+      }
+    }
+    Serial.println("SIM_ERR,FORBID_PT");
+    return;
+  }
+
+  // SIM_FORBID_END - mark forbidden zones ready
+  if (line == "SIM_FORBID_END") {
+    g_forbiddenReady = forbiddenReady();
+    Serial.printf("SIM_FORBID_END_OK,%u\n", g_forbiddenReady ? 1 : 0);
+    return;
+  }
+
+  if (line == "SIM_STOP") {
+    g_simulationMode = false;
+    g_navState = STATE_IDLE;
+    g_navReason = "simulation_stopped";
+    g_targetLeft = g_targetRight = 0;
+    g_curLeft = g_curRight = 0;
+    Serial.println("SIM_STOPPED");
+    return;
+  }
+
+  if (line.startsWith("SIM_VERBOSE,")) {
+    g_simVerbose = line.substring(12).toInt() != 0;
+    Serial.printf("SIM_VERBOSE,%u\n", g_simVerbose ? 1 : 0);
+    return;
+  }
+
+  // SIM_SETPARAMS,k_heading,k_crosstrack - set navigation gains at runtime
+  if (line.startsWith("SIM_SETPARAMS,")) {
+    const int comma1 = line.indexOf(',', 14);
+    if (comma1 > 14) {
+      const float kh = line.substring(14, comma1).toFloat();
+      const float kx = line.substring(comma1 + 1).toFloat();
+      if (kh > 0 && kh <= 2.0 && kx > 0 && kx <= 50.0) {
+        g_kHeading = kh;
+        g_kCrossTrack = kx;
+        g_navCore.config().headingGain = kh;
+        g_navCore.config().crossTrackGain = kx;
+        Serial.printf("SIM_PARAMS,k_heading=%.2f,k_crosstrack=%.1f\n", kh, kx);
+        return;
+      }
+    }
+    Serial.println("SIM_ERR,INVALID_PARAMS");
+    return;
+  }
+
+  if (!g_simulationMode) return;
+
+  if (line.startsWith("GPS,")) {
+    const int p1 = line.indexOf(',', 4);
+    const int p2 = line.indexOf(',', p1 + 1);
+    const int p3 = line.indexOf(',', p2 + 1);
+    const int p4 = line.indexOf(',', p3 + 1);
+    if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) {
+      Serial.println("SIM_ERR,GPS_FORMAT");
+      return;
+    }
+
+    const float x = line.substring(4, p1).toFloat();
+    const float y = line.substring(p1 + 1, p2).toFloat();
+    const float heading = line.substring(p2 + 1, p3).toFloat();
+    const float speed = line.substring(p3 + 1, p4).toFloat();
+    const NavQuality quality = simQualityFromToken(line.substring(p4 + 1));
+
+    applySimulationGps(x, y, heading, speed, quality);
+    runSimulationNavigationTick();
+    return;
+  }
+
+  Serial.println("SIM_ERR,UNKNOWN");
+}
+
+static void handleSimulationSerialInput() {
+  while (Serial.available()) {
+    const char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      g_simSerialLine[g_simSerialLen] = '\0';
+      handleSimulationLine(String(g_simSerialLine));
+      g_simSerialLen = 0;
+    } else if (g_simSerialLen + 1 < sizeof(g_simSerialLine)) {
+      g_simSerialLine[g_simSerialLen++] = c;
+    } else {
+      g_simSerialLen = 0;
+      Serial.println("SIM_ERR,LINE_TOO_LONG");
+    }
+  }
+}
+
 // ============== STATUS ==============
 
 static void printStatus() {
@@ -2443,6 +3180,11 @@ void setup() {
     g_imuCalibrationOffset, g_invertYaw ? 1 : 0, g_invertForward ? 1 : 0,
     g_invertSteering ? 1 : 0, g_navForwardScale, g_navTurnScale);
 
+  pinMode(PIN_RELAY_ATTACHMENT, OUTPUT);
+  pinMode(PIN_RELAY_MOUNT, OUTPUT);
+  setAttachmentRelay(false);
+  setMountRelay(false);
+
   // GPS
   GpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
   delay(200);
@@ -2469,6 +3211,12 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
+
+  handleSimulationSerialInput();
+  if (g_simulationMode) {
+    yield();
+    return;
+  }
 
   // WiFi
   if (WiFi.status() == WL_CONNECTED) {

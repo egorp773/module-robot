@@ -8,8 +8,10 @@ import 'package:go_router/go_router.dart';
 
 import 'package:hello_flutter/core/wifi_connection.dart';
 import 'package:hello_flutter/core/map_storage.dart';
+import 'package:hello_flutter/core/gps_display_math.dart';
 import 'package:hello_flutter/features/maps/maps_screen.dart';
-import 'package:hello_flutter/features/home/home_screen.dart' show batteryPercentProvider;
+import 'package:hello_flutter/features/home/home_screen.dart'
+    show batteryPercentProvider;
 
 /// ============================================================================
 /// ✅ Speed настройки (1.0 = базовая скорость, 0.33 = ~в 3 раза медленнее)
@@ -268,6 +270,48 @@ class ManualMapController extends StateNotifier<ManualMapState> {
 
   void panBy(Offset dPx) => state = state.copyWith(pan: state.pan + dPx);
 
+  bool _gpsReady(WifiConnectionState wifi) {
+    final lat = wifi.gpsLat;
+    final lon = wifi.gpsLon;
+    final hAccMm = wifi.gpsAccuracy;
+    final fresh = wifi.gpsReceivedAt != null &&
+        DateTime.now().difference(wifi.gpsReceivedAt!).inMilliseconds < 2500;
+    return wifi.isConnected &&
+        fresh &&
+        wifi.gpsCarrier == 'fixed' &&
+        lat != null &&
+        lon != null &&
+        lat.abs() > 0.000001 &&
+        lon.abs() > 0.000001 &&
+        (hAccMm == null || hAccMm <= 80);
+  }
+
+  void syncRobotFromGps(WifiConnectionState wifi, {bool force = false}) {
+    if (!_gpsReady(wifi)) return;
+    final lat = wifi.gpsLat!;
+    final lon = wifi.gpsLon!;
+    final originLat = state.refLat ?? lat;
+    final originLon = state.refLon ?? lon;
+    final geo = GpsDisplayGeometry(originLat: originLat, originLon: originLon);
+    final local = geo.toLocal(lat, lon);
+    final next = Offset(local.x, local.y);
+
+    final movedEnough = (next - state.robot).distance >= 0.02;
+    if (!force && !movedEnough && state.coordinateType == 'gps') return;
+
+    state = state.copyWith(
+      coordinateType: 'gps',
+      refLat: originLat,
+      refLon: originLon,
+      robot: next,
+      startPoint: state.startPoint ?? next,
+    );
+
+    if (state.stage == ManualStage.drawing) {
+      _appendStroke(next);
+    }
+  }
+
   /// центрирование: перемещаем карту так, чтобы робот оказался в центре экрана
   void centerOnRobot(double uiScale, Size mapSize) {
     // Вычисляем размер клетки с учетом зума
@@ -366,6 +410,9 @@ class ManualMapController extends StateNotifier<ManualMapState> {
   }
 
   void moveRobot(Offset direction) {
+    final wifi = ref.read(wifiConnectionProvider);
+    syncRobotFromGps(wifi);
+
     if (!_isConnected) {
       ref.read(noticeProvider.notifier).show(const NoticeState(
             title: 'Подключение',
@@ -390,10 +437,11 @@ class ManualMapController extends StateNotifier<ManualMapState> {
       direction.dy * stepSize,
     );
     final next = state.robot + deltaCells;
-    state = state.copyWith(robot: next);
-
-    if (state.stage == ManualStage.drawing) {
-      _appendStroke(next);
+    if (state.coordinateType != 'gps') {
+      state = state.copyWith(robot: next);
+      if (state.stage == ManualStage.drawing) {
+        _appendStroke(next);
+      }
     }
 
     // Преобразуем нормализованное направление в дифференциальные значения left/right
@@ -504,6 +552,17 @@ class ManualMapController extends StateNotifier<ManualMapState> {
     }
     if (state.mapName == null || state.kind == null) return;
 
+    final wifi = ref.read(wifiConnectionProvider);
+    if (!_gpsReady(wifi)) {
+      ref.read(noticeProvider.notifier).show(const NoticeState(
+            title: 'RTK not ready',
+            message: 'Wait for RTK fixed and hAcc <= 8 cm before recording.',
+            kind: NoticeKind.warning,
+          ));
+      return;
+    }
+    syncRobotFromGps(wifi, force: true);
+
     // Устанавливаем начальную точку в позицию робота, если её еще нет
     if (state.startPoint == null) {
       state = state.copyWith(startPoint: state.robot);
@@ -610,12 +669,12 @@ class ManualMapController extends StateNotifier<ManualMapState> {
           ));
     } else if (k == DrawKind.forbidden) {
       state = state.copyWith(forbiddens: [...state.forbiddens, PolyShape(pts)]);
-    state = state.copyWith(stage: ManualStage.completed, stroke: const []);
-    ref.read(noticeProvider.notifier).show(const NoticeState(
-          title: 'Готово',
-          message: 'Запись завершена.',
-          kind: NoticeKind.success,
-        ));
+      state = state.copyWith(stage: ManualStage.completed, stroke: const []);
+      ref.read(noticeProvider.notifier).show(const NoticeState(
+            title: 'Готово',
+            message: 'Запись завершена.',
+            kind: NoticeKind.success,
+          ));
     } else {
       // Transition завершен - автоматически начинаем зону уборки
       state = state.copyWith(transitions: [...state.transitions, pts]);
@@ -795,11 +854,16 @@ class _ManualControlScreenState extends ConsumerState<ManualControlScreen> {
     final pingCheckEnabled = ref.watch(wifiPingCheckProvider);
     final batteryFromSettings = ref.watch(batteryPercentProvider);
     final battery = pingCheckEnabled
-        ? (wifi.batteryPercent ?? batteryFromSettings) // При включенной проверке приоритет WebSocket, fallback на настройки
+        ? (wifi.batteryPercent ??
+            batteryFromSettings) // При включенной проверке приоритет WebSocket, fallback на настройки
         : batteryFromSettings; // При выключенной проверке только настройки
     final speed = ref.watch(manualSpeedProvider); // ✅ скорость
     final s = ref.watch(manualMapProvider);
     final notice = ref.watch(noticeProvider);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ref.read(manualMapProvider.notifier).syncRobotFromGps(wifi);
+    });
 
     return Scaffold(
       body: LayoutBuilder(builder: (context, constraints) {
@@ -819,8 +883,9 @@ class _ManualControlScreenState extends ConsumerState<ManualControlScreen> {
 
         final topBarH = u(54).clamp(46.0, 54.0);
         final statusH = u(72).clamp(62.0, 72.0);
+        final rtkH = u(44).clamp(38.0, 44.0);
 
-        final availableHeight = contentH - topBarH - statusH - (gap * 3);
+        final availableHeight = contentH - topBarH - statusH - rtkH - (gap * 4);
         final baseControls = (contentH * 0.33);
         final controlsMax = u(270).clamp(220.0, 270.0);
         final controlsMin = u(150).clamp(135.0, 150.0);
@@ -867,6 +932,11 @@ class _ManualControlScreenState extends ConsumerState<ManualControlScreen> {
                         batteryPercent: battery,
                         onToggle: _toggleWifiConnection,
                       ),
+                    ),
+                    SizedBox(height: gap),
+                    SizedBox(
+                      height: rtkH,
+                      child: _RtkStatusPanel(uiScale: uiScale, wifi: wifi),
                     ),
                     SizedBox(height: gap),
                     _AttachmentMountPanel(uiScale: uiScale),
@@ -1173,7 +1243,8 @@ class _ControlsArea extends ConsumerWidget {
                           ref.read(noticeProvider.notifier).show(
                                 const NoticeState(
                                   title: 'Подключение',
-                                  message: 'Подключитесь к роботу для управления.',
+                                  message:
+                                      'Подключитесь к роботу для управления.',
                                   kind: NoticeKind.danger,
                                 ),
                               );
@@ -1215,7 +1286,8 @@ class _ControlsArea extends ConsumerWidget {
                           ref.read(noticeProvider.notifier).show(
                                 const NoticeState(
                                   title: 'Подключение',
-                                  message: 'Подключитесь к роботу для управления.',
+                                  message:
+                                      'Подключитесь к роботу для управления.',
                                   kind: NoticeKind.danger,
                                 ),
                               );
@@ -1558,7 +1630,8 @@ class _ArrowControls extends ConsumerStatefulWidget {
 class _ArrowControlsState extends ConsumerState<_ArrowControls> {
   Timer? _moveTimer;
   Timer? _positionUpdateTimer;
-  Timer? _safetyTimer; // Таймер безопасности - автоматическая остановка через 3 секунды
+  Timer?
+      _safetyTimer; // Таймер безопасности - автоматическая остановка через 3 секунды
   int? _currentLeft;
   int? _currentRight;
 
@@ -1820,37 +1893,37 @@ class _ArrowButton extends StatelessWidget {
                 onPressed();
               },
         borderRadius: BorderRadius.circular(16),
-      child: Container(
-        width: size,
-        height: size,
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [
-              color.withOpacity(enabled ? 0.28 : 0.14),
-              Colors.white.withOpacity(0.06)
-            ],
+        child: Container(
+          width: size,
+          height: size,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                color.withOpacity(enabled ? 0.28 : 0.14),
+                Colors.white.withOpacity(0.06)
+              ],
+            ),
+            border: Border.all(
+              color: color.withOpacity(enabled ? 0.55 : 0.25),
+            ),
+            boxShadow: enabled
+                ? [
+                    BoxShadow(
+                      color: color.withOpacity(0.22),
+                      blurRadius: 18,
+                      spreadRadius: 1,
+                    )
+                  ]
+                : null,
           ),
-          border: Border.all(
-            color: color.withOpacity(enabled ? 0.55 : 0.25),
-          ),
-          boxShadow: enabled
-              ? [
-                  BoxShadow(
-                    color: color.withOpacity(0.22),
-                    blurRadius: 18,
-                    spreadRadius: 1,
-                  )
-                ]
-              : null,
-        ),
-        child: Center(
-          child: Icon(
-            icon,
-            color: enabled ? color : Colors.white.withOpacity(0.4),
-            size: size * 0.55,
+          child: Center(
+            child: Icon(
+              icon,
+              color: enabled ? color : Colors.white.withOpacity(0.4),
+              size: size * 0.55,
             ),
           ),
         ),
@@ -1963,76 +2036,79 @@ class _StatusPanel extends StatelessWidget {
       ),
       child: _GlassCard(
         borderColor: statusColor.withOpacity(0.15),
-      child: Padding(
-        padding: EdgeInsets.symmetric(
-          horizontal: u(12).clamp(10.0, 12.0),
-          vertical: u(10).clamp(8.0, 10.0),
-        ),
-        child: Row(
-          children: [
-            _BatteryChip(uiScale: uiScale, percent: batteryPercent, isConnected: wifi.isConnected),
-            SizedBox(width: u(10)),
-            Expanded(
-              child: Row(
-                children: [
-                  Container(
-                    decoration: BoxDecoration(
-                      boxShadow: [
-                        BoxShadow(
-                          color: statusColor.withOpacity(0.06),
-                          blurRadius: 4.0,
-                          spreadRadius: 0.2,
-                        ),
-                      ],
-                    ),
-                    child: Icon(
-                    wifi.isConnected
-                        ? Icons.wifi_rounded
-                        : Icons.wifi_off_rounded,
-                    color: statusColor,
-                    size: u(18).clamp(16.0, 18.0),
-                    ),
-                  ),
-                  SizedBox(width: u(8)),
-                  Expanded(
-                    child: Text(
-                      statusText,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w900,
-                        fontSize: u(11.5).clamp(10.5, 11.5),
-                        color: statusColor,
-                        shadows: [
-                          // Едва заметное неоновое свечение
-                          Shadow(
-                            color: statusColor.withOpacity(0.1),
-                            blurRadius: 4.0,
-                            offset: const Offset(0, 0),
-                          ),
-                          Shadow(
+        child: Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: u(12).clamp(10.0, 12.0),
+            vertical: u(10).clamp(8.0, 10.0),
+          ),
+          child: Row(
+            children: [
+              _BatteryChip(
+                  uiScale: uiScale,
+                  percent: batteryPercent,
+                  isConnected: wifi.isConnected),
+              SizedBox(width: u(10)),
+              Expanded(
+                child: Row(
+                  children: [
+                    Container(
+                      decoration: BoxDecoration(
+                        boxShadow: [
+                          BoxShadow(
                             color: statusColor.withOpacity(0.06),
-                            blurRadius: 6.0,
-                            offset: const Offset(0, 0),
+                            blurRadius: 4.0,
+                            spreadRadius: 0.2,
                           ),
                         ],
                       ),
-                      maxLines: 2,
-                      softWrap: true,
-                      overflow: TextOverflow.visible,
+                      child: Icon(
+                        wifi.isConnected
+                            ? Icons.wifi_rounded
+                            : Icons.wifi_off_rounded,
+                        color: statusColor,
+                        size: u(18).clamp(16.0, 18.0),
+                      ),
                     ),
-                  ),
-                ],
+                    SizedBox(width: u(8)),
+                    Expanded(
+                      child: Text(
+                        statusText,
+                        style: TextStyle(
+                          fontWeight: FontWeight.w900,
+                          fontSize: u(11.5).clamp(10.5, 11.5),
+                          color: statusColor,
+                          shadows: [
+                            // Едва заметное неоновое свечение
+                            Shadow(
+                              color: statusColor.withOpacity(0.1),
+                              blurRadius: 4.0,
+                              offset: const Offset(0, 0),
+                            ),
+                            Shadow(
+                              color: statusColor.withOpacity(0.06),
+                              blurRadius: 6.0,
+                              offset: const Offset(0, 0),
+                            ),
+                          ],
+                        ),
+                        maxLines: 2,
+                        softWrap: true,
+                        overflow: TextOverflow.visible,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            ),
-            SizedBox(width: u(10)),
-            _ConnectBtn(
-              uiScale: uiScale,
-              accent: accent,
-              busy: wifi.isConnecting,
-              isConnected: wifi.isConnected,
-              onTap: onToggle,
-            ),
-          ],
-        ),
+              SizedBox(width: u(10)),
+              _ConnectBtn(
+                uiScale: uiScale,
+                accent: accent,
+                busy: wifi.isConnecting,
+                isConnected: wifi.isConnected,
+                onTap: onToggle,
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -2042,6 +2118,72 @@ class _StatusPanel extends StatelessWidget {
 /// ============================================================================
 /// Панель переключателей насадки и крепления
 /// ============================================================================
+class _RtkStatusPanel extends StatelessWidget {
+  final double uiScale;
+  final WifiConnectionState wifi;
+
+  const _RtkStatusPanel({
+    required this.uiScale,
+    required this.wifi,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    double u(double v) => v * uiScale;
+    final fresh = wifi.gpsReceivedAt != null &&
+        DateTime.now().difference(wifi.gpsReceivedAt!).inMilliseconds < 2500;
+    final fixed = fresh && wifi.gpsCarrier == 'fixed';
+    final hAccText = wifi.gpsAccuracy == null
+        ? 'hAcc -'
+        : 'hAcc ${(wifi.gpsAccuracy! / 10).round() / 100} m';
+    final satText =
+        wifi.gpsSatellites == null ? 'SV -' : 'SV ${wifi.gpsSatellites}';
+    final color = fixed ? const Color(0xFF38F6A7) : const Color(0xFFFFD166);
+
+    return _GlassCard(
+      borderColor: color.withOpacity(0.18),
+      child: Padding(
+        padding: EdgeInsets.symmetric(horizontal: u(12), vertical: u(7)),
+        child: Row(
+          children: [
+            Icon(
+              fixed ? Icons.gps_fixed_rounded : Icons.gps_not_fixed_rounded,
+              color: color,
+              size: u(18).clamp(16.0, 18.0),
+            ),
+            SizedBox(width: u(8)),
+            Expanded(
+              child: Text(
+                fixed
+                    ? 'RTK fixed - map records robot GPS'
+                    : 'Waiting RTK fixed',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: color,
+                  fontSize: u(11.5).clamp(10.0, 11.5),
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ),
+            SizedBox(width: u(8)),
+            Text(
+              '$hAccText  $satText',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.72),
+                fontSize: u(10.5).clamp(9.5, 10.5),
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _AttachmentMountPanel extends ConsumerWidget {
   final double uiScale;
 
@@ -2050,7 +2192,7 @@ class _AttachmentMountPanel extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     double u(double v) => v * uiScale;
-    
+
     final attachmentEnabled = ref.watch(attachmentProvider);
     final mountEnabled = ref.watch(mountProvider);
     final wifi = ref.watch(wifiConnectionProvider);
@@ -2094,7 +2236,8 @@ class _AttachmentMountPanel extends ConsumerWidget {
                         ref.read(noticeProvider.notifier).show(
                               const NoticeState(
                                 title: 'Подключение',
-                                message: 'Подключитесь к роботу для управления.',
+                                message:
+                                    'Подключитесь к роботу для управления.',
                                 kind: NoticeKind.danger,
                               ),
                             );
@@ -2110,7 +2253,8 @@ class _AttachmentMountPanel extends ConsumerWidget {
                 enabled: wifi.isConnected,
                 onTap: () {
                   if (wifi.isConnected) {
-                    ref.read(mountProvider.notifier).state = mountEnabled ? false : true;
+                    ref.read(mountProvider.notifier).state =
+                        mountEnabled ? false : true;
                   }
                 },
                 onDisabledTap: !wifi.isConnected
@@ -2118,7 +2262,8 @@ class _AttachmentMountPanel extends ConsumerWidget {
                         ref.read(noticeProvider.notifier).show(
                               const NoticeState(
                                 title: 'Подключение',
-                                message: 'Подключитесь к роботу для управления.',
+                                message:
+                                    'Подключитесь к роботу для управления.',
                                 kind: NoticeKind.danger,
                               ),
                             );
@@ -2158,7 +2303,7 @@ class _ToggleSwitch extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     double u(double v) => v * uiScale;
-    
+
     final accentColor = value ? const Color(0xFF00D9FF) : Colors.white;
     final opacity = enabled ? (value ? 1.0 : 0.55) : 0.3;
 
@@ -2178,7 +2323,7 @@ class _ToggleSwitch extends StatelessWidget {
           ),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(14),
-            color: enabled 
+            color: enabled
                 ? accentColor.withOpacity(value ? 0.12 : 0.06)
                 : Colors.white.withOpacity(0.03),
             border: Border.all(
@@ -2219,7 +2364,8 @@ class _ToggleSwitch extends StatelessWidget {
                       duration: const Duration(milliseconds: 200),
                       curve: Curves.easeInOut,
                       decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(u(10).clamp(9.0, 10.0)),
+                        borderRadius:
+                            BorderRadius.circular(u(10).clamp(9.0, 10.0)),
                         color: enabled
                             ? (value
                                 ? accentColor.withOpacity(0.25)
@@ -2236,7 +2382,11 @@ class _ToggleSwitch extends StatelessWidget {
                     AnimatedPositioned(
                       duration: const Duration(milliseconds: 200),
                       curve: Curves.easeInOut,
-                      left: value ? u(36).clamp(32.0, 36.0) - u(18).clamp(16.0, 18.0) - 2 : 2,
+                      left: value
+                          ? u(36).clamp(32.0, 36.0) -
+                              u(18).clamp(16.0, 18.0) -
+                              2
+                          : 2,
                       top: 1,
                       child: Container(
                         width: u(18).clamp(16.0, 18.0),
@@ -2244,7 +2394,9 @@ class _ToggleSwitch extends StatelessWidget {
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
                           color: enabled
-                              ? (value ? accentColor : Colors.white.withOpacity(0.4))
+                              ? (value
+                                  ? accentColor
+                                  : Colors.white.withOpacity(0.4))
                               : Colors.white.withOpacity(0.2),
                           boxShadow: enabled && value
                               ? [
@@ -2395,13 +2547,12 @@ class _BatteryChip extends StatelessWidget {
       child: Row(
         children: [
           Icon(Icons.battery_full_rounded,
-              size: u(18).clamp(16.0, 18.0),
-              color: batteryColor),
+              size: u(18).clamp(16.0, 18.0), color: batteryColor),
           if (isConnected) ...[
-          SizedBox(width: u(6)),
-          Text('$p%',
-              style: TextStyle(
-                  fontWeight: FontWeight.w900,
+            SizedBox(width: u(6)),
+            Text('$p%',
+                style: TextStyle(
+                    fontWeight: FontWeight.w900,
                     fontSize: u(12.5).clamp(11.0, 12.5),
                     color: batteryColor)),
           ],

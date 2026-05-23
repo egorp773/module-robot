@@ -8,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import '../../core/wifi_connection.dart';
 import '../../core/map_storage.dart';
 import '../../core/cleaning_route_planner.dart';
+import '../../core/gps_display_math.dart';
 import '../manual/manual_control_screen.dart';
 import '../home/home_screen.dart' show batteryPercentProvider;
 
@@ -20,12 +21,17 @@ class AutoMapScreen extends ConsumerStatefulWidget {
 }
 
 class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
-  static const double _draftLineStepMeters = 0.42;
+  static const double _draftLineStepMeters = 0.35;
+  static const int _maxRouteWaypoints = 254;
+  static const int _maxForbiddenPolygons = 8;
+  static const int _maxForbiddenPoints = 24;
 
   ManualMapState? _mapState;
   bool _isLoading = true;
   String? _error;
   List<Offset> _route = []; // Построенный маршрут
+  double _routeDistanceM = 0.0;
+  double _routeRunTimeS = 0.0;
   bool _routeSent = false;
   String? _routeWorkflowError;
 
@@ -103,71 +109,93 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     await ctrl.connect();
   }
 
-  void _buildRoute(BuildContext context, WidgetRef ref) {
-    if (_mapState == null) return;
+  Offset _currentRobotStart(ManualMapState map, WifiConnectionState wifi) {
+    if (map.coordinateType == 'gps' &&
+        map.refLat != null &&
+        map.refLon != null &&
+        wifi.gpsLat != null &&
+        wifi.gpsLon != null) {
+      final geometry = GpsDisplayGeometry(
+        originLat: map.refLat!,
+        originLon: map.refLon!,
+      );
+      final local = geometry.toLocal(wifi.gpsLat!, wifi.gpsLon!);
+      return Offset(local.x, local.y);
+    }
+    return map.startPoint ?? map.robot;
+  }
 
-    final startPoint = _mapState!.startPoint;
-    if (startPoint == null) {
+  ManualMapState _mapWithLiveRobot(
+    ManualMapState map,
+    WifiConnectionState wifi,
+  ) {
+    if (map.coordinateType != 'gps' ||
+        map.refLat == null ||
+        map.refLon == null ||
+        wifi.gpsLat == null ||
+        wifi.gpsLon == null) {
+      return map;
+    }
+    final geometry = GpsDisplayGeometry(
+      originLat: map.refLat!,
+      originLon: map.refLon!,
+    );
+    final local = geometry.toLocal(wifi.gpsLat!, wifi.gpsLon!);
+    return map.copyWith(robot: Offset(local.x, local.y));
+  }
+
+  void _buildRoute(BuildContext context, WidgetRef ref) {
+    final map = _mapState;
+    if (map == null) return;
+
+    final currentStart =
+        _currentRobotStart(map, ref.read(wifiConnectionProvider));
+    final cleaningRoute = CleaningRoutePlanner.planRoute(
+      map,
+      lineStep: _draftLineStepMeters,
+      borderPasses: 1,
+      startOverride: currentStart,
+      debugPrint: true,
+    );
+
+    if (cleaningRoute == null || cleaningRoute.path.isEmpty) {
       ref.read(noticeProvider.notifier).show(
             const NoticeState(
-              title: 'Стартовая точка',
-              message: 'Укажите старт (чёрный квадрат) перед построением маршрута.',
+              title: 'Route error',
+              message:
+                  'Could not build a safe perimeter + snake route. Check zone, forbidden areas, and start distance.',
               kind: NoticeKind.danger,
             ),
           );
       return;
     }
 
-    final allRoutePoints = <Offset>[];
-    String? errorMsg;
-
-    // 2. Строим маршрут покрытия зеленых зон змейкой
-    if (_mapState!.zones.isNotEmpty) {
-      final greenStart = allRoutePoints.isNotEmpty ? allRoutePoints.last : startPoint;
-      final cleaningRoute = CleaningRoutePlanner.planRoute(
-        _mapState!,
-        lineStep: _draftLineStepMeters,
-        borderPasses: 2,
-        startOverride: greenStart,
-        debugPrint: true,
-      );
-
-      if (cleaningRoute != null && cleaningRoute.path.isNotEmpty) {
-        if (allRoutePoints.isNotEmpty) {
-          // переход от синей к зелёной
-          allRoutePoints.add(greenStart);
-        }
-        allRoutePoints.addAll(cleaningRoute.path);
-      } else {
-        errorMsg = 'Не удалось построить змейку внутри зеленой зоны.';
-      }
-    } else if (allRoutePoints.isEmpty) {
-      errorMsg = 'Нет зеленых зон для уборки.';
-    }
-
-    if (allRoutePoints.isEmpty) {
+    if (cleaningRoute.path.length > _maxRouteWaypoints) {
       ref.read(noticeProvider.notifier).show(
             NoticeState(
-              title: 'Ошибка',
-              message: errorMsg ?? 'Не удалось построить маршрут. Проверьте карту.',
+              title: 'Route is too long',
+              message:
+                  'Built ${cleaningRoute.path.length} waypoints, ESP32 limit is $_maxRouteWaypoints. Increase row step or split the zone.',
               kind: NoticeKind.danger,
             ),
           );
       return;
     }
 
-    // Сохраняем объединенный маршрут в состояние
     setState(() {
-      _route = allRoutePoints;
+      _mapState = map.copyWith(robot: currentStart);
+      _route = cleaningRoute.path;
+      _routeDistanceM = cleaningRoute.totalDistance;
+      _routeRunTimeS = _estimatedRunTimeSeconds(cleaningRoute.totalDistance);
       _routeSent = false;
       _routeWorkflowError = null;
     });
 
     ref.read(noticeProvider.notifier).show(
           NoticeState(
-            title: 'Маршрут построен',
-            message: 'Маршрут из ${allRoutePoints.length} точек успешно построен.\n'
-                'Зеленые зоны: ${_mapState!.zones.length}',
+            title: 'Route built',
+            message:
+                'Built ${cleaningRoute.path.length} waypoints, ${cleaningRoute.totalDistance.toStringAsFixed(1)} m, about ${(_estimatedRunTimeSeconds(cleaningRoute.totalDistance) / 60).toStringAsFixed(1)} min.',
             kind: NoticeKind.success,
           ),
         );
@@ -200,7 +228,8 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         map.coordinateType != 'gps' ||
         map.refLat == null ||
         map.refLon == null) {
-      const msg = 'Route upload blocked: GPS origin/local-meter map is not ready.';
+      const msg =
+          'Route upload blocked: GPS origin/local-meter map is not ready.';
       setState(() => _routeWorkflowError = msg);
       _showNotice(
         ref,
@@ -211,43 +240,63 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       return;
     }
 
-    if (map.zones.isEmpty || map.zones.first.points.length < 3) {
-      const msg = 'No valid cleaning zone to send to robot.';
+    if (_route.length > _maxRouteWaypoints) {
+      final msg =
+          'Route has ${_route.length} waypoints, limit is $_maxRouteWaypoints.';
       setState(() => _routeWorkflowError = msg);
       _showNotice(
         ref,
-        title: 'Zone is not ready',
+        title: 'Route is too long',
         message: msg,
         kind: NoticeKind.danger,
       );
       return;
     }
 
-    final zone = map.zones.first.points;
-    if (zone.length > 32) {
-      const msg = 'Zone has too many points for rover planner. Use 32 or fewer.';
+    final forbiddenPolygons = map.forbiddens
+        .map((poly) => poly.points
+            .where((p) => p.dx.isFinite && p.dy.isFinite)
+            .toList(growable: false))
+        .where((points) => points.length >= 3)
+        .toList(growable: false);
+
+    if (forbiddenPolygons.length > _maxForbiddenPolygons ||
+        forbiddenPolygons
+            .any((points) => points.length > _maxForbiddenPoints)) {
+      final msg =
+          'Forbidden zones exceed firmware limits: max $_maxForbiddenPolygons zones, '
+          '$_maxForbiddenPoints points each.';
       setState(() => _routeWorkflowError = msg);
       _showNotice(
         ref,
-        title: 'Zone is too complex',
+        title: 'Forbidden zones too complex',
         message: msg,
         kind: NoticeKind.danger,
       );
       return;
     }
 
-    final ctrl = ref.read(wifiConnectionProvider.notifier);
-    ctrl.sendAreaBegin(
-      zone.length,
+    final routeCtrl = ref.read(wifiConnectionProvider.notifier);
+    routeCtrl.sendForbiddenBegin(forbiddenPolygons.length);
+    for (var polyIndex = 0; polyIndex < forbiddenPolygons.length; polyIndex++) {
+      final points = forbiddenPolygons[polyIndex];
+      for (var pointIndex = 0; pointIndex < points.length; pointIndex++) {
+        final p = points[pointIndex];
+        routeCtrl.sendForbiddenPoint(polyIndex, pointIndex, p.dx, p.dy);
+      }
+    }
+    routeCtrl.sendForbiddenEnd();
+
+    routeCtrl.sendRouteBegin(
+      _route.length,
       originLat: map.refLat!,
       originLon: map.refLon!,
-      lineStepMeters: _draftLineStepMeters,
     );
-    for (var i = 0; i < zone.length; i++) {
-      final p = zone[i];
-      ctrl.sendAreaPoint(i, p.dx, p.dy);
+    for (var i = 0; i < _route.length; i++) {
+      final p = _route[i];
+      routeCtrl.sendRoutePoint(i, p.dx, p.dy);
     }
-    ctrl.sendAreaEnd();
+    routeCtrl.sendRouteEnd();
 
     setState(() {
       _routeSent = true;
@@ -256,8 +305,8 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
 
     _showNotice(
       ref,
-      title: 'Маршрут отправлен',
-      message: 'Robot received the zone and plans the route onboard.',
+      title: 'Route sent',
+      message: 'Robot received ${_route.length} exact waypoints from the app.',
       kind: NoticeKind.info,
     );
   }
@@ -337,12 +386,13 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     final notice = ref.watch(noticeProvider);
     final media = MediaQuery.of(context);
     final safeTop = media.padding.top;
-    
+
     // Получаем батарею: если включена проверка Wi-Fi - используем только данные из WebSocket, иначе из настроек
     final pingCheckEnabled = ref.watch(wifiPingCheckProvider);
     final batteryFromSettings = ref.watch(batteryPercentProvider);
     final battery = pingCheckEnabled
-        ? (wifi.batteryPercent ?? batteryFromSettings) // При включенной проверке приоритет WebSocket, fallback на настройки
+        ? (wifi.batteryPercent ??
+            batteryFromSettings) // При включенной проверке приоритет WebSocket, fallback на настройки
         : batteryFromSettings; // При выключенной проверке только настройки
 
     return Scaffold(
@@ -447,7 +497,8 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                                         )
                                       : _MapCardView(
                                           uiScale: uiScale,
-                                          state: _mapState!,
+                                          state: _mapWithLiveRobot(
+                                              _mapState!, wifi),
                                           mapSize: constraints.biggest,
                                           route: _route,
                                           zoom: _zoom,
@@ -521,6 +572,9 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                             uiScale: uiScale,
                             wifi: wifi,
                             routePoints: _route.length,
+                            routeDistanceM: _routeDistanceM,
+                            routeRunTimeS: _routeRunTimeS,
+                            mapSizeLabel: _mapSizeLabel(_mapState),
                             routeSent: _routeSent,
                             error: _routeWorkflowError,
                             onSendRoute: () => _sendRoute(context, ref),
@@ -579,6 +633,33 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
 /// ============================================================================
 /// Баннер уведомлений
 /// ============================================================================
+double _estimatedRunTimeSeconds(double distanceM) {
+  return distanceM / 0.28 + 120.0;
+}
+
+String _mapSizeLabel(ManualMapState? map) {
+  if (map == null || map.zones.isEmpty) return 'Map: -';
+  var minX = double.infinity;
+  var maxX = -double.infinity;
+  var minY = double.infinity;
+  var maxY = -double.infinity;
+  for (final zone in map.zones) {
+    for (final p in zone.points) {
+      if (!p.dx.isFinite || !p.dy.isFinite) continue;
+      minX = math.min(minX, p.dx);
+      maxX = math.max(maxX, p.dx);
+      minY = math.min(minY, p.dy);
+      maxY = math.max(maxY, p.dy);
+    }
+  }
+  if (!minX.isFinite || !maxX.isFinite || !minY.isFinite || !maxY.isFinite) {
+    return 'Map: -';
+  }
+  final width = maxX - minX;
+  final height = maxY - minY;
+  return 'Map: ${width.toStringAsFixed(1)}x${height.toStringAsFixed(1)} m';
+}
+
 class _NoticeBanner extends StatelessWidget {
   final NoticeState notice;
 
@@ -704,6 +785,9 @@ class _AutoWorkflowPanel extends StatelessWidget {
   final double uiScale;
   final WifiConnectionState wifi;
   final int routePoints;
+  final double routeDistanceM;
+  final double routeRunTimeS;
+  final String mapSizeLabel;
   final bool routeSent;
   final String? error;
   final VoidCallback onSendRoute;
@@ -715,6 +799,9 @@ class _AutoWorkflowPanel extends StatelessWidget {
     required this.uiScale,
     required this.wifi,
     required this.routePoints,
+    required this.routeDistanceM,
+    required this.routeRunTimeS,
+    required this.mapSizeLabel,
     required this.routeSent,
     required this.error,
     required this.onSendRoute,
@@ -738,11 +825,16 @@ class _AutoWorkflowPanel extends StatelessWidget {
         ? 'WP: -'
         : 'WP: ${wifi.navWpIndex ?? 0}/${wifi.navWpTotal}';
     final routeStatus = routeSent ? 'sent' : 'not sent';
+    final routeDistance = routePoints == 0
+        ? 'Distance: -'
+        : 'Distance: ${routeDistanceM.toStringAsFixed(1)} m';
+    final routeTime = routePoints == 0
+        ? 'Time: -'
+        : 'Time: ${(routeRunTimeS / 60.0).toStringAsFixed(1)} min';
     final carrier = wifi.gpsCarrier ?? 'none';
     final rtkStatus = 'RTK: $carrier';
-    final motorStatus = wifi.motorFeedback == true
-        ? 'Motor: linked'
-        : 'Motor: no feedback';
+    final motorStatus =
+        wifi.motorFeedback == true ? 'Motor: linked' : 'Motor: no feedback';
     final startReady = routeSent &&
         wifi.isConnected &&
         (wifi.gpsCarrier?.toLowerCase() == 'fixed' ||
@@ -762,6 +854,9 @@ class _AutoWorkflowPanel extends StatelessWidget {
               runSpacing: u(6).clamp(5.0, 6.0),
               children: [
                 _StatusPill(label: 'Route: $routePoints pts, $routeStatus'),
+                _StatusPill(label: mapSizeLabel),
+                _StatusPill(label: routeDistance),
+                _StatusPill(label: routeTime),
                 _StatusPill(label: 'NAV: $navMode'),
                 _StatusPill(label: waypoint),
                 _StatusPill(label: gpsStatus),
@@ -1412,7 +1507,7 @@ class _GridPainter extends CustomPainter {
   bool shouldRepaint(covariant _GridPainter oldDelegate) {
     return oldDelegate.s != s ||
         oldDelegate.uiScale != uiScale ||
-        oldDelegate.route.length != route.length ||
+        oldDelegate.route != route ||
         oldDelegate.zoom != zoom ||
         oldDelegate.pan != pan;
   }
@@ -1567,7 +1662,10 @@ class _StatusPanel extends StatelessWidget {
           ),
           child: Row(
             children: [
-              _BatteryChip(uiScale: uiScale, percent: batteryPercent, isConnected: wifi.isConnected),
+              _BatteryChip(
+                  uiScale: uiScale,
+                  percent: batteryPercent,
+                  isConnected: wifi.isConnected),
               SizedBox(width: u(10)),
               Expanded(
                 child: Row(
@@ -1674,8 +1772,7 @@ class _BatteryChip extends StatelessWidget {
       child: Row(
         children: [
           Icon(Icons.battery_full_rounded,
-              size: u(18).clamp(16.0, 18.0),
-              color: batteryColor),
+              size: u(18).clamp(16.0, 18.0), color: batteryColor),
           if (isConnected) ...[
             SizedBox(width: u(6)),
             Text('$p%',

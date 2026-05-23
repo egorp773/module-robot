@@ -48,7 +48,8 @@ class WifiConnectionState {
   final int? navWpIndex;
   final int? navWpTotal;
   final double? navDistToWp;
-  final double? movementProgressRate; // скорость изменения расстояния до цели (м/с)
+  final double?
+      movementProgressRate; // скорость изменения расстояния до цели (м/с)
   final double? movementCrossTrack; // cross-track error (м)
   final String? movementStatus; // OK, STUCK, WRONG_DIR, APPROACHING, STARTING
   final int? motorLeft;
@@ -914,9 +915,13 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                   navWpIndex: wpIdx,
                   navWpTotal: wpTotal,
                   navDistToWp: distToWp,
-                  movementProgressRate: parts.length > 5 ? double.tryParse(parts[5]) : null,
-                  movementCrossTrack: parts.length > 6 ? double.tryParse(parts[6]) : null,
-                  movementStatus: parts.length > 7 && parts[7].trim().isNotEmpty ? parts[7].trim() : null,
+                  movementProgressRate:
+                      parts.length > 5 ? double.tryParse(parts[5]) : null,
+                  movementCrossTrack:
+                      parts.length > 6 ? double.tryParse(parts[6]) : null,
+                  movementStatus: parts.length > 7 && parts[7].trim().isNotEmpty
+                      ? parts[7].trim()
+                      : null,
                 );
               }
             } catch (e) {
@@ -1165,6 +1170,53 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   void sendAreaEnd() {
     if (!state.isConnected) return;
     sendRaw("AREA_END");
+  }
+
+  void sendRouteBegin(
+    int count, {
+    required double originLat,
+    required double originLon,
+  }) {
+    if (!state.isConnected) return;
+    sendRaw(
+      "ROUTE_BEGIN,$count,${originLat.toStringAsFixed(8)},"
+      "${originLon.toStringAsFixed(8)}",
+    );
+  }
+
+  void sendRoutePoint(int index, double xMeters, double yMeters) {
+    if (!state.isConnected) return;
+    sendRaw(
+      "ROUTE_WP,$index,${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
+    );
+  }
+
+  void sendRouteEnd() {
+    if (!state.isConnected) return;
+    sendRaw("ROUTE_END");
+  }
+
+  void sendForbiddenBegin(int polygonCount) {
+    if (!state.isConnected) return;
+    sendRaw("FORBID_BEGIN,$polygonCount");
+  }
+
+  void sendForbiddenPoint(
+    int polygonIndex,
+    int pointIndex,
+    double xMeters,
+    double yMeters,
+  ) {
+    if (!state.isConnected) return;
+    sendRaw(
+      "FORBID_PT,$polygonIndex,$pointIndex,"
+      "${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
+    );
+  }
+
+  void sendForbiddenEnd() {
+    if (!state.isConnected) return;
+    sendRaw("FORBID_END");
   }
 
   /// Navigation commands
