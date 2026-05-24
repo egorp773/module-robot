@@ -1334,27 +1334,16 @@ static void updateEstimator() {
     }
     g_est.rtkFixed = (g_gps.carrier == 2);
 
-    // Update heading from GPS velocity if moving
+    // Update heading from GPS velocity — always, even when IMU is present.
+    // IMU can have calibration errors that cause oscillation. GPS heading is
+    // stable and sufficient for navigation when RTK is fixed/float.
     if (g_est.speed > GPS_HEADING_MIN_SPEED_MPS) {
       float gpsHeading = atan2f(g_est.vel.x, g_est.vel.y) * 180.0f / PI;
       if (gpsHeading < 0) gpsHeading += 360.0f;
-
-      if (g_imuFresh) {
-        // Blend IMU and GPS heading
-        float imuHeading = g_imuYaw;
-        float imuError = normalizeAngle(gpsHeading - imuHeading);
-        g_est.heading = normalizeAngle360(imuHeading + imuError * GPS_HEADING_BLEND_FACTOR);
-        g_est.headingSource = 2;  // blended
-      } else {
-        // Use GPS heading only
-        g_est.heading = gpsHeading;
-        g_est.headingSource = 1;  // GPS
-      }
-    } else if (g_imuFresh) {
-      // Use IMU when stationary
-      g_est.heading = g_imuYaw;
-      g_est.headingSource = 0;  // IMU
+      g_est.heading = gpsHeading;
+      g_est.headingSource = 1;  // GPS
     }
+    // When stationary, keep last known heading (no IMU fallback)
   } else if (qual == QUAL_GPS_HOLD_SHORT && g_est.lastUpdateMs > 0) {
     // Dead reckoning - use last known heading
     float dt = (now - g_est.lastUpdateMs) / 1000.0f;

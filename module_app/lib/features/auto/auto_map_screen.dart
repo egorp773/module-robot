@@ -15,12 +15,10 @@ import '../home/home_screen.dart' show batteryPercentProvider;
 String? _navStartBlockReason(WifiConnectionState wifi) {
   final carrier = wifi.gpsCarrier?.toLowerCase();
   final rtkReady = carrier == 'fixed' || carrier == 'float';
-  final imuReady = wifi.imuFresh == true;
   final motorReady = wifi.motorFeedback == true;
-  if (rtkReady && imuReady && motorReady) return null;
+  if (rtkReady && motorReady) return null;
   return [
     if (!rtkReady) 'RTK is not float/fixed',
-    if (!imuReady) 'IMU is not fresh',
     if (!motorReady) 'motor controller feedback is absent',
   ].join('; ');
 }
@@ -859,7 +857,6 @@ class _AutoWorkflowPanel extends StatelessWidget {
         : 'Time: ${(routeRunTimeS / 60.0).toStringAsFixed(1)} min';
     final carrier = wifi.gpsCarrier ?? 'none';
     final rtkStatus = 'RTK: $carrier';
-    final imuStatus = wifi.imuFresh == true ? 'IMU: fresh' : 'IMU: stale';
     final motorStatus =
         wifi.motorFeedback == true ? 'Motor: linked' : 'Motor: no feedback';
     final startEnabled = routeSent && wifi.isConnected;
@@ -888,7 +885,6 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 _StatusPill(label: waypoint),
                 _StatusPill(label: gpsStatus),
                 _StatusPill(label: rtkStatus),
-                _StatusPill(label: imuStatus),
                 _StatusPill(label: motorStatus),
                 _StatusPill(label: gpsCoords),
                 _StatusPill(label: startStatus),
