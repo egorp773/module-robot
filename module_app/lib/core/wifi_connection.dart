@@ -476,6 +476,8 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   int _reconnectAttempt = 0;
 
   Completer<void>? _pongWaiter;
+  Completer<void>? _routeAckWaiter;
+  static const Duration _routeAckTimeout = Duration(milliseconds: 800);
 
   Uri get _wsUri => Uri.parse("ws://$_host:$_port/ws");
 
@@ -644,6 +646,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
   Future<void> _closeSocketOnly() async {
     _pongWaiter = null;
+    _routeAckWaiter = null;
     await _sub?.cancel();
     _sub = null;
     try {
@@ -929,6 +932,21 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
             }
           }
 
+          // Generic OK/ERR responses from rover (route acks, nav ack, etc.)
+          if (msgStr.startsWith("OK")) {
+            if (_routeAckWaiter != null && !_routeAckWaiter!.isCompleted) {
+              _routeAckWaiter!.complete();
+              _routeAckWaiter = null;
+            }
+          }
+          if (msgStr.startsWith("ERR,")) {
+            _log("× Rover ERR: $msgStr");
+            if (_routeAckWaiter != null && !_routeAckWaiter!.isCompleted) {
+              _routeAckWaiter!.completeError(msgStr);
+              _routeAckWaiter = null;
+            }
+          }
+
           // Waypoint reached notification
           if (msgStr.startsWith("NAV_WP,")) {
             try {
@@ -1184,16 +1202,48 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     );
   }
 
-  void sendRoutePoint(int index, double xMeters, double yMeters) {
+  Future<void> sendRoutePoint(int index, double xMeters, double yMeters) async {
     if (!state.isConnected) return;
-    sendRaw(
-      "ROUTE_WP,$index,${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
-    );
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final completer = Completer<void>();
+      _routeAckWaiter = completer;
+      sendRaw(
+        "ROUTE_WP,$index,${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
+      );
+      try {
+        await completer.future.timeout(_routeAckTimeout);
+        _routeAckWaiter = null;
+        return;
+      } catch (e) {
+        _routeAckWaiter = null;
+        if (attempt < 2) {
+          _log("× ROUTE_WP $index ack timeout, retry ${attempt + 1}/3");
+        } else {
+          _log("× ROUTE_WP $index failed after 3 attempts");
+        }
+      }
+    }
   }
 
-  void sendRouteEnd() {
+  Future<void> sendRouteEnd() async {
     if (!state.isConnected) return;
-    sendRaw("ROUTE_END");
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final completer = Completer<void>();
+      _routeAckWaiter = completer;
+      sendRaw("ROUTE_END");
+      try {
+        await completer.future.timeout(const Duration(milliseconds: 1500));
+        _routeAckWaiter = null;
+        return;
+      } catch (e) {
+        _routeAckWaiter = null;
+        if (attempt < 2) {
+          _log("× ROUTE_END ack timeout, retry ${attempt + 1}/3");
+        } else {
+          _log("× ROUTE_END failed after 3 attempts");
+        }
+      }
+    }
   }
 
   void sendForbiddenBegin(int polygonCount) {

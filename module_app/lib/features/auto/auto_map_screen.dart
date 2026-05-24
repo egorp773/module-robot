@@ -46,6 +46,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   double _routeDistanceM = 0.0;
   double _routeRunTimeS = 0.0;
   bool _routeSent = false;
+  bool _routeSending = false;
   String? _routeWorkflowError;
 
   // Состояние для управления картой
@@ -225,8 +226,11 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         );
   }
 
-  void _sendRoute(BuildContext context, WidgetRef ref) {
-    if (_route.isEmpty) {
+  Future<void> _sendRoute(BuildContext context, WidgetRef ref) async {
+    if (_routeSending) return;
+    setState(() => _routeSending = true);
+    try {
+      if (_route.isEmpty) {
       _showNotice(
         ref,
         title: 'Нет маршрута',
@@ -318,9 +322,9 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     );
     for (var i = 0; i < _route.length; i++) {
       final p = _route[i];
-      routeCtrl.sendRoutePoint(i, p.dx, p.dy);
+      await routeCtrl.sendRoutePoint(i, p.dx, p.dy);
     }
-    routeCtrl.sendRouteEnd();
+    await routeCtrl.sendRouteEnd();
 
     setState(() {
       _routeSent = true;
@@ -333,6 +337,9 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       message: 'Robot received ${_route.length} exact waypoints from the app.',
       kind: NoticeKind.info,
     );
+    } finally {
+      if (mounted) setState(() => _routeSending = false);
+    }
   }
 
   void _startNavigation(BuildContext context, WidgetRef ref) {
@@ -592,6 +599,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                             routeRunTimeS: _routeRunTimeS,
                             mapSizeLabel: _mapSizeLabel(_mapState),
                             routeSent: _routeSent,
+                            routeSending: _routeSending,
                             error: _routeWorkflowError,
                             onSendRoute: () => _sendRoute(context, ref),
                             onStart: () => _startNavigation(context, ref),
@@ -805,6 +813,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
   final double routeRunTimeS;
   final String mapSizeLabel;
   final bool routeSent;
+  final bool routeSending;
   final String? error;
   final VoidCallback onSendRoute;
   final VoidCallback onStart;
@@ -819,6 +828,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
     required this.routeRunTimeS,
     required this.mapSizeLabel,
     required this.routeSent,
+    required this.routeSending,
     required this.error,
     required this.onSendRoute,
     required this.onStart,
@@ -905,7 +915,8 @@ class _AutoWorkflowPanel extends StatelessWidget {
                   child: _WorkflowButton(
                     icon: Icons.upload_rounded,
                     label: 'Send route',
-                    enabled: routePoints > 0 && wifi.isConnected,
+                    enabled: routePoints > 0 && wifi.isConnected && !routeSending,
+                    busy: routeSending,
                     onTap: onSendRoute,
                   ),
                 ),
@@ -975,38 +986,51 @@ class _WorkflowButton extends StatelessWidget {
   final IconData icon;
   final String label;
   final bool enabled;
+  final bool busy;
   final VoidCallback onTap;
 
   const _WorkflowButton({
     required this.icon,
     required this.label,
     required this.enabled,
+    this.busy = false,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    final color = enabled ? Colors.white : Colors.white.withOpacity(0.34);
+    final effectiveEnabled = enabled && !busy;
+    final color = effectiveEnabled ? Colors.white : Colors.white.withOpacity(0.34);
 
     return InkWell(
       borderRadius: BorderRadius.circular(14),
-      onTap: enabled ? onTap : null,
+      onTap: effectiveEnabled ? onTap : null,
       child: Opacity(
-        opacity: enabled ? 1.0 : 0.55,
+        opacity: effectiveEnabled ? 1.0 : 0.55,
         child: Container(
           height: 42,
           decoration: BoxDecoration(
-            color: Colors.white.withOpacity(enabled ? 0.08 : 0.04),
+            color: Colors.white.withOpacity(effectiveEnabled ? 0.08 : 0.04),
             borderRadius: BorderRadius.circular(14),
             border: Border.all(color: color.withOpacity(0.20)),
           ),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: 17, color: color),
+              if (busy)
+                SizedBox(
+                  width: 17,
+                  height: 17,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation(color),
+                  ),
+                )
+              else
+                Icon(icon, size: 17, color: color),
               const SizedBox(height: 2),
               Text(
-                label,
+                busy ? 'Sending...' : label,
                 style: TextStyle(
                   color: color,
                   fontSize: 10,
