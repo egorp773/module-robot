@@ -583,7 +583,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       if (lastRx == null) return;
       final silence = DateTime.now().difference(lastRx);
 
-      if (silence.inSeconds >= 4) {
+      if (silence.inSeconds >= 8) {
         final ch = _channel;
         if (ch != null) {
           try {
@@ -596,7 +596,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         }
       }
 
-      if (silence.inSeconds >= 8) {
+      if (silence.inSeconds >= 20) {
         unawaited(
           _handleConnectionLost(
             "Нет данных от ровера ${silence.inSeconds} секунд",

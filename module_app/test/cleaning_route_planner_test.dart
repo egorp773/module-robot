@@ -37,6 +37,22 @@ void main() {
     expect(route, isNull);
   });
 
+  test('can build from a far GPS start when automatic mode allows approach',
+      () {
+    final zone = _rect(0, 0, 6, 2.4);
+    final route = CleaningRoutePlanner.planRoute(
+      _map(zone),
+      lineStep: 0.35,
+      startOverride: const Offset(-10, 1.2),
+      maxStartDistanceMeters: double.infinity,
+    );
+
+    expect(route, isNotNull);
+    expect(route!.path.first, const Offset(-10, 1.2));
+    expect(route.path[1], const Offset(0, 1.2));
+    expect(_allAfterStartInside(route.path, zone), isTrue);
+  });
+
   test('routes around a forbidden island without entering the red polygon', () {
     final zone = _rect(0, 0, 6, 3);
     final forbidden = _rect(2.5, 1, 3.5, 2);
@@ -114,6 +130,21 @@ void main() {
       isTrue,
       reason: 'route should travel along the stored transition line',
     );
+  });
+
+  test('keeps reachable zone route when another zone has no transition', () {
+    final zoneA = _rect(0, 0, 2, 2);
+    final zoneB = _rect(6, 0, 8, 2);
+
+    final route = CleaningRoutePlanner.planRoute(
+      _map(zoneA, zones: [zoneA, zoneB]),
+      lineStep: 0.35,
+      startOverride: const Offset(-1, 1),
+    );
+
+    expect(route, isNotNull);
+    expect(route!.path.any((p) => _pointInOrOnPolygon(p, zoneA)), isTrue);
+    expect(route.path.any((p) => _pointInOrOnPolygon(p, zoneB)), isFalse);
   });
 }
 

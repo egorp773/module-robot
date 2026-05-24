@@ -84,7 +84,6 @@ class CleaningRoutePlanner {
     final commands = <RobotCommand>[];
     final path = <Offset>[start];
     var current = start;
-    var totalDistance = 0.0;
     var cleaningSegments = 0;
     var reachedAnyZone = false;
 
@@ -93,7 +92,6 @@ class CleaningRoutePlanner {
       if (_dist(current, p) < 0.03) return;
       commands.add(RobotCommand(RobotCommandType.move, target: p));
       path.add(p);
-      totalDistance += _dist(current, p);
       current = p;
     }
 
@@ -134,10 +132,13 @@ class CleaningRoutePlanner {
       final rawZone = _normalizePolygon(zone.points);
       if (rawZone.length < 3) continue;
 
-      final safeOuter = _safeOffsetPolygon(rawZone, boundaryMargin);
+      var safeOuter = _safeOffsetPolygon(rawZone, boundaryMargin);
       if (safeOuter.length < 3 || _polygonArea(safeOuter).abs() < 0.2) {
-        logger.log('zone skipped: inset collapsed');
-        continue;
+        safeOuter = _safeOffsetPolygon(rawZone, math.min(boundaryMargin, 0.05));
+        if (safeOuter.length < 3 || _polygonArea(safeOuter).abs() < 0.2) {
+          logger.log('inset collapsed, using recorded perimeter as safe outer');
+          safeOuter = rawZone;
+        }
       }
 
       final zoneForbiddens = _findInternalForbiddens(
@@ -161,14 +162,17 @@ class CleaningRoutePlanner {
 
       if (!reachedAnyZone && !_isPointInPolygon(start, rawZone)) {
         if (!_isSegmentFreeOfBlocked(start, rawEntry.point, zoneForbiddens)) {
-          logger.log('outside approach to zone intersects a forbidden polygon');
-          return null;
+          logger.log(
+              'outside approach touches a forbidden polygon, entering via boundary anyway');
         }
         addTravelPath([current, rawEntry.point]);
       } else if (_isPointInPolygon(current, rawZone)) {
         final toEntry =
             _safePathBetween(current, rawEntry.point, rawZone, zoneForbiddens);
-        if (toEntry == null) return null;
+        if (toEntry == null) {
+          logger.log('zone entry is blocked from inside, skipping zone');
+          continue;
+        }
         addTravelPath(toEntry);
       } else {
         final toEntry = _transitionPathBetween(
@@ -180,7 +184,7 @@ class CleaningRoutePlanner {
         if (toEntry == null) {
           logger
               .log('zone is not reachable from current position or transition');
-          return null;
+          continue;
         }
         addTravelPath(toEntry);
       }
@@ -198,8 +202,11 @@ class CleaningRoutePlanner {
 
       final toInset =
           _safePathBetween(current, entry.point, rawZone, zoneForbiddens);
-      if (toInset == null) return null;
-      addTravelPath(toInset);
+      if (toInset != null) {
+        addTravelPath(toInset);
+      } else {
+        logger.log('inset entry unreachable, continuing from perimeter');
+      }
 
       final extraPasses = math.max(0, borderPasses - 1);
       for (var i = 0; i < extraPasses; i++) {
@@ -226,6 +233,33 @@ class CleaningRoutePlanner {
         edgeInset: boundaryMargin,
         horizontalOverride: primaryHorizontal,
       );
+      if (snakeSegments.isEmpty && boundaryMargin > 0.05) {
+        snakeSegments = _buildSnakeSegments(
+          snakeOuter,
+          zoneForbiddens,
+          step,
+          edgeInset: 0.05,
+          horizontalOverride: primaryHorizontal,
+        );
+      }
+      if (snakeSegments.isEmpty) {
+        snakeSegments = _buildSnakeSegments(
+          snakeOuter,
+          zoneForbiddens,
+          step,
+          edgeInset: boundaryMargin,
+          horizontalOverride: !primaryHorizontal,
+        );
+      }
+      if (snakeSegments.isEmpty && boundaryMargin > 0.05) {
+        snakeSegments = _buildSnakeSegments(
+          snakeOuter,
+          zoneForbiddens,
+          step,
+          edgeInset: 0.05,
+          horizontalOverride: !primaryHorizontal,
+        );
+      }
       snakeSegments = _orderSnakeSegments(
         snakeSegments,
         current,
@@ -235,13 +269,29 @@ class CleaningRoutePlanner {
       logger.log('snake segments: ${snakeSegments.length}');
       var skippedSnakeSegments = 0;
       for (final seg in snakeSegments) {
-        if (!_isSegmentSafe(seg.start, seg.end, snakeOuter, zoneForbiddens)) {
+        final reachableSeg = _reachableSegment(
+          current,
+          seg,
+          snakeOuter,
+          zoneForbiddens,
+        );
+        if (reachableSeg == null ||
+            !_isSegmentSafe(
+              reachableSeg.start,
+              reachableSeg.end,
+              snakeOuter,
+              zoneForbiddens,
+            )) {
           skippedSnakeSegments++;
           continue;
         }
 
-        final connector =
-            _safePathBetween(current, seg.start, snakeOuter, zoneForbiddens);
+        final connector = _safePathBetween(
+          current,
+          reachableSeg.start,
+          snakeOuter,
+          zoneForbiddens,
+        );
         if (connector == null) {
           skippedSnakeSegments++;
           continue;
@@ -249,7 +299,7 @@ class CleaningRoutePlanner {
         addTravelPath(connector);
 
         commands.add(const RobotCommand(RobotCommandType.cleanOn));
-        addPoint(seg.end);
+        addPoint(reachableSeg.end);
         cleaningSegments++;
       }
       if (skippedSnakeSegments > 0 &&
@@ -276,13 +326,29 @@ class CleaningRoutePlanner {
         var skippedCrossSegments = 0;
         logger.log('cross snake segments: ${crossSegments.length}');
         for (final seg in crossSegments) {
-          if (!_isSegmentSafe(seg.start, seg.end, snakeOuter, zoneForbiddens)) {
+          final reachableSeg = _reachableSegment(
+            current,
+            seg,
+            snakeOuter,
+            zoneForbiddens,
+          );
+          if (reachableSeg == null ||
+              !_isSegmentSafe(
+                reachableSeg.start,
+                reachableSeg.end,
+                snakeOuter,
+                zoneForbiddens,
+              )) {
             skippedCrossSegments++;
             continue;
           }
 
-          final connector =
-              _safePathBetween(current, seg.start, snakeOuter, zoneForbiddens);
+          final connector = _safePathBetween(
+            current,
+            reachableSeg.start,
+            snakeOuter,
+            zoneForbiddens,
+          );
           if (connector == null) {
             skippedCrossSegments++;
             continue;
@@ -290,7 +356,7 @@ class CleaningRoutePlanner {
           addTravelPath(connector);
 
           commands.add(const RobotCommand(RobotCommandType.cleanOn));
-          addPoint(seg.end);
+          addPoint(reachableSeg.end);
           cleaningSegments++;
         }
         if (skippedCrossSegments > 0) {
@@ -542,6 +608,19 @@ class CleaningRoutePlanner {
     }
     final path = _safePathBetween(start, first, outer, blocked);
     return path == null ? double.infinity : _pathDistance(path);
+  }
+
+  static _Segment? _reachableSegment(
+    Offset current,
+    _Segment segment,
+    List<Offset> outer,
+    List<List<Offset>> blocked,
+  ) {
+    final startCost =
+        _snakeEndpointCost(current, segment.start, outer, blocked);
+    final endCost = _snakeEndpointCost(current, segment.end, outer, blocked);
+    if (!startCost.isFinite && !endCost.isFinite) return null;
+    return endCost < startCost ? segment.reversed() : segment;
   }
 
   static List<Offset>? _transitionPathBetween(

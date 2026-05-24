@@ -18,6 +18,7 @@
 #include <Preferences.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <esp_system.h>
 #include <Adafruit_BNO08x.h>
 #include "NavigationCore.h"
 
@@ -59,12 +60,17 @@ static const IPAddress SUBNET(255, 255, 255, 0);
 // Network
 static constexpr uint16_t WS_PORT = 81;
 static constexpr uint16_t RTCM_UDP_PORT = 2101;
-static constexpr uint32_t WIFI_RECONNECT_MS = 5000;
+static constexpr uint32_t WIFI_RECONNECT_INITIAL_MS = 15000;
+static constexpr uint32_t WIFI_RECONNECT_MAX_MS = 60000;
 
 // GPS
 static constexpr int GPS_RX = 4;
 static constexpr int GPS_TX = 5;
+static constexpr int GPS_ALT_RX = GPS_TX;
+static constexpr int GPS_ALT_TX = GPS_RX;
 static constexpr uint32_t GPS_BAUD = 38400;
+static int g_activeGpsRx = GPS_RX;
+static int g_activeGpsTx = GPS_TX;
 
 // Motor
 static constexpr int MOTOR_RX = 16;
@@ -86,6 +92,8 @@ static constexpr uint32_t RTK_FLOAT_AGE_MS = 1000;
 static constexpr uint32_t GPS_HOLD_AGE_MS = 2000;
 static constexpr uint32_t GPS_DEAD_AGE_MS = 5000;
 static constexpr uint32_t IMU_TIMEOUT_MS = 2000;
+static constexpr uint32_t IMU_REPORT_INTERVAL_US = 20000;
+static constexpr uint32_t IMU_REENABLE_MS = 2000;
 static constexpr uint32_t RTK_CORRECTION_TIMEOUT_MS = 30000;
 
 static constexpr uint32_t RTK_FIXED_HACC_MM = 50;
@@ -240,6 +248,15 @@ static LocalCoords toLocal(double lat, double lon) {
   };
 }
 
+static float approxGpsDistanceM(double latA, double lonA, double latB, double lonB) {
+  const double latRad = ((latA + latB) * 0.5) * PI / 180.0;
+  const double mPerDegLat = 111132.92 - 559.82 * cos(2 * latRad) + 1.175 * cos(4 * latRad);
+  const double mPerDegLon = 111412.84 * cos(latRad) - 93.5 * cos(3 * latRad);
+  const double dx = (lonB - lonA) * mPerDegLon;
+  const double dy = (latB - latA) * mPerDegLat;
+  return (float)sqrt(dx * dx + dy * dy);
+}
+
 // ============== NAVIGATION QUALITY ==============
 
 enum NavQuality {
@@ -310,6 +327,20 @@ struct GpsRaw {
 static GpsRaw g_gps;
 static uint32_t g_gpsRawBytes = 0;
 
+static bool gpsPositionPlausible(double lat, double lon, float hAcc, uint8_t numSV) {
+  if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return false;
+  if (numSV > 80) return false;
+  if (hAcc <= 0.0f || hAcc > 20000.0f) return false;
+  if (!g_gps.valid || g_gps.lastMs == 0) return true;
+
+  const uint32_t ageMs = millis() - g_gps.lastMs;
+  if (ageMs > 10000) return true;
+  const float jumpM = approxGpsDistanceM(g_gps.lat, g_gps.lon, lat, lon);
+  const float allowedJumpM = 3.0f + 0.003f * (float)ageMs +
+      max(g_gps.speed, 0.1f) * ((float)ageMs * 0.001f) * 4.0f;
+  return jumpM <= max(allowedJumpM, 8.0f);
+}
+
 // GPS Position Filter
 struct GpsPositionFilter {
   LocalCoords samples[GPS_MEDIAN_WINDOW];
@@ -329,6 +360,8 @@ static uint32_t g_f9pRtcmMsgs = 0;
 static uint32_t g_f9pRtcmCrcFail = 0;
 static uint32_t g_lastF9pRtcmMs = 0;
 static uint32_t g_rtcmLastType = 0;
+static uint32_t g_ubxAck = 0;
+static uint32_t g_ubxNak = 0;
 
 // GPS parser state
 enum GpsParserState { GPS_SYNC1, GPS_SYNC2, GPS_CLASS, GPS_ID, GPS_LEN1, GPS_LEN2, GPS_PAYLOAD, GPS_CKA, GPS_CKB };
@@ -340,13 +373,26 @@ static uint8_t gpsCkA = 0, gpsCkB = 0;
 static char nmeaLine[128];
 static uint8_t nmeaLen = 0;
 
+static void feedGpsByte(uint8_t b);
+
 // UBX config keys
 static constexpr uint32_t CFG_RATE_MEAS = 0x30210001;
 static constexpr uint32_t CFG_MSGOUT_UBX_NAV_PVT_UART1 = 0x20910007;
 static constexpr uint32_t CFG_MSGOUT_UBX_NAV_RELPOSNED_UART1 = 0x2099008E;
 static constexpr uint32_t CFG_MSGOUT_UBX_RXM_RTCM_UART1 = 0x20910269;
+static constexpr uint32_t CFG_MSGOUT_UBX_RXM_RTCM_UART2 = 0x2091026A;
 static constexpr uint32_t CFG_MSGOUT_UBX_NAV_VELNED_UART1 = 0x20910027;
 static constexpr uint32_t CFG_MSGOUT_NMEA_GGA_UART1 = 0x209100BA;
+static constexpr uint32_t CFG_UART1INPROT_UBX = 0x10730001;
+static constexpr uint32_t CFG_UART1INPROT_NMEA = 0x10730002;
+static constexpr uint32_t CFG_UART1INPROT_RTCM3X = 0x10730004;
+static constexpr uint32_t CFG_UART1OUTPROT_UBX = 0x10740001;
+static constexpr uint32_t CFG_UART1OUTPROT_NMEA = 0x10740002;
+static constexpr uint32_t CFG_UART2INPROT_UBX = 0x10750001;
+static constexpr uint32_t CFG_UART2INPROT_NMEA = 0x10750002;
+static constexpr uint32_t CFG_UART2INPROT_RTCM3X = 0x10750004;
+static constexpr uint32_t CFG_UART2OUTPROT_UBX = 0x10760001;
+static constexpr uint32_t CFG_UART2OUTPROT_NMEA = 0x10760002;
 
 static uint32_t getU32(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -379,6 +425,16 @@ static void writeUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t l
   GpsSerial.write(ckB);
 }
 
+static void serviceGpsInputFor(uint32_t durationMs) {
+  const uint32_t until = millis() + durationMs;
+  do {
+    while (GpsSerial.available()) {
+      feedGpsByte(GpsSerial.read());
+    }
+    delay(1);
+  } while ((int32_t)(millis() - until) < 0);
+}
+
 static void sendValset(uint32_t key, uint32_t value, uint8_t size) {
   uint8_t payload[16] = {0};
   payload[0] = 0; payload[1] = 0x01;
@@ -387,6 +443,7 @@ static void sendValset(uint32_t key, uint32_t value, uint8_t size) {
     payload[8 + i] = (uint8_t)(value >> (8 * i));
   }
   writeUbx(0x06, 0x8A, payload, 8 + size);
+  serviceGpsInputFor(30);
   Serial.printf("GPS CFG key=0x%08lX val=%lu\n", (unsigned long)key, (unsigned long)value);
 }
 
@@ -469,38 +526,81 @@ static void applyWeightedGpsUpdate(LocalCoords* pos, float hAcc) {
   }
 }
 
-static void sendCfgMsg(uint8_t msgClass, uint8_t msgId, uint8_t uart1Rate) {
+static void sendCfgMsg(uint8_t msgClass, uint8_t msgId, uint8_t uartRate) {
   uint8_t payload[8] = {0};
   payload[0] = msgClass;
   payload[1] = msgId;
-  payload[3] = uart1Rate;
+  payload[3] = uartRate;  // UART1
+  payload[4] = uartRate;  // UART2
   writeUbx(0x06, 0x01, payload, sizeof(payload));
+  serviceGpsInputFor(30);
+}
+
+static void resetGpsIoMessageConfig() {
+  uint8_t payload[12] = {0};
+  payload[0] = 0x03;  // clearMask: ioPort + msgConf
+  payload[1] = 0x00;
+  payload[2] = 0x00;
+  payload[3] = 0x00;
+  writeUbx(0x06, 0x09, payload, sizeof(payload));
+  serviceGpsInputFor(150);
+  while (GpsSerial.available()) feedGpsByte(GpsSerial.read());
+  Serial.println("GPS: cleared I/O and message config");
+}
+
+static void sendCfgPrt(uint8_t portId, uint16_t inProtoMask, uint16_t outProtoMask) {
+  uint8_t cfgPrt[28] = {0};
+  cfgPrt[0] = 0xB5; cfgPrt[1] = 0x62;
+  cfgPrt[2] = 0x06; cfgPrt[3] = 0x00;
+  cfgPrt[4] = 0x14; cfgPrt[5] = 0x00;
+  cfgPrt[6] = portId;
+  cfgPrt[8] = 0x00; cfgPrt[9] = 0x00;  // txReady
+  cfgPrt[10] = 0xC0; cfgPrt[11] = 0x08; cfgPrt[12] = 0x00; cfgPrt[13] = 0x00;  // mode: 8N1
+  cfgPrt[14] = (uint8_t)GPS_BAUD;
+  cfgPrt[15] = (uint8_t)(GPS_BAUD >> 8);
+  cfgPrt[16] = (uint8_t)(GPS_BAUD >> 16);
+  cfgPrt[17] = (uint8_t)(GPS_BAUD >> 24);
+  cfgPrt[18] = (uint8_t)inProtoMask;
+  cfgPrt[19] = (uint8_t)(inProtoMask >> 8);
+  cfgPrt[20] = (uint8_t)outProtoMask;
+  cfgPrt[21] = (uint8_t)(outProtoMask >> 8);
+  cfgPrt[22] = 0x00; cfgPrt[23] = 0x00;  // flags
+  cfgPrt[24] = 0x00; cfgPrt[25] = 0x00;  // reserved
+  uint8_t ckA = 0, ckB = 0;
+  for (int i = 2; i <= 25; i++) { ckA += cfgPrt[i]; ckB += ckA; }
+  cfgPrt[26] = ckA; cfgPrt[27] = ckB;
+  GpsSerial.write(cfgPrt, sizeof(cfgPrt));
+  serviceGpsInputFor(50);
+  Serial.printf("GPS CFG-PRT port=%u in=0x%04X out=0x%04X\n",
+    portId, inProtoMask, outProtoMask);
 }
 
 static void configureGpsRover() {
   Serial.println("GPS: configuring rover...");
 
-  uint8_t cfgPrt[28] = {0};
-  cfgPrt[0] = 0xB5; cfgPrt[1] = 0x62;
-  cfgPrt[2] = 0x06; cfgPrt[3] = 0x00;
-  cfgPrt[4] = 0x14; cfgPrt[5] = 0x00;
-  cfgPrt[6] = 0x01;
-  cfgPrt[12] = 0xC0; cfgPrt[13] = 0x08;
-  cfgPrt[16] = (uint8_t)GPS_BAUD;
-  cfgPrt[17] = (uint8_t)(GPS_BAUD >> 8);
-  cfgPrt[18] = (uint8_t)(GPS_BAUD >> 16);
-  cfgPrt[19] = (uint8_t)(GPS_BAUD >> 24);
-  cfgPrt[20] = 0x03; cfgPrt[21] = 0x00;  // UBX + RTCM in
-  cfgPrt[22] = 0x01; cfgPrt[23] = 0x00;  // UBX out
-  uint8_t ckA = 0, ckB = 0;
-  for (int i = 2; i <= 25; i++) { ckA += cfgPrt[i]; ckB += ckA; }
-  cfgPrt[26] = ckA; cfgPrt[27] = ckB;
-  GpsSerial.write(cfgPrt, sizeof(cfgPrt));
+  resetGpsIoMessageConfig();
+  delay(100);
+
+  sendCfgPrt(0x01, 0x0021, 0x0001);  // UART1: UBX + RTCM3 in, UBX out
+  delay(100);
+  sendCfgPrt(0x02, 0x0021, 0x0001);  // UART2: same, covers boards wired to UART2
   delay(200);
+
+  sendValset(CFG_UART1INPROT_UBX, 1, 1);
+  sendValset(CFG_UART1INPROT_NMEA, 0, 1);
+  sendValset(CFG_UART1INPROT_RTCM3X, 1, 1);
+  sendValset(CFG_UART1OUTPROT_UBX, 1, 1);
+  sendValset(CFG_UART1OUTPROT_NMEA, 0, 1);
+  sendValset(CFG_UART2INPROT_UBX, 1, 1);
+  sendValset(CFG_UART2INPROT_NMEA, 0, 1);
+  sendValset(CFG_UART2INPROT_RTCM3X, 1, 1);
+  sendValset(CFG_UART2OUTPROT_UBX, 1, 1);
+  sendValset(CFG_UART2OUTPROT_NMEA, 0, 1);
 
   sendValset(CFG_RATE_MEAS, 100, 2);  // 10 Hz
   sendValset(CFG_MSGOUT_UBX_NAV_PVT_UART1, 1, 1);
   sendValset(CFG_MSGOUT_UBX_RXM_RTCM_UART1, 1, 1);
+  sendValset(CFG_MSGOUT_UBX_RXM_RTCM_UART2, 1, 1);
   sendValset(CFG_MSGOUT_UBX_NAV_RELPOSNED_UART1, 1, 1);
   sendValset(CFG_MSGOUT_UBX_NAV_VELNED_UART1, 1, 1);  // VELNED for GPS heading
   sendValset(CFG_MSGOUT_NMEA_GGA_UART1, 1, 1);
@@ -530,18 +630,29 @@ static void maintainGpsOutput() {
 static void parseNavPvt(const uint8_t* p, uint16_t len) {
   if (len < 92) return;
 
-  g_gps.lat = (int32_t)getU32(p + 28) * 1e-7;
-  g_gps.lon = (int32_t)getU32(p + 24) * 1e-7;
-  g_gps.hAcc = (float)getU32(p + 40);
-  g_gps.vAcc = (float)getU32(p + 44);
+  const double lat = (int32_t)getU32(p + 28) * 1e-7;
+  const double lon = (int32_t)getU32(p + 24) * 1e-7;
+  const float hAcc = (float)getU32(p + 40);
+  const float vAcc = (float)getU32(p + 44);
+  const uint8_t fixType = p[20];
+  const uint8_t carrier = (p[21] >> 6) & 0x03;
+  const uint8_t numSV = p[23];
+  if (!gpsPositionPlausible(lat, lon, hAcc, numSV)) return;
+  if (fixType > 5 || carrier > 2 || numSV > 80) return;
+  if (vAcc <= 0.0f || vAcc > 1000000.0f) return;
+
+  g_gps.lat = lat;
+  g_gps.lon = lon;
+  g_gps.hAcc = hAcc;
+  g_gps.vAcc = vAcc;
   g_gps.speed = (int32_t)getU32(p + 60) * 0.001f;
   g_gps.heading = (int32_t)getU32(p + 64) * 1e-5f;
   if (g_gps.heading < 0) g_gps.heading += 360.0f;
-  g_gps.fixType = p[20];
+  g_gps.fixType = fixType;
   g_gps.diff = (p[21] & 0x02) != 0;
-  g_gps.carrier = (p[21] >> 6) & 0x03;
+  g_gps.carrier = carrier;
   g_gps.valid = (p[21] & 0x01) != 0;
-  g_gps.numSV = p[23];
+  g_gps.numSV = numSV;
   g_gps.lastMs = millis();
   g_gpsUbxParsed++;
 }
@@ -568,6 +679,16 @@ static void parseRxmRtcm(const uint8_t* p, uint16_t len) {
   }
 }
 
+static void parseUbxAck(uint8_t id, const uint8_t* p, uint16_t len) {
+  if (len < 2) return;
+  if (id == 0x01) {
+    g_ubxAck++;
+  } else if (id == 0x00) {
+    g_ubxNak++;
+    Serial.printf("GPS NAK cls=0x%02X id=0x%02X\n", p[0], p[1]);
+  }
+}
+
 static void feedGpsByte(uint8_t b) {
   g_gpsRawBytes++;
 
@@ -590,24 +711,34 @@ static void feedGpsByte(uint8_t b) {
           fields[count++] = tok;
           tok = strtok(NULL, ",");
         }
-        if (count >= 10 && strncmp(fields[0] + 3, "GGA", 3) == 0) {
+        if (count >= 10 && fields[0][0] == '$' && strlen(fields[0]) >= 6 &&
+            strncmp(fields[0] + 3, "GGA", 3) == 0 &&
+            fields[2][0] && fields[3][0] && fields[4][0] && fields[5][0]) {
           int deg = atoi(fields[2]) / 100;
           double min = atof(fields[2]) - deg * 100;
-          g_gps.lat = deg + min / 60.0;
-          if (fields[3][0] == 'S') g_gps.lat = -g_gps.lat;
+          double lat = deg + min / 60.0;
+          if (fields[3][0] == 'S') lat = -lat;
           deg = atoi(fields[4]) / 100;
           min = atof(fields[4]) - deg * 100;
-          g_gps.lon = deg + min / 60.0;
-          if (fields[5][0] == 'W') g_gps.lon = -g_gps.lon;
+          double lon = deg + min / 60.0;
+          if (fields[5][0] == 'W') lon = -lon;
           int quality = atoi(fields[6]);
+          int numSV = atoi(fields[7]);
           g_gps.fixType = quality > 0 ? 3 : 0;
           g_gps.carrier = (quality == 4) ? 2 : (quality == 5 ? 1 : 0);
           g_gps.diff = quality >= 2;
           g_gps.valid = quality > 0;
-          g_gps.numSV = atoi(fields[7]);
           float hdop = atof(fields[8]);
+          const float hAcc = (hdop > 0.0f && hdop < 99.0f) ? hdop * 1000.0f : g_gps.hAcc;
+          if (numSV < 0 || !gpsPositionPlausible(lat, lon, hAcc, (uint8_t)numSV)) {
+            nmeaLen = 0;
+            return;
+          }
+          g_gps.lat = lat;
+          g_gps.lon = lon;
+          g_gps.numSV = numSV;
           if (hdop > 0.0f && hdop < 99.0f) {
-            g_gps.hAcc = hdop * 1000.0f;
+            g_gps.hAcc = hAcc;
           }
           g_gps.lastMs = millis();
           g_gpsNmeaParsed++;
@@ -643,6 +774,8 @@ static void feedGpsByte(uint8_t b) {
         parseNavVelned(gpsPayload, gpsLen);
       } else if (b == gpsCkB && gpsClass == 0x02 && gpsId == 0x32) {
         parseRxmRtcm(gpsPayload, gpsLen);
+      } else if (b == gpsCkB && gpsClass == 0x05) {
+        parseUbxAck(gpsId, gpsPayload, gpsLen);
       }
       break;
   }
@@ -651,23 +784,137 @@ static void feedGpsByte(uint8_t b) {
 // ============== RTCM ==============
 
 static constexpr size_t RTCM_PACKET_BUF_SIZE = 1200;
+static constexpr uint16_t RTCM_FRAME_BUF_SIZE = 1200;
 static WiFiUDP rtcmUdp;
 static uint32_t g_rtcmBytes = 0;
 static uint32_t g_rtcmMsgs = 0;
 static uint32_t g_rtcmErrors = 0;
 static uint32_t g_rtcmWriteErrors = 0;
 static uint32_t g_rtcmOversize = 0;
+static uint32_t g_rtcmFramesToF9p = 0;
+static uint32_t g_rtcmCrcFail = 0;
+static uint32_t g_rtcmFrameOverflow = 0;
 static uint32_t g_lastRtcmMs = 0;
 static bool g_rtcmFresh = false;
+static uint8_t g_rtcmFrameBuf[RTCM_FRAME_BUF_SIZE];
+static uint16_t g_rtcmFrameLen = 0;
+static uint16_t g_rtcmExpectedLen = 0;
 
 static uint16_t rtcmMessageType(const uint8_t* frame, uint16_t len) {
   if (len < 5) return 0;
   return ((uint16_t)frame[3] << 4) | (frame[4] >> 4);
 }
 
+static uint16_t rtcmPayloadLength(const uint8_t* frame) {
+  return ((uint16_t)(frame[1] & 0x03) << 8) | frame[2];
+}
+
+static uint32_t rtcmCrc24q(const uint8_t* data, uint16_t len) {
+  uint32_t crc = 0;
+  for (uint16_t i = 0; i < len; i++) {
+    crc ^= (uint32_t)data[i] << 16;
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc <<= 1;
+      if (crc & 0x1000000) crc ^= 0x1864CFB;
+    }
+  }
+  return crc & 0xFFFFFF;
+}
+
+static bool rtcmCrcOk(const uint8_t* frame, uint16_t len) {
+  if (len < 6) return false;
+  const uint32_t expected = ((uint32_t)frame[len - 3] << 16) |
+                            ((uint32_t)frame[len - 2] << 8) |
+                            frame[len - 1];
+  return rtcmCrc24q(frame, len - 3) == expected;
+}
+
+static void resetRtcmFrameAssembler() {
+  g_rtcmFrameLen = 0;
+  g_rtcmExpectedLen = 0;
+}
+
+static bool resyncRtcmFrameAssembler() {
+  for (uint16_t i = 1; i + 2 < g_rtcmFrameLen; i++) {
+    if (g_rtcmFrameBuf[i] != 0xD3) continue;
+    if ((g_rtcmFrameBuf[i + 1] & 0xFC) != 0) continue;
+    const uint16_t payloadLen = ((uint16_t)(g_rtcmFrameBuf[i + 1] & 0x03) << 8) | g_rtcmFrameBuf[i + 2];
+    const uint16_t expectedLen = payloadLen + 6;
+    if (payloadLen == 0 || expectedLen > RTCM_FRAME_BUF_SIZE) continue;
+
+    const uint16_t remaining = g_rtcmFrameLen - i;
+    memmove(g_rtcmFrameBuf, g_rtcmFrameBuf + i, remaining);
+    g_rtcmFrameLen = remaining;
+    g_rtcmExpectedLen = expectedLen;
+    return true;
+  }
+
+  resetRtcmFrameAssembler();
+  return false;
+}
+
+static void writeRtcmFrameToF9p(const uint8_t* frame, uint16_t len) {
+  const size_t written = GpsSerial.write(frame, len);
+  if (written != (size_t)len) {
+    g_rtcmWriteErrors++;
+    return;
+  }
+  g_rtcmFramesToF9p++;
+  g_rtcmLastType = rtcmMessageType(frame, len);
+}
+
+static void feedRtcmByte(uint8_t b) {
+  if (g_rtcmFrameLen == 0) {
+    if (b != 0xD3) return;
+    g_rtcmFrameBuf[g_rtcmFrameLen++] = b;
+    g_rtcmExpectedLen = 0;
+    return;
+  }
+
+  if (g_rtcmFrameLen == 1 && (b & 0xFC) != 0) {
+    resetRtcmFrameAssembler();
+    return;
+  }
+
+  if (g_rtcmFrameLen >= RTCM_FRAME_BUF_SIZE) {
+    g_rtcmFrameOverflow++;
+    resetRtcmFrameAssembler();
+    return;
+  }
+
+  g_rtcmFrameBuf[g_rtcmFrameLen++] = b;
+
+  if (g_rtcmFrameLen == 3) {
+    const uint16_t payloadLen = rtcmPayloadLength(g_rtcmFrameBuf);
+    g_rtcmExpectedLen = payloadLen + 6;
+    if (payloadLen == 0 || g_rtcmExpectedLen > RTCM_FRAME_BUF_SIZE) {
+      g_rtcmFrameOverflow++;
+      resetRtcmFrameAssembler();
+    }
+    return;
+  }
+
+  if (g_rtcmExpectedLen > 0 && g_rtcmFrameLen >= g_rtcmExpectedLen) {
+    if (rtcmCrcOk(g_rtcmFrameBuf, g_rtcmExpectedLen)) {
+      writeRtcmFrameToF9p(g_rtcmFrameBuf, g_rtcmExpectedLen);
+      resetRtcmFrameAssembler();
+    } else {
+      g_rtcmCrcFail++;
+      if (!resyncRtcmFrameAssembler()) return;
+      if (g_rtcmExpectedLen > 0 && g_rtcmFrameLen >= g_rtcmExpectedLen &&
+          rtcmCrcOk(g_rtcmFrameBuf, g_rtcmExpectedLen)) {
+        writeRtcmFrameToF9p(g_rtcmFrameBuf, g_rtcmExpectedLen);
+        resetRtcmFrameAssembler();
+      }
+    }
+  }
+}
+
 static void relayRtcm() {
-  int pktSize = rtcmUdp.parsePacket();
-  if (pktSize > 0) {
+  for (uint8_t packets = 0; packets < 64; packets++) {
+    int pktSize = rtcmUdp.parsePacket();
+    if (pktSize <= 0) break;
+
     uint8_t buf[RTCM_PACKET_BUF_SIZE];
     if ((size_t)pktSize > sizeof(buf)) {
       rtcmUdp.read(buf, sizeof(buf));
@@ -682,9 +929,7 @@ static void relayRtcm() {
         g_rtcmErrors++;
         return;
       }
-      if (buf[0] == 0xD3 && len >= 5) g_rtcmLastType = rtcmMessageType(buf, len);
-      size_t written = GpsSerial.write(buf, len);
-      if (written != (size_t)len) g_rtcmWriteErrors++;
+      for (int i = 0; i < len; i++) feedRtcmByte(buf[i]);
       g_rtcmBytes += len;
       g_rtcmMsgs++;
       g_lastRtcmMs = millis();
@@ -713,6 +958,16 @@ static float g_imuCalibrationOffset = 0;
 // clockwise/right turns increase heading, so invert yaw by default.
 static bool g_invertYaw = true;
 static uint32_t g_imuFirstReadMs = 0;
+static uint32_t g_lastImuReenableMs = 0;
+
+static bool enableImuReport() {
+  if (!bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US)) {
+    Serial.println("IMU: ERROR - can't enable game rotation vector!");
+    return false;
+  }
+  Serial.println("IMU: game rotation vector enabled");
+  return true;
+}
 
 static bool initImu() {
   Serial.println("IMU: initializing BNO085...");
@@ -728,12 +983,11 @@ static bool initImu() {
   }
   Serial.println("IMU: found!");
 
-  if (!bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, 20000)) {
-    Serial.println("IMU: ERROR - can't enable game rotation vector!");
+  if (!enableImuReport()) {
     return false;
   }
-  Serial.println("IMU: game rotation vector enabled");
   g_imuOk = true;
+  g_lastImuReenableMs = millis();
   return true;
 }
 
@@ -782,6 +1036,12 @@ static void updateImu() {
   }
   if (g_lastImuMs > 0 && millis() - g_lastImuMs > IMU_TIMEOUT_MS) {
     g_imuFresh = false;
+    const uint32_t now = millis();
+    if (now - g_lastImuReenableMs >= IMU_REENABLE_MS) {
+      g_lastImuReenableMs = now;
+      Serial.println("IMU: stale, re-enabling game rotation vector");
+      enableImuReport();
+    }
   }
 }
 
@@ -1007,14 +1267,16 @@ static void updateEstimator() {
   uint32_t now = millis();
   uint32_t gpsAge = g_gps.lastMs ? now - g_gps.lastMs : 99999;
   uint32_t f9pRtcmAge = g_lastF9pRtcmMs ? now - g_lastF9pRtcmMs : 99999;
-  bool f9pRtcmFresh = f9pRtcmAge <= RTK_CORRECTION_TIMEOUT_MS;
+  uint32_t rtcmTransportAge = g_lastRtcmMs ? now - g_lastRtcmMs : 99999;
+  bool correctionsFresh = (f9pRtcmAge <= RTK_CORRECTION_TIMEOUT_MS) ||
+                          (rtcmTransportAge <= RTK_CORRECTION_TIMEOUT_MS && g_gps.diff);
 
   // Determine quality
   NavQuality qual = QUAL_NAV_ERROR;
   if (g_gps.valid && g_gps.fixType >= 3) {
-    if (g_gps.carrier == 2 && g_gps.hAcc <= RTK_FIXED_HACC_MM && gpsAge <= RTK_FIXED_AGE_MS && f9pRtcmFresh) {
+    if (g_gps.carrier == 2 && g_gps.hAcc <= RTK_FIXED_HACC_MM && gpsAge <= RTK_FIXED_AGE_MS && correctionsFresh) {
       qual = QUAL_RTK_FIXED_GOOD;
-    } else if (g_gps.carrier >= 1 && g_gps.hAcc <= RTK_FLOAT_HACC_MM && gpsAge <= RTK_FLOAT_AGE_MS && f9pRtcmFresh) {
+    } else if (g_gps.carrier >= 1 && g_gps.hAcc <= RTK_FLOAT_HACC_MM && gpsAge <= RTK_FLOAT_AGE_MS && correctionsFresh) {
       qual = QUAL_RTK_FLOAT_OK;
     } else if (g_gps.hAcc <= DEGRADED_HACC_MM && gpsAge <= GPS_HOLD_AGE_MS) {
       qual = QUAL_GPS_DEGRADED;
@@ -1049,13 +1311,20 @@ static void updateEstimator() {
       applyWeightedGpsUpdate(&local, g_gps.hAcc);
     }
 
-    float dt = (g_est.lastUpdateMs > 0) ? (now - g_est.lastUpdateMs) / 1000.0f : 0.05f;
-    if (dt > 0.5f) dt = 0.05f;
-    if (dt < 0.001f) dt = 0.05f;
-
-    g_est.vel.x = (local.x - g_est.pos.x) / dt;
-    g_est.vel.y = (local.y - g_est.pos.y) / dt;
-    g_est.speed = sqrt(g_est.vel.x * g_est.vel.x + g_est.vel.y * g_est.vel.y);
+    const float f9pVelMag = hypotf(g_gps.velE, g_gps.velN);
+    const float f9pSpeed = max(g_gps.speed, f9pVelMag);
+    if (f9pVelMag > 0.02f) {
+      g_est.vel.x = g_gps.velE;
+      g_est.vel.y = g_gps.velN;
+    } else if (f9pSpeed > 0.02f) {
+      const float headingRad = degToRad(g_gps.heading);
+      g_est.vel.x = f9pSpeed * sinf(headingRad);
+      g_est.vel.y = f9pSpeed * cosf(headingRad);
+    } else {
+      g_est.vel.x = 0.0f;
+      g_est.vel.y = 0.0f;
+    }
+    g_est.speed = f9pSpeed;
     g_est.pos = local;
     g_est.lastUpdateMs = now;
     const bool rtkUsable = (qual == QUAL_RTK_FIXED_GOOD || qual == QUAL_RTK_FLOAT_OK);
@@ -1625,6 +1894,41 @@ static uint8_t scanVerticalIntersections(float x, float* ys, uint8_t maxYs) {
   return count;
 }
 
+static bool appendAreaSnakeLines(bool horizontal, float minX, float maxX, float minY, float maxY, float step) {
+  const float width = maxX - minX;
+  const float height = maxY - minY;
+  const float span = horizontal ? height : width;
+  const float first = (span >= step) ? ((horizontal ? minY : minX) + step * 0.5f)
+                                    : ((horizontal ? minY + height * 0.5f : minX + width * 0.5f));
+  const float last = (span >= step) ? ((horizontal ? maxY : maxX) - step * 0.5f)
+                                   : first;
+  bool reverse = false;
+  bool added = false;
+  float intersections[MAX_AREA_POINTS];
+
+  for (float line = first; line <= last + 0.001f; line += step) {
+    const uint8_t n = horizontal
+      ? scanHorizontalIntersections(line, intersections, MAX_AREA_POINTS)
+      : scanVerticalIntersections(line, intersections, MAX_AREA_POINTS);
+
+    for (uint8_t i = 0; i + 1 < n; i += 2) {
+      LocalCoords a = horizontal ? LocalCoords{intersections[i], line}
+                                 : LocalCoords{line, intersections[i]};
+      LocalCoords b = horizontal ? LocalCoords{intersections[i + 1], line}
+                                 : LocalCoords{line, intersections[i + 1]};
+      const bool ok = reverse ? (addRoutePoint(b) && addRoutePoint(a))
+                              : (addRoutePoint(a) && addRoutePoint(b));
+      if (!ok) return false;
+      reverse = !reverse;
+      added = true;
+    }
+
+    if (span < step) break;
+  }
+
+  return added;
+}
+
 static bool buildRouteFromArea() {
   if (!areaReady() || !g_origin.valid) return false;
 
@@ -1645,36 +1949,15 @@ static bool buildRouteFromArea() {
   memset(g_routeReceived, 0, sizeof(g_routeReceived));
   addRoutePoint(g_est.pos);
 
-  bool reverse = false;
-  bool ok = true;
-  float intersections[MAX_AREA_POINTS];
+  const bool primaryHorizontal = width >= height;
+  bool ok = appendAreaSnakeLines(primaryHorizontal, minX, maxX, minY, maxY, step);
 
-  if (width >= height) {
-    for (float y = minY + step * 0.5f; y <= maxY - step * 0.5f; y += step) {
-      const uint8_t n = scanHorizontalIntersections(y, intersections, MAX_AREA_POINTS);
-      for (uint8_t i = 0; i + 1 < n; i += 2) {
-        LocalCoords a = {intersections[i], y};
-        LocalCoords b = {intersections[i + 1], y};
-        if (reverse) { ok = addRoutePoint(b) && addRoutePoint(a); }
-        else { ok = addRoutePoint(a) && addRoutePoint(b); }
-        if (!ok) break;
-        reverse = !reverse;
-      }
-      if (!ok) break;
-    }
-  } else {
-    for (float x = minX + step * 0.5f; x <= maxX - step * 0.5f; x += step) {
-      const uint8_t n = scanVerticalIntersections(x, intersections, MAX_AREA_POINTS);
-      for (uint8_t i = 0; i + 1 < n; i += 2) {
-        LocalCoords a = {x, intersections[i]};
-        LocalCoords b = {x, intersections[i + 1]};
-        if (reverse) { ok = addRoutePoint(b) && addRoutePoint(a); }
-        else { ok = addRoutePoint(a) && addRoutePoint(b); }
-        if (!ok) break;
-        reverse = !reverse;
-      }
-      if (!ok) break;
-    }
+  if (!ok || g_routeCount < 2) {
+    g_routeCount = 0;
+    g_routeIndex = 0;
+    memset(g_routeReceived, 0, sizeof(g_routeReceived));
+    addRoutePoint(g_est.pos);
+    ok = appendAreaSnakeLines(!primaryHorizontal, minX, maxX, minY, maxY, step);
   }
 
   if (!ok || g_routeCount < 2) {
@@ -1747,6 +2030,23 @@ static AsyncWebSocket ws("/ws");
 static bool g_wifiConnected = false;
 static bool g_serverStarted = false;
 static uint32_t g_lastWifiReconnectMs = 0;
+static uint32_t g_wifiReconnectIntervalMs = WIFI_RECONNECT_INITIAL_MS;
+
+static const char* resetReasonString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "other_wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+  }
+}
 
 static void setAttachmentRelay(bool on) {
   digitalWrite(PIN_RELAY_ATTACHMENT, on ? HIGH : LOW);
@@ -2202,7 +2502,7 @@ static void broadcastTelemetry() {
 
   // RTCM status
   snprintf(msg, sizeof(msg),
-    "RTCM,%lu,%lu,%lu,%lu,%s,%lu,%lu,%lu",
+    "RTCM,%lu,%lu,%lu,%lu,%s,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
     (unsigned long)g_rtcmBytes,
     (unsigned long)rtcmTransportAge,
     (unsigned long)rtcmTransportAge,
@@ -2210,7 +2510,11 @@ static void broadcastTelemetry() {
     g_rtcmFresh ? "udp" : "none",
     (unsigned long)g_f9pRtcmMsgs,
     (unsigned long)g_f9pRtcmCrcFail,
-    (unsigned long)g_rtcmLastType
+    (unsigned long)g_rtcmLastType,
+    (unsigned long)g_rtcmFramesToF9p,
+    (unsigned long)g_rtcmCrcFail,
+    (unsigned long)g_rtcmWriteErrors,
+    (unsigned long)g_rtcmFrameOverflow
   );
   ws.textAll(msg);
 
@@ -3140,8 +3444,15 @@ static void printStatus() {
   Serial.println("-- RTCM --");
   Serial.printf("  Fresh: %u, Bytes: %lu, Msgs: %lu\n",
     g_rtcmFresh ? 1 : 0, (unsigned long)g_rtcmBytes, (unsigned long)g_rtcmMsgs);
+  Serial.printf("  Frames to F9P: %lu, asmCrcFail: %lu, writeErr: %lu, overflow: %lu\n",
+    (unsigned long)g_rtcmFramesToF9p,
+    (unsigned long)g_rtcmCrcFail,
+    (unsigned long)g_rtcmWriteErrors,
+    (unsigned long)g_rtcmFrameOverflow);
   Serial.printf("  F9P decoded: %lu, crcFail: %lu\n",
     (unsigned long)g_f9pRtcmMsgs, (unsigned long)g_f9pRtcmCrcFail);
+  Serial.printf("  UBX ACK: %lu, NAK: %lu\n",
+    (unsigned long)g_ubxAck, (unsigned long)g_ubxNak);
 
   Serial.println("-- Motor Feedback --");
   Serial.printf("  Fresh: %u, Speed: L=%d R=%d\n", g_haveMotorFeedback ? 1 : 0, g_motorSpeedL, g_motorSpeedR);
@@ -3161,6 +3472,86 @@ static void printStatus() {
 
 // ============== MAIN ==============
 
+struct GpsUartCandidate {
+  int rx;
+  int tx;
+  const char* label;
+};
+
+static void writeUbxPoll(uint8_t cls, uint8_t id) {
+  uint8_t ckA = 0, ckB = 0;
+  auto addCk = [&](uint8_t b) { ckA += b; ckB += ckA; };
+  GpsSerial.write(0xB5);
+  GpsSerial.write(0x62);
+  GpsSerial.write(cls); addCk(cls);
+  GpsSerial.write(id); addCk(id);
+  GpsSerial.write((uint8_t)0); addCk(0);
+  GpsSerial.write((uint8_t)0); addCk(0);
+  GpsSerial.write(ckA);
+  GpsSerial.write(ckB);
+  GpsSerial.flush();
+}
+
+static uint32_t scoreGpsUart(uint32_t passiveMs, bool activeProbe) {
+  uint32_t bytes = 0;
+  uint32_t score = 0;
+  int prev = -1;
+  uint32_t start = millis();
+  bool probeSent = false;
+
+  while (millis() - start < passiveMs) {
+    if (activeProbe && !probeSent && millis() - start > passiveMs / 3) {
+      writeUbxPoll(0x01, 0x07);  // UBX-NAV-PVT poll
+      probeSent = true;
+    }
+    while (GpsSerial.available()) {
+      uint8_t b = GpsSerial.read();
+      bytes++;
+      if (b == '$') score += 8;
+      if (b == 0xD3) score += 3;
+      if (prev == 0xB5 && b == 0x62) score += 40;
+      if (b >= 32 && b <= 126) score++;
+      prev = b;
+    }
+    delay(1);
+  }
+  return score + min(bytes, (uint32_t)200);
+}
+
+static void selectGpsUart() {
+  const GpsUartCandidate candidates[] = {
+    {GPS_RX, GPS_TX, "normal"},
+    {GPS_ALT_RX, GPS_ALT_TX, "swapped"},
+  };
+  uint32_t bestScore = 0;
+  uint8_t bestIndex = 0;
+
+  Serial.println("GPS UART autodetect: checking normal and swapped TX/RX");
+  for (uint8_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    GpsSerial.end();
+    delay(50);
+    GpsSerial.begin(GPS_BAUD, SERIAL_8N1, candidates[i].rx, candidates[i].tx);
+    delay(200);
+    while (GpsSerial.available()) GpsSerial.read();
+    uint32_t score = scoreGpsUart(1200, true);
+    Serial.printf("GPS UART candidate %s RX=%d TX=%d score=%lu\n",
+      candidates[i].label, candidates[i].rx, candidates[i].tx, (unsigned long)score);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = i;
+    }
+  }
+
+  g_activeGpsRx = candidates[bestIndex].rx;
+  g_activeGpsTx = candidates[bestIndex].tx;
+  GpsSerial.end();
+  delay(50);
+  GpsSerial.begin(GPS_BAUD, SERIAL_8N1, g_activeGpsRx, g_activeGpsTx);
+  delay(200);
+  Serial.printf("GPS UART selected: %s RX=%d TX=%d score=%lu\n",
+    candidates[bestIndex].label, g_activeGpsRx, g_activeGpsTx, (unsigned long)bestScore);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -3169,10 +3560,13 @@ void setup() {
   Serial.println("   RTK ROVER AUTOPILOT v2.0");
   Serial.println("   Advanced Navigation System");
   Serial.println("========================================");
-  Serial.printf("GPS UART: RX=%d TX=%d %lu baud\n", GPS_RX, GPS_TX, (unsigned long)GPS_BAUD);
+  Serial.printf("GPS UART default: RX=%d TX=%d alt RX=%d TX=%d %lu baud\n",
+    GPS_RX, GPS_TX, GPS_ALT_RX, GPS_ALT_TX, (unsigned long)GPS_BAUD);
   Serial.printf("Motor UART: RX=%d TX=%d %lu baud\n", MOTOR_RX, MOTOR_TX, (unsigned long)MOTOR_BAUD);
   Serial.printf("IMU I2C: SDA=%d SCL=%d\n", IMU_SDA, IMU_SCL);
   Serial.printf("WebSocket port: %u\n", WS_PORT);
+  Serial.printf("Reset reason: %s (%d)\n",
+    resetReasonString(esp_reset_reason()), (int)esp_reset_reason());
 
   g_prefs.begin("rover-nav", false);
   loadNavPrefs();
@@ -3186,8 +3580,7 @@ void setup() {
   setMountRelay(false);
 
   // GPS
-  GpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
-  delay(200);
+  selectGpsUart();
   Serial.println("GPS UART initialized");
   configureGpsRover();
 
@@ -3204,6 +3597,7 @@ void setup() {
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.config(ROVER_IP, GATEWAY, SUBNET);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.println("WiFi: connecting...");
@@ -3222,6 +3616,7 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!g_wifiConnected) {
       g_wifiConnected = true;
+      g_wifiReconnectIntervalMs = WIFI_RECONNECT_INITIAL_MS;
       Serial.println();
       Serial.println("!!! WiFi CONNECTED !!!");
       Serial.printf("   IP: %s\n", WiFi.localIP().toString().c_str());
@@ -3243,12 +3638,15 @@ void loop() {
       g_wifiConnected = false;
       Serial.println("!!! WiFi DISCONNECTED !!!");
     }
-    if (now - g_lastWifiReconnectMs >= WIFI_RECONNECT_MS) {
+    if (now - g_lastWifiReconnectMs >= g_wifiReconnectIntervalMs) {
       g_lastWifiReconnectMs = now;
-      Serial.println("WiFi: reconnecting...");
-      WiFi.disconnect(false);
-      WiFi.config(ROVER_IP, GATEWAY, SUBNET);
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      Serial.printf("WiFi: reconnecting, next retry in %lu ms...\n",
+        (unsigned long)min(g_wifiReconnectIntervalMs * 2, WIFI_RECONNECT_MAX_MS));
+      if (!WiFi.reconnect()) {
+        WiFi.config(ROVER_IP, GATEWAY, SUBNET);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+      }
+      g_wifiReconnectIntervalMs = min(g_wifiReconnectIntervalMs * 2, WIFI_RECONNECT_MAX_MS);
     }
   }
 

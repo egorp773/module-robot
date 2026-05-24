@@ -12,6 +12,19 @@ import '../../core/gps_display_math.dart';
 import '../manual/manual_control_screen.dart';
 import '../home/home_screen.dart' show batteryPercentProvider;
 
+String? _navStartBlockReason(WifiConnectionState wifi) {
+  final carrier = wifi.gpsCarrier?.toLowerCase();
+  final rtkReady = carrier == 'fixed' || carrier == 'float';
+  final imuReady = wifi.imuFresh == true;
+  final motorReady = wifi.motorFeedback == true;
+  if (rtkReady && imuReady && motorReady) return null;
+  return [
+    if (!rtkReady) 'RTK is not float/fixed',
+    if (!imuReady) 'IMU is not fresh',
+    if (!motorReady) 'motor controller feedback is absent',
+  ].join('; ');
+}
+
 class AutoMapScreen extends ConsumerStatefulWidget {
   final String mapId;
   const AutoMapScreen({super.key, required this.mapId});
@@ -150,32 +163,43 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
 
     final currentStart =
         _currentRobotStart(map, ref.read(wifiConnectionProvider));
-    final cleaningRoute = CleaningRoutePlanner.planRoute(
+    var cleaningRoute = CleaningRoutePlanner.planRoute(
       map,
       lineStep: _draftLineStepMeters,
       borderPasses: 1,
       startOverride: currentStart,
+      maxStartDistanceMeters: double.infinity,
+      debugPrint: true,
+    );
+    cleaningRoute ??= CleaningRoutePlanner.planRoute(
+      map,
+      lineStep: math.max(_draftLineStepMeters, 0.50),
+      borderPasses: 1,
+      startOverride: currentStart,
+      boundaryMarginMeters: 0.05,
+      maxStartDistanceMeters: double.infinity,
       debugPrint: true,
     );
 
-    if (cleaningRoute == null || cleaningRoute.path.isEmpty) {
+    final builtRoute = cleaningRoute;
+    if (builtRoute == null || builtRoute.path.isEmpty) {
       ref.read(noticeProvider.notifier).show(
             const NoticeState(
               title: 'Route error',
               message:
-                  'Could not build a safe perimeter + snake route. Check zone, forbidden areas, and start distance.',
+                  'Could not build a safe perimeter + snake route. Check the zone shape and forbidden areas.',
               kind: NoticeKind.danger,
             ),
           );
       return;
     }
 
-    if (cleaningRoute.path.length > _maxRouteWaypoints) {
+    if (builtRoute.path.length > _maxRouteWaypoints) {
       ref.read(noticeProvider.notifier).show(
             NoticeState(
               title: 'Route is too long',
               message:
-                  'Built ${cleaningRoute.path.length} waypoints, ESP32 limit is $_maxRouteWaypoints. Increase row step or split the zone.',
+                  'Built ${builtRoute.path.length} waypoints, ESP32 limit is $_maxRouteWaypoints. Increase row step or split the zone.',
               kind: NoticeKind.danger,
             ),
           );
@@ -184,9 +208,9 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
 
     setState(() {
       _mapState = map.copyWith(robot: currentStart);
-      _route = cleaningRoute.path;
-      _routeDistanceM = cleaningRoute.totalDistance;
-      _routeRunTimeS = _estimatedRunTimeSeconds(cleaningRoute.totalDistance);
+      _route = builtRoute.path;
+      _routeDistanceM = builtRoute.totalDistance;
+      _routeRunTimeS = _estimatedRunTimeSeconds(builtRoute.totalDistance);
       _routeSent = false;
       _routeWorkflowError = null;
     });
@@ -195,7 +219,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           NoticeState(
             title: 'Route built',
             message:
-                'Built ${cleaningRoute.path.length} waypoints, ${cleaningRoute.totalDistance.toStringAsFixed(1)} m, about ${(_estimatedRunTimeSeconds(cleaningRoute.totalDistance) / 60).toStringAsFixed(1)} min.',
+                'Built ${builtRoute.path.length} waypoints, ${builtRoute.totalDistance.toStringAsFixed(1)} m, about ${(_estimatedRunTimeSeconds(builtRoute.totalDistance) / 60).toStringAsFixed(1)} min.',
             kind: NoticeKind.success,
           ),
         );
@@ -331,16 +355,8 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       );
       return;
     }
-    final carrier = wifi.gpsCarrier?.toLowerCase();
-    final rtkReady = carrier == 'fixed' || carrier == 'float';
-    final imuReady = wifi.imuFresh == true;
-    final motorReady = wifi.motorFeedback == true;
-    if (!rtkReady || !imuReady || !motorReady) {
-      final msg = [
-        if (!rtkReady) 'RTK is not float/fixed',
-        if (!imuReady) 'IMU is not fresh',
-        if (!motorReady) 'motor controller feedback is absent',
-      ].join('; ');
+    final msg = _navStartBlockReason(wifi);
+    if (msg != null) {
       setState(() => _routeWorkflowError = msg);
       _showNotice(
         ref,
@@ -833,14 +849,15 @@ class _AutoWorkflowPanel extends StatelessWidget {
         : 'Time: ${(routeRunTimeS / 60.0).toStringAsFixed(1)} min';
     final carrier = wifi.gpsCarrier ?? 'none';
     final rtkStatus = 'RTK: $carrier';
+    final imuStatus = wifi.imuFresh == true ? 'IMU: fresh' : 'IMU: stale';
     final motorStatus =
         wifi.motorFeedback == true ? 'Motor: linked' : 'Motor: no feedback';
-    final startReady = routeSent &&
-        wifi.isConnected &&
-        (wifi.gpsCarrier?.toLowerCase() == 'fixed' ||
-            wifi.gpsCarrier?.toLowerCase() == 'float') &&
-        wifi.imuFresh == true &&
-        wifi.motorFeedback == true;
+    final startEnabled = routeSent && wifi.isConnected;
+    final startBlockReason = !wifi.isConnected
+        ? 'not connected'
+        : (!routeSent ? 'route not sent' : _navStartBlockReason(wifi));
+    final startStatus =
+        startBlockReason == null ? 'Start: ready' : 'Start: blocked';
 
     return _GlassCard(
       borderColor: Colors.white.withOpacity(0.14),
@@ -861,8 +878,10 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 _StatusPill(label: waypoint),
                 _StatusPill(label: gpsStatus),
                 _StatusPill(label: rtkStatus),
+                _StatusPill(label: imuStatus),
                 _StatusPill(label: motorStatus),
                 _StatusPill(label: gpsCoords),
+                _StatusPill(label: startStatus),
               ],
             ),
             if (error != null) ...[
@@ -885,7 +904,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 Expanded(
                   child: _WorkflowButton(
                     icon: Icons.upload_rounded,
-                    label: 'Send zone',
+                    label: 'Send route',
                     enabled: routePoints > 0 && wifi.isConnected,
                     onTap: onSendRoute,
                   ),
@@ -895,7 +914,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
                   child: _WorkflowButton(
                     icon: Icons.play_arrow_rounded,
                     label: 'Start',
-                    enabled: startReady,
+                    enabled: startEnabled,
                     onTap: onStart,
                   ),
                 ),

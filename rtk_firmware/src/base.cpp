@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <esp_system.h>
 
 #if __has_include("rtk_config_private.h")
 #include "rtk_config_private.h"
@@ -15,7 +16,8 @@
 static constexpr char WIFI_SSID[] = RTK_ROUTER_WIFI_SSID;
 static constexpr char WIFI_PASS[] = RTK_ROUTER_WIFI_PASS;
 static constexpr uint16_t UDP_PORT = 2101;
-static constexpr uint32_t WIFI_RECONNECT_MS = 5000;
+static constexpr uint32_t WIFI_RECONNECT_INITIAL_MS = 15000;
+static constexpr uint32_t WIFI_RECONNECT_MAX_MS = 60000;
 
 #ifndef RTK_ROUTER_GATEWAY_A
 #define RTK_ROUTER_GATEWAY_A 192
@@ -26,28 +28,48 @@ static constexpr uint32_t WIFI_RECONNECT_MS = 5000;
 
 static constexpr int PIN_GPS_RX = 4;
 static constexpr int PIN_GPS_TX = 5;
+static constexpr int PIN_GPS_ALT_RX = PIN_GPS_TX;
+static constexpr int PIN_GPS_ALT_TX = PIN_GPS_RX;
 static constexpr uint32_t GPS_BAUD = 38400;
 static constexpr uint32_t STATUS_INTERVAL_MS = 5000;
-static constexpr uint32_t SVIN_MIN_DUR_S = 120;
-static constexpr uint32_t SVIN_ACC_LIMIT_0_1MM = 20000;  // 2.0 m, units are 0.1 mm
+static constexpr uint32_t SVIN_MIN_DUR_S = 300;
+static constexpr uint32_t SVIN_ACC_LIMIT_0_1MM = 10000;  // 1.0 m, units are 0.1 mm
+static int activeGpsRx = PIN_GPS_RX;
+static int activeGpsTx = PIN_GPS_TX;
 
 static HardwareSerial GpsSerial(1);
 static WiFiUDP udp;
 
+#ifndef RTK_BASE_IP_A
+#define RTK_BASE_IP_A 192
+#define RTK_BASE_IP_B 168
+#define RTK_BASE_IP_C 31
+#define RTK_BASE_IP_D 207
+#endif
 #ifndef RTK_ROVER_IP_A
 #define RTK_ROVER_IP_A 192
 #define RTK_ROVER_IP_B 168
 #define RTK_ROVER_IP_C 31
 #define RTK_ROVER_IP_D 222
 #endif
+static IPAddress baseIP(RTK_BASE_IP_A, RTK_BASE_IP_B, RTK_BASE_IP_C, RTK_BASE_IP_D);
 static IPAddress roverIP(RTK_ROVER_IP_A, RTK_ROVER_IP_B, RTK_ROVER_IP_C, RTK_ROVER_IP_D);
+static IPAddress gateway(RTK_ROUTER_GATEWAY_A, RTK_ROUTER_GATEWAY_B, RTK_ROUTER_GATEWAY_C, RTK_ROUTER_GATEWAY_D);
+static IPAddress subnet(255, 255, 255, 0);
 
 // RTCM буфер
 // RTCM frames can carry up to 1023 bytes of payload plus header/CRC.
 static constexpr uint16_t RTCM_BUF_SIZE = 1200;
+static constexpr uint8_t RTCM_FRAME_QUEUE_SIZE = 8;
 static uint8_t rtcmBuf[RTCM_BUF_SIZE];
 static uint16_t rtcmLen = 0;
 static uint16_t rtcmExpectedLen = 0;
+static uint8_t rtcmFrameQueue[RTCM_FRAME_QUEUE_SIZE][RTCM_BUF_SIZE];
+static uint16_t rtcmFrameQueueLen[RTCM_FRAME_QUEUE_SIZE];
+static uint8_t rtcmFrameQueueHead = 0;
+static uint8_t rtcmFrameQueueTail = 0;
+static uint8_t rtcmFrameQueueCount = 0;
+static uint32_t rtcmFrameQueueDrop = 0;
 static uint32_t rtcmPktsSent = 0;
 static uint32_t rtcmBytesSent = 0;
 static uint32_t rtcmErrors = 0;
@@ -66,8 +88,8 @@ static uint32_t lastRtcmSendMs = 0;
 static uint32_t lastRtcmByteMs = 0;
 static bool rtcmRawForwarding = false;
 static bool rtcmFrameForwarding = false;
-static constexpr uint16_t RAW_RTCM_UDP_BUF_SIZE = 512;
-static constexpr uint32_t RAW_RTCM_FLUSH_MS = 20;
+static constexpr uint16_t RAW_RTCM_UDP_BUF_SIZE = 1024;
+static constexpr uint32_t RAW_RTCM_FLUSH_MS = 80;
 static uint8_t rawRtcmUdpBuf[RAW_RTCM_UDP_BUF_SIZE];
 static uint16_t rawRtcmUdpLen = 0;
 static uint32_t rawRtcmPktsSent = 0;
@@ -130,12 +152,34 @@ static constexpr uint32_t CFG_NMEA_BRDOT = 0x20990026;
 static bool wifiConnected = false;
 static bool gpsConfigured = false;
 static uint32_t lastWifiReconnectMs = 0;
+static uint32_t wifiReconnectIntervalMs = WIFI_RECONNECT_INITIAL_MS;
 static uint32_t svinValid = 0;
 static uint32_t svinDur = 0;
 static uint32_t svinAcc = 0;
 static uint32_t svinActive = 0;
 static bool rtcmConfiguredAfterSvin = false;
 static bool svinPollingEnabled = true;
+
+static void beginBaseWiFi() {
+  WiFi.config(baseIP, gateway, subnet);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+static const char* resetReasonString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "other_wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+  }
+}
 
 void writeUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
   uint8_t ckA = 0, ckB = 0;
@@ -153,6 +197,73 @@ void writeUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
   }
   GpsSerial.write(ckA);
   GpsSerial.write(ckB);
+}
+
+struct GpsUartCandidate {
+  int rx;
+  int tx;
+  const char* label;
+};
+
+static uint32_t scoreGpsUart(uint32_t passiveMs, bool activeProbe) {
+  uint32_t bytes = 0;
+  uint32_t score = 0;
+  int prev = -1;
+  uint32_t start = millis();
+  bool probeSent = false;
+
+  while (millis() - start < passiveMs) {
+    if (activeProbe && !probeSent && millis() - start > passiveMs / 3) {
+      writeUbx(0x01, 0x07, nullptr, 0);
+      GpsSerial.flush();
+      probeSent = true;
+    }
+    while (GpsSerial.available()) {
+      uint8_t b = GpsSerial.read();
+      bytes++;
+      if (b == '$') score += 8;
+      if (b == 0xD3) score += 3;
+      if (prev == 0xB5 && b == 0x62) score += 40;
+      if (b >= 32 && b <= 126) score++;
+      prev = b;
+    }
+    delay(1);
+  }
+  return score + min(bytes, (uint32_t)200);
+}
+
+static void selectGpsUart() {
+  const GpsUartCandidate candidates[] = {
+    {PIN_GPS_RX, PIN_GPS_TX, "normal"},
+    {PIN_GPS_ALT_RX, PIN_GPS_ALT_TX, "swapped"},
+  };
+  uint32_t bestScore = 0;
+  uint8_t bestIndex = 0;
+
+  Serial.println("GPS UART autodetect: checking normal and swapped TX/RX");
+  for (uint8_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    GpsSerial.end();
+    delay(50);
+    GpsSerial.begin(GPS_BAUD, SERIAL_8N1, candidates[i].rx, candidates[i].tx);
+    delay(200);
+    while (GpsSerial.available()) GpsSerial.read();
+    uint32_t score = scoreGpsUart(1200, true);
+    Serial.printf("GPS UART candidate %s RX=%d TX=%d score=%lu\n",
+      candidates[i].label, candidates[i].rx, candidates[i].tx, (unsigned long)score);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = i;
+    }
+  }
+
+  activeGpsRx = candidates[bestIndex].rx;
+  activeGpsTx = candidates[bestIndex].tx;
+  GpsSerial.end();
+  delay(50);
+  GpsSerial.begin(GPS_BAUD, SERIAL_8N1, activeGpsRx, activeGpsTx);
+  delay(200);
+  Serial.printf("GPS UART selected: %s RX=%d TX=%d score=%lu\n",
+    candidates[bestIndex].label, activeGpsRx, activeGpsTx, (unsigned long)bestScore);
 }
 
 void putU32(uint8_t* p, uint32_t v) {
@@ -211,17 +322,18 @@ void sendCfgPrt(uint16_t inProtoMask, uint16_t outProtoMask, const char* label) 
   cfgPrt[4] = 0x14; cfgPrt[5] = 0x00;  // len = 20
   cfgPrt[6] = 0x01;  // portID = UART
   cfgPrt[7] = 0x00;  // reserved
-  cfgPrt[8] = 0x00; cfgPrt[9] = 0x00; cfgPrt[10] = 0x00; cfgPrt[11] = 0x00;  // txReady
-  cfgPrt[12] = 0xC0; cfgPrt[13] = 0x08; cfgPrt[14] = 0x00; cfgPrt[15] = 0x00;  // mode: 8N1
-  cfgPrt[16] = (uint8_t)GPS_BAUD;
-  cfgPrt[17] = (uint8_t)(GPS_BAUD >> 8);
-  cfgPrt[18] = (uint8_t)(GPS_BAUD >> 16);
-  cfgPrt[19] = (uint8_t)(GPS_BAUD >> 24);
-  cfgPrt[20] = (uint8_t)inProtoMask;
-  cfgPrt[21] = (uint8_t)(inProtoMask >> 8);
-  cfgPrt[22] = (uint8_t)outProtoMask;
-  cfgPrt[23] = (uint8_t)(outProtoMask >> 8);
-  cfgPrt[24] = 0x00; cfgPrt[25] = 0x00;  // flags
+  cfgPrt[8] = 0x00; cfgPrt[9] = 0x00;  // txReady
+  cfgPrt[10] = 0xC0; cfgPrt[11] = 0x08; cfgPrt[12] = 0x00; cfgPrt[13] = 0x00;  // mode: 8N1
+  cfgPrt[14] = (uint8_t)GPS_BAUD;
+  cfgPrt[15] = (uint8_t)(GPS_BAUD >> 8);
+  cfgPrt[16] = (uint8_t)(GPS_BAUD >> 16);
+  cfgPrt[17] = (uint8_t)(GPS_BAUD >> 24);
+  cfgPrt[18] = (uint8_t)inProtoMask;
+  cfgPrt[19] = (uint8_t)(inProtoMask >> 8);
+  cfgPrt[20] = (uint8_t)outProtoMask;
+  cfgPrt[21] = (uint8_t)(outProtoMask >> 8);
+  cfgPrt[22] = 0x00; cfgPrt[23] = 0x00;  // flags
+  cfgPrt[24] = 0x00; cfgPrt[25] = 0x00;  // reserved
   uint8_t ckA = 0, ckB = 0;
   for (int i = 2; i <= 25; i++) { ckA += cfgPrt[i]; ckB += ckA; }
   cfgPrt[26] = ckA; cfgPrt[27] = ckB;
@@ -298,15 +410,16 @@ void forceUbxMode() {
   cfgPrt[4] = 0x14; cfgPrt[5] = 0x00;  // len = 20
   cfgPrt[6] = 0x01;  // portID = UART
   cfgPrt[7] = 0x00;  // reserved
-  cfgPrt[8] = 0x00; cfgPrt[9] = 0x00; cfgPrt[10] = 0x00; cfgPrt[11] = 0x00;  // txReady
-  cfgPrt[12] = 0xC0; cfgPrt[13] = 0x08; cfgPrt[14] = 0x00; cfgPrt[15] = 0x00;  // mode: 8N1
-  cfgPrt[16] = (uint8_t)GPS_BAUD;
-  cfgPrt[17] = (uint8_t)(GPS_BAUD >> 8);
-  cfgPrt[18] = (uint8_t)(GPS_BAUD >> 16);
-  cfgPrt[19] = (uint8_t)(GPS_BAUD >> 24);
-  cfgPrt[20] = 0x01; cfgPrt[21] = 0x00;  // inProtoMask = UBX only
-  cfgPrt[22] = 0x01; cfgPrt[23] = 0x00;  // outProtoMask = UBX only
-  cfgPrt[24] = 0x00; cfgPrt[25] = 0x00;  // flags
+  cfgPrt[8] = 0x00; cfgPrt[9] = 0x00;  // txReady
+  cfgPrt[10] = 0xC0; cfgPrt[11] = 0x08; cfgPrt[12] = 0x00; cfgPrt[13] = 0x00;  // mode: 8N1
+  cfgPrt[14] = (uint8_t)GPS_BAUD;
+  cfgPrt[15] = (uint8_t)(GPS_BAUD >> 8);
+  cfgPrt[16] = (uint8_t)(GPS_BAUD >> 16);
+  cfgPrt[17] = (uint8_t)(GPS_BAUD >> 24);
+  cfgPrt[18] = 0x01; cfgPrt[19] = 0x00;  // inProtoMask = UBX only
+  cfgPrt[20] = 0x01; cfgPrt[21] = 0x00;  // outProtoMask = UBX only
+  cfgPrt[22] = 0x00; cfgPrt[23] = 0x00;  // flags
+  cfgPrt[24] = 0x00; cfgPrt[25] = 0x00;  // reserved
   uint8_t ckA = 0, ckB = 0;
   for (int i = 2; i <= 25; i++) { ckA += cfgPrt[i]; ckB += ckA; }
   cfgPrt[26] = ckA; cfgPrt[27] = ckB;
@@ -450,29 +563,50 @@ static void resyncRtcmBuffer() {
   rtcmExpectedLen = 0;
 }
 
-static void sendRtcmFrame() {
-  if (!wifiConnected || rtcmLen == 0) return;
+static void sendRtcmFrameBytes(const uint8_t* frame, uint16_t len) {
+  if (!wifiConnected || len == 0) return;
 
   int result = udp.beginPacket(roverIP, UDP_PORT);
   if (result == 1) {
-    udp.write(rtcmBuf, rtcmLen);
+    udp.write(frame, len);
     result = udp.endPacket();
     if (result == 1) {
       rtcmPktsSent++;
-      rtcmBytesSent += rtcmLen;
+      rtcmBytesSent += len;
       lastRtcmMs = millis();
       lastRtcmSendMs = lastRtcmMs;
       return;
     }
     rtcmErrors++;
     Serial.printf("BASE ERR udp_end result=%d len=%u type=%lu\n",
-      result, rtcmLen, (unsigned long)rtcmMessageType(rtcmBuf, rtcmLen));
+      result, len, (unsigned long)rtcmMessageType(frame, len));
     return;
   }
 
   rtcmErrors++;
   Serial.printf("BASE ERR udp_begin result=%d target=%s:%u len=%u\n",
-    result, roverIP.toString().c_str(), UDP_PORT, rtcmLen);
+    result, roverIP.toString().c_str(), UDP_PORT, len);
+}
+
+static void queueRtcmFrameForSend() {
+  if (rtcmLen == 0) return;
+  if (rtcmFrameQueueCount >= RTCM_FRAME_QUEUE_SIZE) {
+    rtcmFrameQueueDrop++;
+    return;
+  }
+  memcpy(rtcmFrameQueue[rtcmFrameQueueHead], rtcmBuf, rtcmLen);
+  rtcmFrameQueueLen[rtcmFrameQueueHead] = rtcmLen;
+  rtcmFrameQueueHead = (rtcmFrameQueueHead + 1) % RTCM_FRAME_QUEUE_SIZE;
+  rtcmFrameQueueCount++;
+}
+
+static void flushRtcmFrameQueue() {
+  while (rtcmFrameQueueCount > 0) {
+    const uint8_t tail = rtcmFrameQueueTail;
+    sendRtcmFrameBytes(rtcmFrameQueue[tail], rtcmFrameQueueLen[tail]);
+    rtcmFrameQueueTail = (rtcmFrameQueueTail + 1) % RTCM_FRAME_QUEUE_SIZE;
+    rtcmFrameQueueCount--;
+  }
 }
 
 static void flushRawRtcmUdp() {
@@ -557,7 +691,7 @@ static void feedRtcmByte(uint8_t b, bool forwardFrame = true) {
       rtcmLastType = rtcmMessageType(rtcmBuf, rtcmLen);
       countRtcmType(rtcmLastType);
       if (forwardFrame) {
-        sendRtcmFrame();
+        queueRtcmFrameForSend();
       }
       rtcmLen = 0;
       rtcmExpectedLen = 0;
@@ -682,6 +816,8 @@ void printStatus() {
     (unsigned long)rawRtcmPktsSent,
     (unsigned long)rawRtcmBytesSent,
     rawRtcmUdpLen);
+  Serial.printf("RTCM queue: pending=%u dropped=%lu\n",
+    rtcmFrameQueueCount, (unsigned long)rtcmFrameQueueDrop);
   Serial.printf("RTCM types: 1005=%lu 1074=%lu 1084=%lu 1094=%lu 1124=%lu 1230=%lu other=%lu\n",
     (unsigned long)rtcmType1005,
     (unsigned long)rtcmType1074,
@@ -734,15 +870,18 @@ void setup() {
   Serial.println("========================================");
   Serial.println("     RTK BASE STATION - DEBUG VERSION");
   Serial.println("========================================");
-  Serial.printf("GPS UART: RX=%d TX=%d %lu baud\n", PIN_GPS_RX, PIN_GPS_TX, (unsigned long)GPS_BAUD);
+  Serial.printf("GPS UART default: RX=%d TX=%d alt RX=%d TX=%d %lu baud\n",
+    PIN_GPS_RX, PIN_GPS_TX, PIN_GPS_ALT_RX, PIN_GPS_ALT_TX, (unsigned long)GPS_BAUD);
   Serial.printf("WiFi SSID: %s\n", WIFI_SSID);
+  Serial.printf("Base static IP: %s\n", baseIP.toString().c_str());
   Serial.printf("RTCM target: %s:%u\n", roverIP.toString().c_str(), UDP_PORT);
   Serial.printf("Chip: %s rev=%d\n", ESP.getChipModel(), ESP.getChipRevision());
   Serial.printf("SDK: %s\n", ESP.getSdkVersion());
+  Serial.printf("Reset reason: %s (%d)\n",
+    resetReasonString(esp_reset_reason()), (int)esp_reset_reason());
 
   // GPS
-  GpsSerial.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
-  delay(300);
+  selectGpsUart();
   Serial.println("GPS UART initialized");
 
   // WiFi
@@ -750,7 +889,8 @@ void setup() {
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  beginBaseWiFi();
   Serial.println("WiFi: connecting...");
 }
 
@@ -761,6 +901,7 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiConnected) {
       wifiConnected = true;
+      wifiReconnectIntervalMs = WIFI_RECONNECT_INITIAL_MS;
       Serial.println();
       Serial.println("!!! WiFi CONNECTED !!!");
       Serial.printf("   IP: %s\n", WiFi.localIP().toString().c_str());
@@ -779,11 +920,14 @@ void loop() {
       wifiConnected = false;
       Serial.println("!!! WiFi DISCONNECTED !!!");
     }
-    if (now - lastWifiReconnectMs >= WIFI_RECONNECT_MS) {
+    if (now - lastWifiReconnectMs >= wifiReconnectIntervalMs) {
       lastWifiReconnectMs = now;
-      Serial.println("WiFi: reconnecting...");
-      WiFi.disconnect(false);
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      Serial.printf("WiFi: reconnecting, next retry in %lu ms...\n",
+        (unsigned long)min(wifiReconnectIntervalMs * 2, WIFI_RECONNECT_MAX_MS));
+      if (!WiFi.reconnect()) {
+        beginBaseWiFi();
+      }
+      wifiReconnectIntervalMs = min(wifiReconnectIntervalMs * 2, WIFI_RECONNECT_MAX_MS);
     }
   }
 
@@ -812,6 +956,10 @@ void loop() {
     }
   }
 
+  if (rtcmFrameForwarding && rtcmFrameQueueCount > 0) {
+    flushRtcmFrameQueue();
+  }
+
   if (rtcmRawForwarding && rawRtcmUdpLen > 0 &&
       millis() - rawRtcmLastFlushMs >= RAW_RTCM_FLUSH_MS) {
     flushRawRtcmUdp();
@@ -834,15 +982,16 @@ void loop() {
     cfgPrt[4] = 0x14; cfgPrt[5] = 0x00;
     cfgPrt[6] = 0x01;  // portID = UART
     cfgPrt[7] = 0x00;  // reserved
-    cfgPrt[8] = 0x00; cfgPrt[9] = 0x00; cfgPrt[10] = 0x00; cfgPrt[11] = 0x00;  // txReady
-    cfgPrt[12] = 0xC0; cfgPrt[13] = 0x08; cfgPrt[14] = 0x00; cfgPrt[15] = 0x00;  // mode: 8N1
-    cfgPrt[16] = (uint8_t)GPS_BAUD;
-    cfgPrt[17] = (uint8_t)(GPS_BAUD >> 8);
-    cfgPrt[18] = (uint8_t)(GPS_BAUD >> 16);
-    cfgPrt[19] = (uint8_t)(GPS_BAUD >> 24);
-    cfgPrt[20] = 0x01; cfgPrt[21] = 0x00;  // inProtoMask = UBX only
-    cfgPrt[22] = 0x20; cfgPrt[23] = 0x00;  // outProtoMask = RTCM3 only
-    cfgPrt[24] = 0x00; cfgPrt[25] = 0x00;  // flags
+    cfgPrt[8] = 0x00; cfgPrt[9] = 0x00;  // txReady
+    cfgPrt[10] = 0xC0; cfgPrt[11] = 0x08; cfgPrt[12] = 0x00; cfgPrt[13] = 0x00;  // mode: 8N1
+    cfgPrt[14] = (uint8_t)GPS_BAUD;
+    cfgPrt[15] = (uint8_t)(GPS_BAUD >> 8);
+    cfgPrt[16] = (uint8_t)(GPS_BAUD >> 16);
+    cfgPrt[17] = (uint8_t)(GPS_BAUD >> 24);
+    cfgPrt[18] = 0x01; cfgPrt[19] = 0x00;  // inProtoMask = UBX only
+    cfgPrt[20] = 0x20; cfgPrt[21] = 0x00;  // outProtoMask = RTCM3 only
+    cfgPrt[22] = 0x00; cfgPrt[23] = 0x00;  // flags
+    cfgPrt[24] = 0x00; cfgPrt[25] = 0x00;  // reserved
     uint8_t ckA = 0, ckB = 0;
     for (int i = 2; i <= 25; i++) { ckA += cfgPrt[i]; ckB += ckA; }
     cfgPrt[26] = ckA; cfgPrt[27] = ckB;
@@ -856,11 +1005,16 @@ void loop() {
     }
     rtcmLen = 0;
     rtcmExpectedLen = 0;
+    rtcmFrameQueueHead = 0;
+    rtcmFrameQueueTail = 0;
+    rtcmFrameQueueCount = 0;
     rawRtcmUdpLen = 0;
     rawRtcmLastFlushMs = millis();
-    rtcmRawForwarding = false;
-    rtcmFrameForwarding = true;
-    Serial.println("BASE: RTCM frame forwarding enabled");
+    // Forward the RTCM byte stream directly. Full frame forwarding blocks long
+    // enough to lose bytes from large MSM frames on this ESP32/F9P link.
+    rtcmRawForwarding = true;
+    rtcmFrameForwarding = false;
+    Serial.println("BASE: raw RTCM forwarding enabled");
     svinPollingEnabled = false;
   }
 
