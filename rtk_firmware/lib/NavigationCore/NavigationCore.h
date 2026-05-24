@@ -42,10 +42,10 @@ enum class NavQuality : uint8_t {
 };
 
 struct NavConfig {
-  float maxSpeedMps = 0.5f;
-  float floatSpeedMps = 0.25f;
-  float degradedSpeedMps = 0.15f;
-  float holdSpeedMps = 0.05f;
+  float maxSpeedMps = 0.25f;
+  float floatSpeedMps = 0.12f;
+  float degradedSpeedMps = 0.07f;
+  float holdSpeedMps = 0.03f;
   int16_t maxSpeedPercent = 70;
 
   float arrivalDistanceM = 0.1f;

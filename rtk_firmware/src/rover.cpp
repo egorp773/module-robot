@@ -109,10 +109,10 @@ static constexpr float GPS_MAX_HACC_WEIGHT_MM = 300.0f; // hAcc for minimum weig
 
 // ============== SPEED SETTINGS ==============
 
-static constexpr float MAX_SPEED = 0.5f;
-static constexpr float FLOAT_SPEED = 0.25f;
-static constexpr float DEGRADED_SPEED = 0.15f;
-static constexpr float HOLD_SPEED = 0.05f;
+static constexpr float MAX_SPEED = 0.25f;
+static constexpr float FLOAT_SPEED = 0.12f;
+static constexpr float DEGRADED_SPEED = 0.07f;
+static constexpr float HOLD_SPEED = 0.03f;
 
 // ============== TIMING ==============
 
