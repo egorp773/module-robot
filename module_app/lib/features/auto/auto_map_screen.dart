@@ -121,12 +121,19 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     await ctrl.connect();
   }
 
-  Offset _currentRobotStart(ManualMapState map, WifiConnectionState wifi) {
-    if (map.coordinateType == 'gps' &&
-        map.refLat != null &&
-        map.refLon != null &&
-        wifi.gpsLat != null &&
-        wifi.gpsLon != null) {
+  Offset? _currentRobotStart(ManualMapState map, WifiConnectionState wifi) {
+    // For a GPS-projected map, the only meaningful start is the live GPS
+    // position projected to local meters via the map's refLat/refLon. The
+    // saved map.startPoint / map.robot on a GPS map are also stored in
+    // local meters relative to that same origin, but they are stale (they
+    // were captured at edit time, possibly many sessions ago) and they
+    // may be far from the actual robot — leading to a route that starts
+    // "from nowhere" (the saved point) instead of from the robot. So for
+    // GPS maps we trust only the live position, and refuse to build a
+    // route if the rover hasn't sent one yet.
+    if (map.coordinateType == 'gps') {
+      if (map.refLat == null || map.refLon == null) return null;
+      if (wifi.gpsLat == null || wifi.gpsLon == null) return null;
       final geometry = GpsDisplayGeometry(
         originLat: map.refLat!,
         originLon: map.refLon!,
@@ -134,6 +141,9 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       final local = geometry.toLocal(wifi.gpsLat!, wifi.gpsLon!);
       return Offset(local.x, local.y);
     }
+    // For a plain cell-based map, prefer the saved startPoint (where the
+    // user told the robot to begin) and only fall back to map.robot if
+    // it wasn't set.
     return map.startPoint ?? map.robot;
   }
 
@@ -162,6 +172,21 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
 
     final currentStart =
         _currentRobotStart(map, ref.read(wifiConnectionProvider));
+    if (currentStart == null) {
+      // For a GPS map we need a live position to seed the route. If the
+      // rover has not sent lat/lon yet, refuse to build — building from a
+      // stale startPoint is what produced "route starts from nowhere".
+      ref.read(noticeProvider.notifier).show(
+            const NoticeState(
+              title: 'No live GPS',
+              message:
+                  'GPS map selected, but the rover has not sent a position yet. '
+                  'Wait for GPS, then build again.',
+              kind: NoticeKind.warning,
+            ),
+          );
+      return;
+    }
     var cleaningRoute = CleaningRoutePlanner.planRoute(
       map,
       lineStep: _draftLineStepMeters,
