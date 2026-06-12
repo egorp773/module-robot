@@ -279,7 +279,7 @@ public:
 
     output.commandSpeedMps = commandSpeed;
 
-    const float maxTurn = config_.maxSpeedPercent * (output.alignOnly ? 0.45f : 0.6f);
+    const float maxTurn = config_.maxSpeedPercent * (output.alignOnly ? 0.7f : 0.6f);
     turnCmd = clamp(turnCmd, -maxTurn, maxTurn);
 
     if (config_.invertForward) forwardCmd = -forwardCmd;

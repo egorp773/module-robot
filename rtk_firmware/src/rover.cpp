@@ -109,10 +109,10 @@ static constexpr float GPS_MAX_HACC_WEIGHT_MM = 300.0f; // hAcc for minimum weig
 
 // ============== SPEED SETTINGS ==============
 
-static constexpr float MAX_SPEED = 0.25f;
-static constexpr float FLOAT_SPEED = 0.12f;
-static constexpr float DEGRADED_SPEED = 0.07f;
-static constexpr float HOLD_SPEED = 0.03f;
+static constexpr float MAX_SPEED = 0.18f;
+static constexpr float FLOAT_SPEED = 0.10f;
+static constexpr float DEGRADED_SPEED = 0.06f;
+static constexpr float HOLD_SPEED = 0.025f;
 
 // ============== TIMING ==============
 
@@ -143,11 +143,13 @@ static constexpr float ARRIVAL_DIST_M = 0.05f;           // 5cm - target accurac
 // CRITICAL FIX: was 2.0s, caused overshoot. Now 0.3s for responsive stopping.
 static constexpr float ARRIVAL_CONFIRM_TIME_S = 0.3f;   // Must be within 5cm for 0.3 seconds
 static constexpr float ARRIVAL_APPROACH_DIST_M = 0.3f;  // Start approach mode at this distance
-static constexpr float INTERMEDIATE_ADVANCE_MAX_M = 0.35f;  // Segment handoff distance for long mowing rows
+static constexpr float INTERMEDIATE_ADVANCE_MAX_M = 0.60f;  // Segment handoff distance for long mowing rows
 
 // Movement Monitor
 static constexpr float PROGRESS_RATE_MIN_MPS = -0.05f;  // Must be approaching faster than this
-static constexpr float STUCK_SPEED_THRESHOLD_MPS = 0.02f; // Below this = stuck
+// Stuck threshold must be BELOW HOLD_SPEED (0.025 m/s) so HOLD-mode does not
+// falsely trip the recovery loop and stop the robot at slow speed.
+static constexpr float STUCK_SPEED_THRESHOLD_MPS = 0.015f; // Below this = stuck
 static constexpr float HEADING_ERROR_THRESHOLD_DEG = 15.0f; // Heading error limit
 static constexpr float SPEED_ERROR_THRESHOLD_MPS = 0.1f;  // Commanded vs actual speed
 static constexpr uint32_t MONITOR_HISTORY_SIZE = 50;     // 5 seconds at 10Hz
@@ -161,8 +163,18 @@ static constexpr float IMU_DRIFT_THRESHOLD_DEG = 5.0f;   // Trigger recalibratio
 static constexpr uint32_t IMU_DRIFT_CHECK_INTERVAL_MS = 30000;
 
 // GPS Heading
-static constexpr float GPS_HEADING_MIN_SPEED_MPS = 0.15f; // Min speed for GPS heading
+static constexpr float GPS_HEADING_MIN_SPEED_MPS = 0.05f; // Min speed for GPS heading
 static constexpr float GPS_HEADING_BLEND_FACTOR = 0.3f;  // Weight for GPS heading
+// Low-pass filter on GPS-velocity-derived heading. Without this, raw GPS
+// velocity noise (a few mm/s on a 0.18 m/s move) makes heading jump by 2-3°
+// per NAV_LOOP tick and the controller oscillates. 0.20 keeps a ~150 ms
+// time constant (NAV_LOOP=50 ms) — smooth enough to stop the wobble, fast
+// enough to react to real turns.
+static constexpr float HEADING_EMA_ALPHA = 0.20f;
+// Dead zone: ignore heading errors below this. RTK position noise (1.4 cm)
+// at 0.18 m/s produces ~4.5° of bearing jitter, so 3° cuts pure noise turns
+// while still correcting real misalignment.
+static constexpr float HEADING_DEAD_ZONE_DEG = 3.0f;
 
 // Cross track
 static constexpr float CROSS_TRACK_LIMIT_M = 1.0f;      // Max allowed cross track error
@@ -172,8 +184,8 @@ static constexpr uint32_t CROSS_TRACK_STOP_CONFIRM_MS = 1200;
 static constexpr float SEGMENT_ENTRY_SLOW_M = 0.60f;
 static constexpr uint32_t SEGMENT_ENTRY_SLOW_MS = 2500;
 static constexpr float ROBOT_RADIUS_M = 0.20f;  // Physical robot radius ~15cm, clearance for path planning
-static constexpr float FORBIDDEN_STOP_CLEARANCE_M = 0.04f;  // Allow 5cm passes; stop only inside or below 4cm
-static constexpr float FORBIDDEN_SLOW_CLEARANCE_M = 0.05f;  // Slow only at the requested 5cm near-contour band
+static constexpr float FORBIDDEN_STOP_CLEARANCE_M = 0.08f;  // RTK drit 14mm + handoff 0.6m margin: stop only inside or below 8cm
+static constexpr float FORBIDDEN_SLOW_CLEARANCE_M = 0.10f;  // Slow only at the requested 10cm near-contour band
 
 // ============== MOTOR STATE ==============
 
@@ -1262,6 +1274,10 @@ static void updateCalibration() {
 
 static uint32_t g_lastGoodRtkMs = 0;
 static bool g_haveRtkFix = false;
+// Set true once the GPS-velocity heading EMA filter has at least one sample.
+// Reset on START so the bearing-to-first-WP seed doesn't get blended with
+// the previous run's heading.
+static bool g_headingFilterSeeded = false;
 
 static void updateEstimator() {
   uint32_t now = millis();
@@ -1313,10 +1329,17 @@ static void updateEstimator() {
 
     const float f9pVelMag = hypotf(g_gps.velE, g_gps.velN);
     const float f9pSpeed = max(g_gps.speed, f9pVelMag);
-    if (f9pVelMag > 0.02f) {
+    // Hysteresis on the velocity threshold: previously 0.02 m/s, but at
+    // robot speeds near the gate (0.18 m/s) GPS-velocity noise (~5-10 mm/s)
+    // makes f9pVelMag hop across 0.02 every other tick, toggling between
+    // raw velE/velN and the heading-based fallback. That toggling fed the
+    // heading estimator directly and made the heading wobble. Use a tighter
+    // gate so velocity either engages or stays off, not flickers.
+    constexpr float VEL_ENGAGE_MPS = 0.05f;
+    if (f9pVelMag > VEL_ENGAGE_MPS) {
       g_est.vel.x = g_gps.velE;
       g_est.vel.y = g_gps.velN;
-    } else if (f9pSpeed > 0.02f) {
+    } else if (f9pSpeed > VEL_ENGAGE_MPS) {
       const float headingRad = degToRad(g_gps.heading);
       g_est.vel.x = f9pSpeed * sinf(headingRad);
       g_est.vel.y = f9pSpeed * cosf(headingRad);
@@ -1337,10 +1360,21 @@ static void updateEstimator() {
     // Update heading from GPS velocity — always, even when IMU is present.
     // IMU can have calibration errors that cause oscillation. GPS heading is
     // stable and sufficient for navigation when RTK is fixed/float.
+    // Heading is low-pass filtered (EMA, alpha=HEADING_EMA_ALPHA) so that
+    // GPS velocity noise (a few mm/s at 0.18 m/s gives ~2-3° per tick) does
+    // not feed the turn controller and cause the robot to wiggle in place.
     if (g_est.speed > GPS_HEADING_MIN_SPEED_MPS) {
       float gpsHeading = atan2f(g_est.vel.x, g_est.vel.y) * 180.0f / PI;
       if (gpsHeading < 0) gpsHeading += 360.0f;
-      g_est.heading = gpsHeading;
+      if (!g_headingFilterSeeded) {
+        g_est.heading = gpsHeading;
+        g_headingFilterSeeded = true;
+      } else {
+        float diff = gpsHeading - g_est.heading;
+        if (diff > 180.0f) diff -= 360.0f;
+        if (diff < -180.0f) diff += 360.0f;
+        g_est.heading = normalizeAngle360(g_est.heading + HEADING_EMA_ALPHA * diff);
+      }
       g_est.headingSource = 1;  // GPS
     }
     // When stationary, keep last known heading (no IMU fallback)
@@ -1433,7 +1467,7 @@ static void updateMovementMonitor(LocalCoords target, float cmdSpeed, float cmdH
     float newestDist = g_mon.distHistory[newestIdx];
     float timeDiff = (g_mon.timeHistory[newestIdx] - g_mon.timeHistory[oldestIdx]) / 1000.0f;
 
-    if (timeDiff > 0.5f) {
+    if (timeDiff > 1.0f) {
       g_mon.progressRate = (newestDist - oldestDist) / timeDiff;
       g_mon.isApproaching = g_mon.progressRate < -0.02f;
       g_mon.isGoingWrong = g_mon.progressRate > 0.02f;
@@ -1569,11 +1603,11 @@ static void updateRecovery() {
   uint32_t now = millis();
   uint32_t elapsed = now - g_recovery.recoveryStartMs;
 
-  // Check if we should exit recovery
+  // Check if we should exit recovery. Heading is GPS-only now; do not require
+  // IMU freshness here, or the recovery can never end when IMU is stale.
   bool gpsGood = g_est.quality == QUAL_RTK_FIXED_GOOD || g_est.quality == QUAL_RTK_FLOAT_OK;
-  bool imuGood = g_imuFresh;
 
-  if (gpsGood && imuGood && elapsed > 2000) {
+  if (gpsGood && elapsed > 2000) {
     // Verify position is consistent
     float posDrift = hypotf(g_est.pos.x - g_recovery.lastGoodPosition.x,
                             g_est.pos.y - g_recovery.lastGoodPosition.y);
@@ -1687,8 +1721,12 @@ static navcore::NavConfig makeNavCoreConfig() {
   config.lookaheadSpeedGain = LOOKAHEAD_SPEED_GAIN;
   config.headingGain = g_kHeading;
   config.crossTrackGain = g_kCrossTrack;
-  config.alignFirst = true;
-  config.alignFirstThresholdDeg = 35.0f;
+  // alignFirst OFF: heading is GPS-velocity-derived and only updates while moving.
+  // If we hold forward at 0 until heading aligns, we never start moving and heading
+  // never updates — deadlock. Always apply turn correction; pure pursuit will arc
+  // toward the target if heading is off.
+  config.alignFirst = false;
+  config.alignFirstThresholdDeg = 180.0f;
   config.forwardScale = g_navForwardScale;
   config.turnScale = g_navTurnScale;
   config.invertForward = g_invertForward;
@@ -2153,6 +2191,23 @@ static void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
 
   if (cmd == "START" || cmd == "NAV_START") {
     if (routeReady() && g_routeIndex < g_routeCount) {
+      // Seed heading from bearing to first target so pure-pursuit starts
+      // heading in the right direction. GPS velocity heading is only updated
+      // while moving, so without this seed the robot would try to drive at
+      // a wrong initial heading and arc around.
+      if (g_routeCount > 0 && g_est.lastUpdateMs > 0) {
+        const LocalCoords& t = g_route[g_routeIndex].pos;
+        float bearing = atan2f(t.x - g_est.pos.x, t.y - g_est.pos.y) * 180.0f / PI;
+        if (bearing < 0) bearing += 360.0f;
+        g_est.heading = bearing;
+        // Reset the GPS-velocity heading EMA filter so the first GPS heading
+        // sample after start is taken verbatim and not blended with the old
+        // (pre-start) heading. Otherwise the controller would see a few
+        // intermediate values between bearing and the actual motion heading.
+        g_headingFilterSeeded = false;
+        g_imuCalibrationOffset = normalizeAngle(bearing - g_imuRawYaw);
+        Serial.printf("NAV: heading seeded to %.1f (toward first WP)\n", bearing);
+      }
       g_navState = STATE_MOVING;
       g_navReason = "started";
       g_manualActive = false;
@@ -2657,8 +2712,13 @@ static void navUpdate() {
 
   const bool intermediateReached =
     !finalWaypoint && distToTarget < intermediateAdvanceM;
+  // For the final waypoint: do not require the robot to drop below HOLD_SPEED
+  // (HOLD_SPEED=0.025 > arrivalSpeedMps=0.03? close, but checkArrival demands
+  // 0.03 m/s and RTK drit 14mm makes the 5cm radius oscillate). Use a wider
+  // final-approach radius and accept arrival when we are inside it.
+  const bool finalArrived = finalWaypoint && distToTarget < 0.40f;
 
-  if (intermediateReached || checkArrival(target, 0, g_headingError)) {
+  if (intermediateReached || finalArrived || checkArrival(target, 0, g_headingError)) {
     g_routeIndex++;
     char navMsg[64];
     snprintf(navMsg, sizeof(navMsg), "NAV,WP_REACHED,%u,%u,%.2f",
@@ -2697,6 +2757,13 @@ static void navUpdate() {
   navInput.goingWrong = g_mon.isGoingWrong;
 
   navcore::NavOutput navOutput = g_navCore.update(navInput, NAV_LOOP_MS / 1000.0f);
+  // Apply heading dead zone: small bearing jitter (RTK drit + GPS-velocity
+  // noise) sits inside ±HEADING_DEAD_ZONE_DEG and would otherwise produce
+  // an oscillating turnCmd that wiggles the robot in place.
+  float rawHeadingError = navOutput.headingErrorDeg;
+  if (!g_simulationMode && fabsf(rawHeadingError) < HEADING_DEAD_ZONE_DEG) {
+    navOutput.headingErrorDeg = 0.0f;
+  }
   g_headingError = navOutput.headingErrorDeg;
   g_crossTrackError = navOutput.crossTrackErrorM;
   float desiredHeading = navOutput.desiredHeadingDeg;

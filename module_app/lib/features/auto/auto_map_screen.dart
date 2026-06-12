@@ -524,6 +524,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                                           route: _route,
                                           zoom: _zoom,
                                           pan: _pan,
+                                          wifi: wifi,
                                           onPan: (delta) {
                                             setState(() {
                                               _pan = _pan + delta;
@@ -859,6 +860,24 @@ class _AutoWorkflowPanel extends StatelessWidget {
     final rtkStatus = 'RTK: $carrier';
     final motorStatus =
         wifi.motorFeedback == true ? 'Motor: linked' : 'Motor: no feedback';
+    // Heading / distance to target — these are the live numbers that show
+    // *how* the robot is moving toward the waypoint. Useful when the robot
+    // seems to wiggle in place: distToWp should steadily decrease while
+    // headingErr stays small.
+    final headingLabel = wifi.gpsHeading == null
+        ? 'HDG: -'
+        : 'HDG: ${wifi.gpsHeading!.toStringAsFixed(0)}°';
+    final distLabel = wifi.navDistToWp == null
+        ? 'dWP: -'
+        : 'dWP: ${wifi.navDistToWp!.toStringAsFixed(2)} m';
+    final progressLabel = wifi.movementProgressRate == null
+        ? 'prog: -'
+        : 'prog: ${wifi.movementProgressRate! >= 0 ? '+' : ''}'
+            '${wifi.movementProgressRate!.toStringAsFixed(2)} m/s';
+    final crossLabel = wifi.movementCrossTrack == null
+        ? 'XTE: -'
+        : 'XTE: ${wifi.movementCrossTrack!.toStringAsFixed(2)} m';
+    final moveLabel = wifi.movementStatus ?? '-';
     final startEnabled = routeSent && wifi.isConnected;
     final startBlockReason = !wifi.isConnected
         ? 'not connected'
@@ -883,6 +902,11 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 _StatusPill(label: routeTime),
                 _StatusPill(label: 'NAV: $navMode'),
                 _StatusPill(label: waypoint),
+                _StatusPill(label: distLabel),
+                _StatusPill(label: progressLabel),
+                _StatusPill(label: crossLabel),
+                _StatusPill(label: moveLabel),
+                _StatusPill(label: headingLabel),
                 _StatusPill(label: gpsStatus),
                 _StatusPill(label: rtkStatus),
                 _StatusPill(label: motorStatus),
@@ -1261,6 +1285,7 @@ class _MapCardView extends StatelessWidget {
   final List<Offset> route;
   final double zoom;
   final Offset pan;
+  final WifiConnectionState wifi;
   final ValueChanged<Offset> onPan;
   final ValueChanged<double> onZoom;
 
@@ -1275,6 +1300,7 @@ class _MapCardView extends StatelessWidget {
     this.route = const [],
     required this.zoom,
     required this.pan,
+    required this.wifi,
     required this.onPan,
     required this.onZoom,
     required this.onZoomIn,
@@ -1316,6 +1342,7 @@ class _MapCardView extends StatelessWidget {
                           route: route,
                           zoom: zoom,
                           pan: pan,
+                          wifi: wifi,
                         ),
                       ),
                     ),
@@ -1364,6 +1391,7 @@ class _GridPainter extends CustomPainter {
   final List<Offset> route;
   final double zoom;
   final Offset pan;
+  final WifiConnectionState? wifi;
 
   _GridPainter({
     required this.uiScale,
@@ -1371,6 +1399,7 @@ class _GridPainter extends CustomPainter {
     this.route = const [],
     required this.zoom,
     required this.pan,
+    this.wifi,
   });
 
   @override
@@ -1495,12 +1524,81 @@ class _GridPainter extends CustomPainter {
         }
       }
       canvas.drawPath(routePath, routePaint);
+
+      // Highlight the current waypoint: an outer ring + filled dot, in
+      // bright cyan, with a leader line from the robot to that waypoint.
+      // This is what makes "the robot is swinging around the target" obvious.
+      final wpIndex = wifi?.navWpIndex;
+      final navState = wifi?.navState;
+      final activeNav = navState == 'MOVING' || navState == 'APPROACHING';
+      if (wpIndex != null &&
+          wpIndex >= 0 &&
+          wpIndex < route.length &&
+          activeNav) {
+        final wp = route[wpIndex];
+        final wpScreen = w2s(wp);
+        final robotScreen = w2s(s.robot);
+
+        // Leader line: robot -> current WP, in semi-transparent cyan
+        final leaderPaint = Paint()
+          ..color = const Color(0xFF3DE7FF).withOpacity(0.55)
+          ..strokeWidth = 1.5
+          ..style = PaintingStyle.stroke;
+        canvas.drawLine(robotScreen, wpScreen, leaderPaint);
+
+        // Outer ring
+        final ringPaint = Paint()
+          ..color = const Color(0xFF3DE7FF).withOpacity(0.9)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.5;
+        final ringR = (10 * uiScale).clamp(7.0, 14.0);
+        canvas.drawCircle(wpScreen, ringR, ringPaint);
+
+        // Filled center
+        final dotPaint = Paint()
+          ..color = const Color(0xFF3DE7FF)
+          ..style = PaintingStyle.fill;
+        canvas.drawCircle(wpScreen, (3 * uiScale).clamp(2.0, 4.0), dotPaint);
+      }
     }
 
     // робот — белый круг
     final rp = w2s(s.robot);
     final r = (6 * uiScale).clamp(5.0, 7.0);
     canvas.drawCircle(rp, r, Paint()..color = Colors.white.withOpacity(0.95));
+
+    // Heading arrow: a small triangle pointing in the direction of
+    // gpsHeading (when available). Helps spot "robot wiggles in place"
+    // because the arrow will visibly twitch; with a stable heading the
+    // arrow is rock-solid.
+    final hdg = wifi?.gpsHeading;
+    if (hdg != null) {
+      // gpsHeading is compass-style: 0 = north, 90 = east, growing clockwise.
+      // In screen space we rotate by that angle from up.
+      final rad = hdg * math.pi / 180.0;
+      final len = (r + 14 * uiScale).clamp(12.0, 24.0);
+      // Up vector in screen = (0, -1); rotate clockwise by `rad`.
+      final dirX = math.sin(rad);
+      final dirY = -math.cos(rad);
+      final tip = rp + Offset(dirX * len, dirY * len);
+      // Triangle base perpendicular to dir
+      const baseHalf = 4.0;
+      final perpX = -dirY;
+      final perpY = dirX;
+      final base1 = rp +
+          Offset(perpX * baseHalf, perpY * baseHalf);
+      final base2 = rp -
+          Offset(perpX * baseHalf, perpY * baseHalf);
+      final arrowPath = Path()
+        ..moveTo(tip.dx, tip.dy)
+        ..lineTo(base1.dx, base1.dy)
+        ..lineTo(base2.dx, base2.dy)
+        ..close();
+      final arrowPaint = Paint()
+        ..color = const Color(0xFFFFD700)
+        ..style = PaintingStyle.fill;
+      canvas.drawPath(arrowPath, arrowPaint);
+    }
   }
 
   Path _polyPath(List<Offset> worldPts, Offset Function(Offset) w2s) {
