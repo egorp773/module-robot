@@ -2614,6 +2614,23 @@ static void broadcastTelemetry() {
   );
   ws.textAll(msg);
 
+  // Battery percentage. The app parses "BAT_PCT,<int>"; we map the
+  // hoverboard-reported pack voltage to a rough 10S Li-ion percent so the
+  // user has a single number to glance at instead of raw mV. 36.0V = 100%,
+  // 30.0V = 0% (10S undervoltage cut-off). Only meaningful once the
+  // hoverboard has reported feedback at least once.
+  if (g_haveMotorFeedback) {
+    int batPct = 0;
+    if (g_motorBatVoltage > 0) {
+      const float volts = g_motorBatVoltage * 0.01f;
+      batPct = (int)constrain(
+        (volts - 30.0f) / (36.0f - 30.0f) * 100.0f,
+        0.0f, 100.0f);
+    }
+    snprintf(msg, sizeof(msg), "BAT_PCT,%d", batPct);
+    ws.textAll(msg);
+  }
+
   // Calibration
   snprintf(msg, sizeof(msg),
     "CAL,%s,%.2f,%.2f,%u,%u",
@@ -3672,6 +3689,16 @@ void setup() {
   WiFi.config(ROVER_IP, GATEWAY, SUBNET);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.println("WiFi: connecting...");
+
+  // Motor UART. The working sound/sound.ino inits the UART and immediately
+  // sends a (0,0) command in setup(). Doing the same here keeps the
+  // hoverboard controller from sitting idle for the first ~20ms after boot
+  // (which on some firmware revisions shows up as a chirp/error tone).
+  MotorSerial.begin(MOTOR_BAUD, SERIAL_8N1, MOTOR_RX, MOTOR_TX);
+  drive(0, 0);
+  g_lastRampMs = millis();
+  Serial.printf("Motor: UART2 initialized, RX=%d TX=%d, idle command sent\n",
+    MOTOR_RX, MOTOR_TX);
 }
 
 void loop() {

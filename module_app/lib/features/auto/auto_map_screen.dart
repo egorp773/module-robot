@@ -622,6 +622,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                             routeDistanceM: _routeDistanceM,
                             routeRunTimeS: _routeRunTimeS,
                             mapSizeLabel: _mapSizeLabel(_mapState),
+                            batteryPercent: battery,
                             routeSent: _routeSent,
                             routeSending: _routeSending,
                             error: _routeWorkflowError,
@@ -836,6 +837,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
   final double routeDistanceM;
   final double routeRunTimeS;
   final String mapSizeLabel;
+  final int? batteryPercent;
   final bool routeSent;
   final bool routeSending;
   final String? error;
@@ -851,6 +853,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
     required this.routeDistanceM,
     required this.routeRunTimeS,
     required this.mapSizeLabel,
+    required this.batteryPercent,
     required this.routeSent,
     required this.routeSending,
     required this.error,
@@ -903,6 +906,9 @@ class _AutoWorkflowPanel extends StatelessWidget {
         ? 'XTE: -'
         : 'XTE: ${wifi.movementCrossTrack!.toStringAsFixed(2)} m';
     final moveLabel = wifi.movementStatus ?? '-';
+    final batLabel = batteryPercent == null
+        ? 'BAT: -'
+        : 'BAT: $batteryPercent%';
     final startEnabled = routeSent && wifi.isConnected;
     final startBlockReason = !wifi.isConnected
         ? 'not connected'
@@ -932,6 +938,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 _StatusPill(label: crossLabel),
                 _StatusPill(label: moveLabel),
                 _StatusPill(label: headingLabel),
+                _StatusPill(label: batLabel),
                 _StatusPill(label: gpsStatus),
                 _StatusPill(label: rtkStatus),
                 _StatusPill(label: motorStatus),
