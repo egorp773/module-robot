@@ -2798,35 +2798,12 @@ class _GridPainter extends CustomPainter {
       }
     }
 
-    // Начальная точка — черный квадрат
-    if (s.startPoint != null) {
-      final sp = w2s(s.startPoint!);
-      final squareSize = (12 * uiScale * s.zoom).clamp(8.0, 16.0);
-      final squarePaint = Paint()
-        ..color = Colors.black
-        ..style = PaintingStyle.fill;
-      canvas.drawRect(
-        Rect.fromCenter(
-          center: sp,
-          width: squareSize,
-          height: squareSize,
-        ),
-        squarePaint,
-      );
-      // Обводка квадрата
-      final borderPaint = Paint()
-        ..color = Colors.white.withOpacity(0.5)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.5;
-      canvas.drawRect(
-        Rect.fromCenter(
-          center: sp,
-          width: squareSize,
-          height: squareSize,
-        ),
-        borderPaint,
-      );
-    }
+    // startPoint is no longer rendered as a black square: it was a saved
+    // hint from manual editing and the autonomous route is now seeded
+    // from the live GPS position. Showing a stale black square here only
+    // caused "the start is somewhere else than the robot" confusion. The
+    // field is kept on ManualMapState for backward compatibility with
+    // older saved maps.
 
     // робот — белый круг
     final rp = w2s(s.robot);

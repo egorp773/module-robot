@@ -1500,35 +1500,12 @@ class _GridPainter extends CustomPainter {
       );
     }
 
-    // Начальная точка — черный квадрат
-    if (s.startPoint != null) {
-      final sp = w2s(s.startPoint!);
-      final squareSize = (12 * uiScale * zoom).clamp(8.0, 16.0);
-      final squarePaint = Paint()
-        ..color = Colors.black
-        ..style = PaintingStyle.fill;
-      canvas.drawRect(
-        Rect.fromCenter(
-          center: sp,
-          width: squareSize,
-          height: squareSize,
-        ),
-        squarePaint,
-      );
-      // Обводка квадрата
-      final borderPaint = Paint()
-        ..color = Colors.white.withOpacity(0.5)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.5;
-      canvas.drawRect(
-        Rect.fromCenter(
-          center: sp,
-          width: squareSize,
-          height: squareSize,
-        ),
-        borderPaint,
-      );
-    }
+    // startPoint is no longer rendered. It is a saved hint from manual
+    // editing; the route is now seeded from the live GPS position in
+    // _currentRobotStart(), and showing a stale black square on the map
+    // just confused the user ("why is the start somewhere else than the
+    // robot?"). The field is kept on ManualMapState for backward
+    // compatibility with old saved maps.
 
     // Маршрут (если построен)
     if (route.isNotEmpty) {

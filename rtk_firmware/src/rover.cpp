@@ -109,10 +109,16 @@ static constexpr float GPS_MAX_HACC_WEIGHT_MM = 300.0f; // hAcc for minimum weig
 
 // ============== SPEED SETTINGS ==============
 
-static constexpr float MAX_SPEED = 0.18f;
-static constexpr float FLOAT_SPEED = 0.10f;
-static constexpr float DEGRADED_SPEED = 0.06f;
-static constexpr float HOLD_SPEED = 0.025f;
+// Halved again: the robot keeps overshooting waypoints and oscillating
+// around its heading target at 0.18 m/s. At 0.06 m/s the wheel inertia
+// and the EMA-filtered heading error stop driving an arc that misses
+// the target. Pushing the speeds back up is a one-line revert once
+// heading tracking is solid; the autonomous run is still time-bounded
+// because the route planner reuses these values.
+static constexpr float MAX_SPEED = 0.06f;
+static constexpr float FLOAT_SPEED = 0.03f;
+static constexpr float DEGRADED_SPEED = 0.02f;
+static constexpr float HOLD_SPEED = 0.01f;
 
 // ============== TIMING ==============
 
