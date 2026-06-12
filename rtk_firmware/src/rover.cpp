@@ -3731,12 +3731,25 @@ void loop() {
     navUpdate();
   }
 
-  // Failsafe
+  // Failsafe: if no fresh motor command arrived within CMD_TIMEOUT_MS, we
+  // are blind to the operator (WiFi/WebSocket stall, app crash, USB
+  // unplugged). The previous code only logged the event but left
+  // g_targetLeft/Right at the last values, so the ramp kept moving the
+  // robot toward a wall until something else cleared the targets. This
+  // sets targets to zero and the ramp glides to a stop.
   if (now - g_lastCmdMs > CMD_TIMEOUT_MS) {
-    if (!g_isFailSafeStopping && (g_targetLeft != 0 || g_targetRight != 0 || g_curLeft != 0 || g_curRight != 0)) {
+    if (!g_isFailSafeStopping &&
+        (g_targetLeft != 0 || g_targetRight != 0 || g_curLeft != 0 || g_curRight != 0)) {
       g_isFailSafeStopping = true;
-      Serial.println("FAILSAFE: smooth stop");
+      Serial.printf("FAILSAFE: smooth stop, last cmd %lu ms ago\n",
+        (unsigned long)(now - g_lastCmdMs));
     }
+    if (g_isFailSafeStopping) {
+      g_targetLeft = 0;
+      g_targetRight = 0;
+    }
+  } else {
+    g_isFailSafeStopping = false;
   }
 
   // Motor control
