@@ -3680,15 +3680,22 @@ void setup() {
     Serial.println("IMU: FAILED - continuing without IMU");
   }
 
-  // WiFi
+  // WiFi. We deliberately use a lower TX power (WIFI_POWER_11dBm) instead
+  // of the previous 19.5dBm: when the rover starts moving, the hoverboard
+  // pulls transient current from the shared 5V rail. WiFi TX at 19.5dBm
+  // adds ~200mA bursts on top, and the combined spike forces a
+  // POWERON_RESET (the chip literally loses power and reboots). At
+  // 11dBm the radio is still strong enough at close range (the rover is
+  // typically within a few meters of the phone / router), and the TX
+  // current stays around 80mA.
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setTxPower(WIFI_POWER_11dBm);
   WiFi.config(ROVER_IP, GATEWAY, SUBNET);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.println("WiFi: connecting...");
+  Serial.println("WiFi: connecting (TX 11dBm)...");
 
   // Motor UART. The working sound/sound.ino inits the UART and immediately
   // sends a (0,0) command in setup(). Doing the same here keeps the
