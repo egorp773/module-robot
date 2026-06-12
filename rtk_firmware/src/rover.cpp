@@ -109,16 +109,25 @@ static constexpr float GPS_MAX_HACC_WEIGHT_MM = 300.0f; // hAcc for minimum weig
 
 // ============== SPEED SETTINGS ==============
 
-// Halved again: the robot keeps overshooting waypoints and oscillating
-// around its heading target at 0.18 m/s. At 0.06 m/s the wheel inertia
-// and the EMA-filtered heading error stop driving an arc that misses
-// the target. Pushing the speeds back up is a one-line revert once
-// heading tracking is solid; the autonomous run is still time-bounded
-// because the route planner reuses these values.
-static constexpr float MAX_SPEED = 0.06f;
-static constexpr float FLOAT_SPEED = 0.03f;
-static constexpr float DEGRADED_SPEED = 0.02f;
-static constexpr float HOLD_SPEED = 0.01f;
+// The robot still cannot lock onto a heading target at 0.06 m/s. The
+// problem is wheel inertia: at the previous speeds the EMA-filtered
+// heading error still had enough authority to throw the chassis into
+// an arc that misses the waypoint before the next 50 ms tick. We
+// calibrated against manual drive: in MANUAL, M,15,15 gives the
+// wheels about 5.8% of HOVER_MAX_CMD, and at that throttle the
+// operator can comfortably steer without overshoot. We set
+// MAX_SPEED so the autonomous controller asks for ~2.9% of
+// HOVER_MAX_CMD at top speed — about 2x slower than the comfortable
+// manual 15%. That gives the EMA heading filter enough time to
+// converge before the wheels have built up any meaningful angular
+// momentum, so the robot can actually reach its heading target.
+//
+// At 0.0035 m/s a 10 m segment is ~48 minutes. We trade time for
+// stability here on purpose.
+static constexpr float MAX_SPEED = 0.0035f;
+static constexpr float FLOAT_SPEED = 0.0018f;
+static constexpr float DEGRADED_SPEED = 0.0012f;
+static constexpr float HOLD_SPEED = 0.0006f;
 
 // ============== TIMING ==============
 
@@ -153,9 +162,9 @@ static constexpr float INTERMEDIATE_ADVANCE_MAX_M = 0.60f;  // Segment handoff d
 
 // Movement Monitor
 static constexpr float PROGRESS_RATE_MIN_MPS = -0.05f;  // Must be approaching faster than this
-// Stuck threshold must be BELOW HOLD_SPEED (0.025 m/s) so HOLD-mode does not
-// falsely trip the recovery loop and stop the robot at slow speed.
-static constexpr float STUCK_SPEED_THRESHOLD_MPS = 0.015f; // Below this = stuck
+// Stuck threshold must be BELOW HOLD_SPEED (0.0006 m/s) so HOLD-mode does
+// not falsely trip the recovery loop and stop the robot at slow speed.
+static constexpr float STUCK_SPEED_THRESHOLD_MPS = 0.0003f; // Below this = stuck
 static constexpr float HEADING_ERROR_THRESHOLD_DEG = 15.0f; // Heading error limit
 static constexpr float SPEED_ERROR_THRESHOLD_MPS = 0.1f;  // Commanded vs actual speed
 static constexpr uint32_t MONITOR_HISTORY_SIZE = 50;     // 5 seconds at 10Hz
