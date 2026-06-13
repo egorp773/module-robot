@@ -584,6 +584,15 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       final lastRx = _lastRxAt;
       if (lastRx == null) return;
       final silence = DateTime.now().difference(lastRx);
+      final heartbeatChannel = _channel;
+      if (heartbeatChannel != null) {
+        try {
+          heartbeatChannel.sink.add("PING");
+        } catch (e) {
+          unawaited(_handleConnectionLost("РћС€РёР±РєР° PING: $e"));
+          return;
+        }
+      }
 
       if (silence.inSeconds >= 8) {
         final ch = _channel;
@@ -744,6 +753,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                     imuAgeMs: int.tryParse(parts[17]),
                     imuFresh: parts[18].trim() == '1',
                     imuReceivedAt: imuYaw == null ? null : now,
+                    motorFeedback: true,
                   );
                   _maybeLogTelemetrySummary();
                 }
