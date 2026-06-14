@@ -61,6 +61,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   double _routeRunTimeS = 0.0;
   bool _routeSent = false;
   bool _routeSending = false;
+  int _routeSendProgress = 0;
   String? _routeWorkflowError;
 
   // Состояние для управления картой
@@ -267,7 +268,10 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
 
   Future<void> _sendRoute(BuildContext context, WidgetRef ref) async {
     if (_routeSending) return;
-    setState(() => _routeSending = true);
+    setState(() {
+      _routeSending = true;
+      _routeSendProgress = 0;
+    });
     try {
       if (_route.isEmpty) {
         _showNotice(
@@ -344,6 +348,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       }
 
       final routeCtrl = ref.read(wifiConnectionProvider.notifier);
+      setState(() => _routeWorkflowError = 'Sending route: 0/${_route.length}');
       await routeCtrl.sendRouteBegin(
         _route.length,
         originLat: map.refLat!,
@@ -352,6 +357,13 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       for (var i = 0; i < _route.length; i++) {
         final p = _route[i];
         await routeCtrl.sendRoutePoint(i, p.dx, p.dy);
+        if (mounted) {
+          setState(() {
+            _routeSendProgress = i + 1;
+            _routeWorkflowError =
+                'Sending route: $_routeSendProgress/${_route.length}';
+          });
+        }
       }
       await routeCtrl.sendRouteEnd();
 
@@ -382,7 +394,12 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         kind: NoticeKind.danger,
       );
     } finally {
-      if (mounted) setState(() => _routeSending = false);
+      if (mounted) {
+        setState(() {
+          _routeSending = false;
+          _routeSendProgress = 0;
+        });
+      }
     }
   }
 

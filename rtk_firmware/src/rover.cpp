@@ -37,13 +37,16 @@ struct Follower {
     float crossTrack = 0;
     float distToTarget = 0;
     bool  turning = false;          // режим разворота на месте (с гистерезисом)
+    int8_t turnSign = 0;
+    uint32_t turningSinceMs = 0;
+    uint32_t turnCooldownUntilMs = 0;
     bool  arrived = false;
     uint32_t arrivedSinceMs = 0;
 
     void reset() {
         wpIdx = 0; running = false; paused = false;
         linearMps = angularRadps = headingErr = crossTrack = distToTarget = 0;
-        turning = false;
+        turning = false; turnSign = 0; turningSinceMs = 0; turnCooldownUntilMs = 0;
         arrived = false; arrivedSinceMs = 0;
     }
 } g_follow;
@@ -172,19 +175,39 @@ static void stepFollower() {
 
     float w = 0;
     float absErr = fabsf(headingErr);
+    uint32_t nowMs = millis();
 
     // ----- РЕЖИМ 1: разворот на месте (курс сильно не туда) -----
     // Ключевое отличие от старого кода: гистерезис (входим >ENTER, выходим <EXIT — без дёрганья)
     // и угловая скорость, ПРОПОРЦИОНАЛЬНАЯ ошибке, но с ПОЛОМ выше трения гусениц.
-    if (absErr > ROVER_TURN_IN_PLACE_ENTER_DEG) g_follow.turning = true;
-    if (absErr < ROVER_TURN_IN_PLACE_EXIT_DEG)  g_follow.turning = false;
+    if (!g_follow.turning &&
+        nowMs >= g_follow.turnCooldownUntilMs &&
+        absErr > ROVER_TURN_IN_PLACE_ENTER_DEG) {
+        g_follow.turning = true;
+        g_follow.turnSign = (headingErr >= 0) ? 1 : -1;
+        g_follow.turningSinceMs = nowMs;
+    }
+    if (g_follow.turning && absErr < ROVER_TURN_IN_PLACE_EXIT_DEG) {
+        g_follow.turning = false;
+        g_follow.turnSign = 0;
+        g_follow.turningSinceMs = 0;
+    }
+    if (g_follow.turning &&
+        g_follow.turningSinceMs != 0 &&
+        (nowMs - g_follow.turningSinceMs) > ROVER_TURN_IN_PLACE_TIMEOUT_MS) {
+        g_follow.turning = false;
+        g_follow.turnSign = 0;
+        g_follow.turningSinceMs = 0;
+        g_follow.turnCooldownUntilMs = nowMs + ROVER_TURN_IN_PLACE_COOLDOWN_MS;
+    }
 
     if (g_follow.turning) {
         baseSpeed = 0;
         // w пропорциональна ошибке, но не ниже MIN (пробить трение) и не выше MAX.
         float mag = ROVER_K_HEADING * (absErr * M_PI / 180.0f);
         mag = clampf(mag, ROVER_TURN_MIN_RADPS, ROVER_MAX_ANGULAR_RADPS);
-        w = (headingErr >= 0) ? mag : -mag;   // + = по часовой
+        int8_t sign = g_follow.turnSign != 0 ? g_follow.turnSign : ((headingErr >= 0) ? 1 : -1);
+        w = sign * mag;   // + = по часовой
     } else {
         // ----- РЕЖИМ 2: движение со Stanley-рулёжкой -----
         // Притормаживаем у цели и при большой ошибке курса (плавнее на змейке).

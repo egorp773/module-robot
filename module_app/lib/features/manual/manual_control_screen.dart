@@ -299,7 +299,7 @@ class ManualMapController extends StateNotifier<ManualMapState> {
     final local = geo.toLocal(lat, lon);
     final next = Offset(local.x, local.y);
 
-    final movedEnough = (next - state.robot).distance >= 0.02;
+    final movedEnough = (next - state.robot).distance >= 0.05;
     if (!force && !movedEnough && state.coordinateType == 'gps') return;
 
     state = state.copyWith(
@@ -460,7 +460,7 @@ class ManualMapController extends StateNotifier<ManualMapState> {
   void _appendStroke(Offset p) {
     if (state.stroke.isNotEmpty) {
       final last = state.stroke.last;
-      if ((last - p).distance < 0.0005) return;
+      if ((last - p).distance < 0.05) return;
     }
     state = state.copyWith(stroke: [...state.stroke, p]);
   }

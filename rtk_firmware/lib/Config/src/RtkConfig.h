@@ -54,6 +54,7 @@
 #define ROVER_MAX_PWM       70
 #define ROVER_INPUT_DIV     2
 #define ROVER_CMD_TIMEOUT_MS 400
+#define ROVER_AUTO_MAX_PERCENT 16
 #define ROVER_MAX_SPEED_MPS  0.25f
 #define ROVER_FLOAT_SPEED    0.12f
 #define ROVER_DEGRADED_SPEED 0.07f
@@ -64,16 +65,18 @@
 #define ROVER_LOOKAHEAD_MIN  0.5f
 #define ROVER_LOOKAHEAD_MAX  1.2f
 #define ROVER_LOOKAHEAD_GAIN 1.5f
-#define ROVER_K_HEADING      1.5f
-#define ROVER_K_CROSSTRACK   0.15f
+#define ROVER_K_HEADING      0.55f
+#define ROVER_K_CROSSTRACK   0.08f
 #define ROVER_TURN_THRESH_DEG 25.0f
-#define ROVER_ROTATE_SPEED_RADPS 0.50f
-#define ROVER_MAX_ANGULAR_RADPS 1.20f
+#define ROVER_ROTATE_SPEED_RADPS 0.25f
+#define ROVER_MAX_ANGULAR_RADPS 0.28f
 // Разворот на месте: гистерезис входа/выхода + МИНИМАЛЬНАЯ угл. скорость (пробить трение гусениц).
 // ВЫВЕРИТЬ TURN_MIN на железе: робот должен реально поворачиваться, а не дёргаться на месте.
-#define ROVER_TURN_IN_PLACE_ENTER_DEG 35.0f
-#define ROVER_TURN_IN_PLACE_EXIT_DEG  12.0f
-#define ROVER_TURN_MIN_RADPS          0.45f
+#define ROVER_TURN_IN_PLACE_ENTER_DEG 70.0f
+#define ROVER_TURN_IN_PLACE_EXIT_DEG  18.0f
+#define ROVER_TURN_MIN_RADPS          0.10f
+#define ROVER_TURN_IN_PLACE_TIMEOUT_MS 2500u
+#define ROVER_TURN_IN_PLACE_COOLDOWN_MS 1200u
 #define ROVER_STANLEY_SOFT_SPEED 0.08f
 #define ROVER_HANDOFF_FRAC    0.10f   // handoff = segLen * this
 #define ROVER_HANDOFF_MAX_M   0.30f

@@ -477,7 +477,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
   Completer<void>? _pongWaiter;
   Completer<void>? _routeAckWaiter;
-  static const Duration _routeAckTimeout = Duration(milliseconds: 800);
+  static const Duration _routeAckTimeout = Duration(milliseconds: 500);
 
   Uri get _wsUri => Uri.parse("ws://$_host:$_port/ws");
 
@@ -1215,7 +1215,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         "${originLon.toStringAsFixed(8)}",
       );
       try {
-        await completer.future.timeout(const Duration(milliseconds: 1500));
+        await completer.future.timeout(_routeAckTimeout);
         _routeAckWaiter = null;
         return;
       } catch (e) {
@@ -1265,7 +1265,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       _routeAckWaiter = completer;
       sendRaw("ROUTE_END");
       try {
-        await completer.future.timeout(const Duration(milliseconds: 1500));
+        await completer.future.timeout(_routeAckTimeout);
         _routeAckWaiter = null;
         return;
       } catch (e) {

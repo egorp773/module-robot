@@ -90,11 +90,11 @@ void Motor::setLinearAngularSpeed(float linearMps, float angularRadps, bool useR
     float vL = linearMps - angularRadps * _wheelBase * 0.5f;
     float vR = linearMps + angularRadps * _wheelBase * 0.5f;
     // м/с -> проценты: ROVER_MAX_SPEED_MPS соответствует HOVER_MAX_PERCENT
-    float scale = (float)HOVER_MAX_PERCENT / ROVER_MAX_SPEED_MPS;
+    float scale = (float)ROVER_AUTO_MAX_PERCENT / ROVER_MAX_SPEED_MPS;
     int leftPct  = (int)roundf(vL * scale);
     int rightPct = (int)roundf(vR * scale);
-    leftPct  = (int)clamp16(leftPct,  -HOVER_MAX_PERCENT, HOVER_MAX_PERCENT);
-    rightPct = (int)clamp16(rightPct, -HOVER_MAX_PERCENT, HOVER_MAX_PERCENT);
+    leftPct  = (int)clamp16(leftPct,  -ROVER_AUTO_MAX_PERCENT, ROVER_AUTO_MAX_PERCENT);
+    rightPct = (int)clamp16(rightPct, -ROVER_AUTO_MAX_PERCENT, ROVER_AUTO_MAX_PERCENT);
     int16_t sp, st;
     pctToHover(leftPct, rightPct, sp, st);
     sp = clamp16(sp, -HOVER_MAX_CMD, HOVER_MAX_CMD);
