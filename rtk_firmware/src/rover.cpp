@@ -36,18 +36,24 @@ struct Follower {
     float headingErr = 0;
     float crossTrack = 0;
     float distToTarget = 0;
-    bool  turning = false;          // режим разворота на месте (с гистерезисом)
-    int8_t turnSign = 0;
-    uint32_t turningSinceMs = 0;
-    uint32_t turnCooldownUntilMs = 0;
+    // Поля разворота на месте удалены: GPS-only heading не позволяет разворот стоя
+    // (курс набирается только в движении), поэтому всегда едем вперёд по дуге.
     bool  arrived = false;
     uint32_t arrivedSinceMs = 0;
+    const char* faultReason = nullptr;
+    bool progressInit = false;
+    float progressX = 0;
+    float progressY = 0;
+    uint32_t progressSinceMs = 0;
 
     void reset() {
         wpIdx = 0; running = false; paused = false;
         linearMps = angularRadps = headingErr = crossTrack = distToTarget = 0;
-        turning = false; turnSign = 0; turningSinceMs = 0; turnCooldownUntilMs = 0;
         arrived = false; arrivedSinceMs = 0;
+        faultReason = nullptr;
+        progressInit = false;
+        progressX = progressY = 0;
+        progressSinceMs = 0;
     }
 } g_follow;
 
@@ -68,6 +74,44 @@ static float wrapDeg180Local(float d) {
 // дёргать loop() вручную НЕЛЬЗЯ: будет гонка двух нитей за один Serial2.
 static void serviceMotorFor(uint32_t durationMs) {
     delay(durationMs);
+}
+
+static void followerFault(const char* reason) {
+    g_follow.running = false;
+    g_follow.arrived = false;
+    g_follow.faultReason = reason;
+    g_follow.progressInit = false;
+    g_route.finish();
+    g_motor.stopImmediately();
+}
+
+static bool checkFollowerProgress(const Estimate& e, float commandedSpeed) {
+    uint32_t now = millis();
+    if (!g_safety.allowMotion() || fabsf(commandedSpeed) < ROVER_STUCK_MIN_CMD_MPS) {
+        g_follow.progressInit = false;
+        return true;
+    }
+    if (!g_follow.progressInit) {
+        g_follow.progressInit = true;
+        g_follow.progressX = e.x;
+        g_follow.progressY = e.y;
+        g_follow.progressSinceMs = now;
+        return true;
+    }
+    float dx = e.x - g_follow.progressX;
+    float dy = e.y - g_follow.progressY;
+    float moved = sqrtf(dx * dx + dy * dy);
+    if (moved >= ROVER_STUCK_MIN_MOVE_M || e.speedMps >= ROVER_STUCK_MIN_CMD_MPS) {
+        g_follow.progressX = e.x;
+        g_follow.progressY = e.y;
+        g_follow.progressSinceMs = now;
+        return true;
+    }
+    if ((now - g_follow.progressSinceMs) > ROVER_STUCK_TIMEOUT_MS) {
+        followerFault("stuck_no_progress");
+        return false;
+    }
+    return true;
 }
 
 static void connectWiFi() {
@@ -107,10 +151,16 @@ static void stepFollower() {
     }
     const auto& e = g_est.get();
     int total = g_route.count();
+    NavPoint current{e.x, e.y};
+    if (!g_route.positionAllowed(current, ROVER_BOUNDARY_TOLERANCE_M)) {
+        followerFault("perimeter_violation");
+        return;
+    }
     if (total == 0 || g_follow.wpIdx >= total) {
         g_motor.setLinearAngularSpeed(0, 0, true);
         g_follow.running = false;
         g_follow.arrived = true;
+        g_route.finish();
         return;
     }
 
@@ -137,6 +187,7 @@ static void stepFollower() {
         if (g_follow.wpIdx >= total) {
             g_follow.running = false;
             g_follow.arrived = true;
+            g_route.finish();
             g_motor.setLinearAngularSpeed(0, 0, true);
             return;
         }
@@ -155,10 +206,19 @@ static void stepFollower() {
             float rx = e.x - prevWp->p.x;
             float ry = e.y - prevWp->p.y;
             g_follow.crossTrack = (lineDx * ry - lineDy * rx) / lineLen;
+            if (fabsf(g_follow.crossTrack) > ROVER_CROSSTRACK_HOLD_M) {
+                followerFault("cross_track_limit");
+                return;
+            }
         } else {
             lineDx = dx;
             lineDy = dy;
         }
+    }
+
+    if (!g_route.segmentAllowed(current, wp.p, ROVER_BOUNDARY_TOLERANCE_M, ROVER_BOUNDARY_SAMPLE_M)) {
+        followerFault("route_segment_blocked");
+        return;
     }
 
     // Желаемый курс — вдоль активного сегмента пути (не только на waypoint).
@@ -173,58 +233,36 @@ static void stepFollower() {
     else if (g_safety.level() == SAFETY_HOLD) baseSpeed = 0;
     else if (g_safety.level() == SAFETY_ESTOP) baseSpeed = 0;
 
-    float w = 0;
     float absErr = fabsf(headingErr);
-    uint32_t nowMs = millis();
 
-    // ----- РЕЖИМ 1: разворот на месте (курс сильно не туда) -----
-    // Ключевое отличие от старого кода: гистерезис (входим >ENTER, выходим <EXIT — без дёрганья)
-    // и угловая скорость, ПРОПОРЦИОНАЛЬНАЯ ошибке, но с ПОЛОМ выше трения гусениц.
-    if (!g_follow.turning &&
-        nowMs >= g_follow.turnCooldownUntilMs &&
-        absErr > ROVER_TURN_IN_PLACE_ENTER_DEG) {
-        g_follow.turning = true;
-        g_follow.turnSign = (headingErr >= 0) ? 1 : -1;
-        g_follow.turningSinceMs = nowMs;
-    }
-    if (g_follow.turning && absErr < ROVER_TURN_IN_PLACE_EXIT_DEG) {
-        g_follow.turning = false;
-        g_follow.turnSign = 0;
-        g_follow.turningSinceMs = 0;
-    }
-    if (g_follow.turning &&
-        g_follow.turningSinceMs != 0 &&
-        (nowMs - g_follow.turningSinceMs) > ROVER_TURN_IN_PLACE_TIMEOUT_MS) {
-        g_follow.turning = false;
-        g_follow.turnSign = 0;
-        g_follow.turningSinceMs = 0;
-        g_follow.turnCooldownUntilMs = nowMs + ROVER_TURN_IN_PLACE_COOLDOWN_MS;
-    }
+    // ===== GPS-only рулёжка: ВСЕГДА едем вперёд, поворот по ДУГЕ =====
+    // Курс берётся только из GPS motion heading и обновляется лишь когда робот ДВИЖЕТСЯ.
+    // Поэтому разворот на месте невозможен: стоя, робот не узнает, что повернулся, и
+    // крутился бы вечно. Вместо этого всегда даём линейную скорость (робот едет),
+    // а большую ошибку курса отрабатываем угловой скоростью — получается поворот по дуге,
+    // во время которого GPS-курс набирается и ошибка естественно уменьшается.
+    // (Эталон поведения: OpenMower/Sunray на одной GPS-антенне.)
 
-    if (g_follow.turning) {
-        baseSpeed = 0;
-        // w пропорциональна ошибке, но не ниже MIN (пробить трение) и не выше MAX.
-        float mag = ROVER_K_HEADING * (absErr * M_PI / 180.0f);
-        mag = clampf(mag, ROVER_TURN_MIN_RADPS, ROVER_MAX_ANGULAR_RADPS);
-        int8_t sign = g_follow.turnSign != 0 ? g_follow.turnSign : ((headingErr >= 0) ? 1 : -1);
-        w = sign * mag;   // + = по часовой
-    } else {
-        // ----- РЕЖИМ 2: движение со Stanley-рулёжкой -----
-        // Притормаживаем у цели и при большой ошибке курса (плавнее на змейке).
-        if (dist < 0.30f)      baseSpeed *= 0.35f;
-        else if (dist < 0.60f) baseSpeed *= 0.65f;
-        baseSpeed *= clampf(1.0f - absErr / 90.0f, 0.25f, 1.0f);
+    // Притормаживаем у цели — но НЕ до нуля, иначе курс перестанет набираться.
+    if (dist < 0.30f)      baseSpeed *= 0.45f;
+    else if (dist < 0.60f) baseSpeed *= 0.70f;
+    // При большой ошибке курса едем медленнее (круче дуга), но сохраняем ход вперёд:
+    // пол 0.35 гарантирует, что робот всё равно движется и GPS обновляет курс.
+    baseSpeed *= clampf(1.0f - absErr / 120.0f, 0.35f, 1.0f);
 
-        // Stanley: руль = ошибка курса + atan(k*crossTrack / (soft + v))
-        float headingTerm = ROVER_K_HEADING * headingErr * M_PI / 180.0f;
-        float crosstrackTerm = atan2f(ROVER_K_CROSSTRACK * g_follow.crossTrack,
-                                      ROVER_STANLEY_SOFT_SPEED + fabsf(baseSpeed));
-        w = headingTerm + crosstrackTerm;
-    }
+    // Угловая скорость: ошибка курса (P-регулятор) + Stanley cross-track.
+    float headingTerm = ROVER_K_HEADING * headingErr * M_PI / 180.0f;
+    float crosstrackTerm = atan2f(ROVER_K_CROSSTRACK * g_follow.crossTrack,
+                                  ROVER_STANLEY_SOFT_SPEED + fabsf(baseSpeed));
+    float w = headingTerm + crosstrackTerm;
     w = clampf(w, -ROVER_MAX_ANGULAR_RADPS, ROVER_MAX_ANGULAR_RADPS);
     g_follow.linearMps   = baseSpeed;
     g_follow.angularRadps = w;
     g_follow.distToTarget = dist;
+
+    if (!checkFollowerProgress(e, baseSpeed)) {
+        return;
+    }
 
     if (g_safety.allowMotion()) {
         g_motor.setLinearAngularSpeed(baseSpeed, w, true);
@@ -308,9 +346,19 @@ void loop() {
     si.pDop         = g_est.get().pDop;
     si.hAcc         = g_est.get().hAcc;
     si.pvtAgeMs     = g_est.get().pvtAgeMs;
+    si.acceptedPositionAgeMs = g_est.get().acceptedPositionAgeMs;
+    si.headingAgeMs = g_est.get().headingAgeMs;
+    si.rejectedPositionFixes = g_est.get().rejectedPositionFixes;
     si.originLocked = g_est.get().originSet;
     si.routeReady   = g_route.isReady();
     g_safety.tick(now, si, g_est, g_imu);
+    if (!g_safety.allowMotion()) {
+        g_motor.stopImmediately();
+    }
+
+    if (!g_ws.navRequested()) {
+        g_follow.faultReason = nullptr;
+    }
 
     if (g_ws.navRequested() && g_route.isRunning()) {
         if (!g_follow.running) {
@@ -321,7 +369,10 @@ void loop() {
     }
 
     NavStateOut nso;
-    if (g_safety.level() == SAFETY_ESTOP) {
+    if (g_follow.faultReason != nullptr) {
+        nso.state = NavStateOut::ERROR;
+        nso.errorReason = g_follow.faultReason;
+    } else if (g_safety.level() == SAFETY_ESTOP || g_safety.level() == SAFETY_HOLD) {
         nso.state = NavStateOut::ERROR;
         nso.errorReason = g_safety.reason();
     } else if (!g_route.isRunning() && g_route.isReady() && g_follow.arrived) {

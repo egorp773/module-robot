@@ -49,22 +49,30 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
             set(SAFETY_HOLD, "no_route");
             return;
         }
+        if (in.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {
+            set(SAFETY_HOLD, "position_stale");
+            return;
+        }
+        if (in.rejectedPositionFixes > 0) {
+            set(SAFETY_HOLD, "gps_jump");
+            return;
+        }
+        if (in.headingAgeMs > SAFE_HEADING_AGE_MS) {
+            set(SAFETY_HOLD, "heading_stale");
+            return;
+        }
         if (in.sol == SOL_INVALID) {
             set(SAFETY_HOLD, "rtk_invalid");
             return;
         }
         if (in.sol == SOL_FIXED) {
             if (in.hAcc > SAFE_HACC_FIXED_M) {
-                set(SAFETY_DEGRADED, "rtk_fixed_but_hacc");
+                set(SAFETY_HOLD, "rtk_fixed_hacc_gt_2cm");
             } else {
                 set(SAFETY_OK, "rtk_fixed");
             }
         } else if (in.sol == SOL_FLOAT) {
-            if (in.hAcc <= SAFE_HACC_FIXED_M) {
-                set(SAFETY_DEGRADED, "rtk_float_accurate");
-            } else {
-                set(SAFETY_HOLD, "rtk_float_hacc");
-            }
+            set(SAFETY_HOLD, "rtk_float_wait_fixed");
         }
         return;
     }

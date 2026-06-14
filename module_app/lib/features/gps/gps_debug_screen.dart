@@ -646,12 +646,9 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       setState(() => _notice = 'Нет связи с роботом');
       return;
     }
-    ref
-        .read(wifiConnectionProvider.notifier)
-        .sendGoToTarget(_savedTarget!.lat, _savedTarget!.lon);
     setState(() {
-      _navActive = true;
-      _notice = 'Отправляю команду GO_TO...';
+      _navActive = false;
+      _notice = 'GO_TO disabled: build and send a boundary route in Auto mode';
     });
   }
 
@@ -682,7 +679,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
       target.lon,
     );
     ref.read(wifiConnectionProvider.notifier).sendRaw(
-          'CAL_IMU,${bearing.toStringAsFixed(1)}',
+          'SET_HEADING,${bearing.toStringAsFixed(1)}',
         );
     setState(
         () => _notice = 'IMU calibrated to ${bearing.toStringAsFixed(1)} deg');
@@ -886,8 +883,7 @@ class _GpsDebugScreenState extends ConsumerState<GpsDebugScreen> {
   static bool _rtkUsable(WifiConnectionState wifi) {
     final carrier = wifi.gpsCarrier?.toLowerCase();
     final hAcc = wifi.gpsAccuracy;
-    return carrier == 'fixed' ||
-        (carrier == 'float' && hAcc != null && hAcc <= 50);
+    return carrier == 'fixed' && hAcc != null && hAcc <= 20;
   }
 
   static double _distanceM(double lat1, double lon1, double lat2, double lon2) {

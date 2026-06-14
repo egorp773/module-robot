@@ -25,6 +25,7 @@ void Motor::begin(HardwareSerial& serial, float wheelBaseM, uint8_t rxPin, uint8
     _enabled = false;
     _lastSendMs = 0;
     _lastSetMs = 0;
+    _commandGeneration = 0;
     _fbIdx = 0; _fbPrev = 0; _fbP = nullptr;
     _haveFeedback = false;
     _batVoltsFilt = 0.0f;
@@ -81,14 +82,15 @@ void Motor::setManualPercent(int leftPct, int rightPct) {
     _targetSteer = st;
     _enabled = true;
     _lastSetMs = millis();
+    _commandGeneration++;
     taskEXIT_CRITICAL(&_mux);
 }
 
 void Motor::setLinearAngularSpeed(float linearMps, float angularRadps, bool useRamp) {
     (void)useRamp;  // slew всегда применяется в loop()
     // diff-drive: v_left = v - w*b/2 ; v_right = v + w*b/2  (м/с)
-    float vL = linearMps - angularRadps * _wheelBase * 0.5f;
-    float vR = linearMps + angularRadps * _wheelBase * 0.5f;
+    float vL = linearMps + angularRadps * _wheelBase * 0.5f;
+    float vR = linearMps - angularRadps * _wheelBase * 0.5f;
     // м/с -> проценты: ROVER_MAX_SPEED_MPS соответствует HOVER_MAX_PERCENT
     float scale = (float)ROVER_AUTO_MAX_PERCENT / ROVER_MAX_SPEED_MPS;
     int leftPct  = (int)roundf(vL * scale);
@@ -106,6 +108,7 @@ void Motor::setLinearAngularSpeed(float linearMps, float angularRadps, bool useR
     _targetSteer = st;
     _enabled = true;
     _lastSetMs = millis();
+    _commandGeneration++;
     taskEXIT_CRITICAL(&_mux);
 }
 
@@ -115,6 +118,7 @@ void Motor::stopImmediately() {
     _cmdSpeed = _cmdSteer = 0;
     _curLeftPct = _curRightPct = 0;
     _lastSetMs = millis();
+    _commandGeneration++;
     taskEXIT_CRITICAL(&_mux);
     if (_serial) sendHover(0, 0);
 }
@@ -143,6 +147,9 @@ void Motor::loop(uint32_t nowMs) {
     int16_t  tgtSteer = _targetSteer;
     bool     en       = _enabled;
     uint32_t lastSet  = _lastSetMs;
+    int16_t  cmdSpeed = _cmdSpeed;
+    int16_t  cmdSteer = _cmdSteer;
+    uint32_t generation = _commandGeneration;
     taskEXIT_CRITICAL(&_mux);
 
     // failsafe: давно не было новой команды -> цель в ноль (плавно через slew)
@@ -152,9 +159,18 @@ void Motor::loop(uint32_t nowMs) {
     }
 
     // slew к цели в домене команды (сглаживание как в sound.ino)
-    _cmdSpeed = slewToward(_cmdSpeed, tgtSpeed, HOVER_SLEW_SPEED);
-    _cmdSteer = slewToward(_cmdSteer, tgtSteer, HOVER_SLEW_STEER);
-    sendHover(_cmdSteer, _cmdSpeed);
+    int16_t nextSpeed = slewToward(cmdSpeed, tgtSpeed, HOVER_SLEW_SPEED);
+    int16_t nextSteer = slewToward(cmdSteer, tgtSteer, HOVER_SLEW_STEER);
+    taskENTER_CRITICAL(&_mux);
+    if (generation == _commandGeneration) {
+        _cmdSpeed = nextSpeed;
+        _cmdSteer = nextSteer;
+    } else {
+        nextSpeed = _cmdSpeed;
+        nextSteer = _cmdSteer;
+    }
+    taskEXIT_CRITICAL(&_mux);
+    sendHover(nextSteer, nextSpeed);
     _sendCount++;
 }
 

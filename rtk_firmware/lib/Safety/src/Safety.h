@@ -23,6 +23,9 @@ struct SafetyInput {
     float pDop = 99;
     float hAcc = 999;
     uint32_t pvtAgeMs = 0xFFFFFFFFu;
+    uint32_t acceptedPositionAgeMs = 0xFFFFFFFFu;
+    uint32_t headingAgeMs = 0xFFFFFFFFu;
+    uint16_t rejectedPositionFixes = 0;
     bool originLocked = false;
     bool routeReady = false;
 };

@@ -33,8 +33,12 @@
 #define RTCM_UDP_FALLBACK 2103
 
 // ---------------- Base/rover behaviour ----------------
-#define BASE_SURVEY_ACC_M   2.0f
-#define BASE_SURVEY_MIN_S   60
+// Survey-In: ПРОВЕРЕННЫЕ значения из старой рабочей версии (до рерайта c455a76), когда
+// RTK FIXED работал: точность 1.0м / минимум 300с. Codex сломал, поставив 12м → база
+// фиксировалась за 0.7с с ошибкой 8м. 3см не сходится вообще (Survey-In логарифмический).
+// Для FIXED абсолютная точность базы не критична — RTK относителен; важна стабильность.
+#define BASE_SURVEY_ACC_M   1.0f
+#define BASE_SURVEY_MIN_S   300
 #define BASE_TCP_RX_TIMEOUT_MS 4000
 
 // ---------------- Hoverboard motor protocol (эталон: sound.ino, рабочий) ----------------
@@ -54,9 +58,16 @@
 #define ROVER_MAX_PWM       70
 #define ROVER_INPUT_DIV     2
 #define ROVER_CMD_TIMEOUT_MS 400
-#define ROVER_AUTO_MAX_PERCENT 16
+// Скорость автономки = ручной 16%. Расчёт: ручной M,16 → /ROVER_INPUT_DIV(2) = 8% →
+// pctToHover(8,8) = 8*2*300/(2*70) = команда платы 34/300. Чтобы автономка на полном ходу
+// давала ту же команду 34, нужно leftPct=8 при baseSpeed=ROVER_MAX_SPEED_MPS:
+//   scale = ROVER_AUTO_MAX_PERCENT / ROVER_MAX_SPEED_MPS = 8 / 0.25 = 32
+//   baseSpeed 0.25 * 32 = 8 → pctToHover(8,8) = 34. Совпадает с ручным 16%.
+#define ROVER_AUTO_MAX_PERCENT 8
 #define ROVER_MAX_SPEED_MPS  0.25f
-#define ROVER_FLOAT_SPEED    0.12f
+// FLOAT едет с той же скоростью что и FIXED (на FLOAT hAcc уже ~2см, безопасно) —
+// чтобы автономка ехала одинаково как ручной 16% независимо от RTK-режима.
+#define ROVER_FLOAT_SPEED    0.25f
 #define ROVER_DEGRADED_SPEED 0.07f
 #define ROVER_HOLD_SPEED     0.03f
 #define ROVER_INITIAL_HEADING_DEG 176.0f  // физ. старт-курс робота (выставлен на улице)
@@ -81,6 +92,12 @@
 #define ROVER_HANDOFF_FRAC    0.10f   // handoff = segLen * this
 #define ROVER_HANDOFF_MAX_M   0.30f
 #define ROVER_HANDOFF_MIN_M   0.08f
+#define ROVER_BOUNDARY_TOLERANCE_M 0.15f
+#define ROVER_BOUNDARY_SAMPLE_M    0.10f
+#define ROVER_CROSSTRACK_HOLD_M    0.60f
+#define ROVER_STUCK_TIMEOUT_MS     4000u
+#define ROVER_STUCK_MIN_CMD_MPS    0.05f
+#define ROVER_STUCK_MIN_MOVE_M     0.05f
 
 // ---------------- Telemetry period ----------------
 #define TEL_PERIOD_MS       200
@@ -92,10 +109,12 @@
 // ---------------- Safety thresholds ----------------
 #define SAFE_RTK_AGE_MS    5000
 #define SAFE_PVT_AGE_MS    1000
+#define SAFE_ACCEPTED_POS_AGE_MS 1500
+#define SAFE_HEADING_AGE_MS 1500
 #define SAFE_IMU_AGE_MS     200
 #define SAFE_NAV_TIMEOUT_MS 8000
-#define SAFE_HACC_FIXED_M  0.05f
-#define SAFE_HACC_FLOAT_M  0.20f
+#define SAFE_HACC_FIXED_M  0.02f
+#define SAFE_HACC_FLOAT_M  0.02f
 #define SAFE_HACC_HOLD_M   1.00f
 #define SAFE_NUM_SV         10
 #define SAFE_PDOP_MAX       4.0

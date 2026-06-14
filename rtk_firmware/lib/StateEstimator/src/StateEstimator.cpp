@@ -11,9 +11,13 @@ void StateEstimator::begin() {
     est.pvtAgeMs   = 0xFFFFFFFFu;
     est.rtcmAgeMs  = 0xFFFFFFFFu;
     est.headingAgeMs = 0xFFFFFFFFu;
+    est.acceptedPositionAgeMs = 0xFFFFFFFFu;
+    est.rejectedPositionFixes = 0;
     _headingSeeded = false;
     _lastImuMs = 0;
     _haveLastFix = false;
+    _lastAcceptedPositionMs = 0;
+    _lastHeadingMs = 0;
 }
 
 float StateEstimator::normalizeDeg360(float d) {
@@ -45,33 +49,41 @@ bool StateEstimator::setOrigin(double lat, double lon) {
     est.originLat = lat;
     est.originLon = lon;
     est.originSet = true;
-    est.x = est.y = 0;
+    if (est.lat != 0.0 || est.lon != 0.0) {
+        float lx, ly;
+        llaToLocalMeters(est.lat, est.lon, est.originLat, est.originLon, lx, ly);
+        est.x = lx;
+        est.y = ly;
+    } else {
+        est.x = est.y = 0;
+    }
     return true;
 }
 
 void StateEstimator::seedHeadingDeg(float headingDeg) {
+    uint32_t nowMs = millis();
     float h = normalizeDeg360(headingDeg);
     est.headingDeg = h;
     est.headingFiltDeg = h;
     est.headingValid = true;
+    est.acceptedPositionAgeMs = (_lastAcceptedPositionMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastAcceptedPositionMs);
+    est.headingAgeMs = (_lastHeadingMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastHeadingMs);
+    _lastHeadingMs = nowMs;
     est.headingAgeMs = 0;
     _headingSeeded = true;
 }
 
-// --- IMU: интегрируем yaw rate в краткосрочный курс ---
+// --- IMU: НЕ участвует в курсе (GPS-only heading) ---
+// Раньше здесь интегрировался yaw rate гироскопа в курс. Это давало крутку на месте:
+// при неверной калибровке знака/дрейфе BNO085 курс «убегал», ошибка курса росла,
+// робот бесконечно разворачивался. Курс теперь берём ТОЛЬКО из GPS motion heading
+// (см. onPvt). IMU оставлен для будущего tilt-детекта, но в навигацию не вмешивается.
+// Эталон: коммит 5917838 "Use GPS-only heading: remove IMU from navigation".
 void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh) {
+    (void)yawRateDps;
     if (!imuFresh) { _lastImuMs = nowMs; return; }
-    if (_lastImuMs == 0) { _lastImuMs = nowMs; return; }
-    float dt = (nowMs - _lastImuMs) * 0.001f;
     _lastImuMs = nowMs;
-    if (dt <= 0 || dt > 0.5f) return;   // защита от выбросов dt
-
-    if (!_headingSeeded) return;        // пока нет абсолютного нуля — не интегрируем
-
-    // интеграция gyro — даёт быстрый курс даже на месте (то, чего не было раньше)
-    est.headingFiltDeg = normalizeDeg360(est.headingFiltDeg + yawRateDps * dt);
-    est.headingValid = true;
-    est.headingAgeMs = 0;
+    // курс НЕ трогаем — он живёт за счёт GPS-курса (onPvt) и замораживается на месте
 }
 
 void StateEstimator::onPvt(uint32_t nowMs,
@@ -120,6 +132,9 @@ void StateEstimator::onPvt(uint32_t nowMs,
         _lastFixLat = newLat;
         _lastFixLon = newLon;
         _lastFixMs = nowMs;
+        _lastAcceptedPositionMs = nowMs;
+        est.acceptedPositionAgeMs = 0;
+        est.rejectedPositionFixes = 0;
         _haveLastFix = true;
         if (est.originSet) {
             float lx, ly;
@@ -127,24 +142,36 @@ void StateEstimator::onPvt(uint32_t nowMs,
             est.x = lx;
             est.y = ly;
         }
+    } else {
+        if (est.rejectedPositionFixes < 0xFFFFu) est.rejectedPositionFixes++;
     }
     // если outlier — позицию НЕ двигаем (dead-reckoning держит прошлую), но fix-метку обновили выше нет
 
-    // --- GPS-course коррекция курса (только при движении) ---
-    est.headingDeg = (float)headMot_deg_e5 * 1e-5f;   // сырой GPS-курс (для телеметрии)
+    // --- Курс ТОЛЬКО из GPS motion heading (GPS-only, без IMU) ---
+    // При движении курс = направление вектора скорости GPS (headMot). Это единственный
+    // источник курса. При стоянии (speed <= порог) курс ЗАМОРАЖИВАЕТСЯ (держим последний),
+    // никакого гиро-интеграла — иначе крутка на месте. Лёгкое сглаживание по GPS-курсу,
+    // чтобы шум headMot на низкой скорости не дёргал руль.
+    est.headingDeg = (float)headMot_deg_e5 * 1e-5f;   // сырой GPS-курс
     est.headingDeg = normalizeDeg360(est.headingDeg);
-    if (est.speedMps > kGpsHeadingMinMps && est.sol != SOL_INVALID && accept) {
+    if (est.speedMps > kGpsHeadingMinMpsActive && est.sol != SOL_INVALID && accept) {
         if (!_headingSeeded) {
-            // первый надёжный курс — сидим абсолютный ноль
+            // первый надёжный курс — берём как есть
             seedHeadingDeg(est.headingDeg);
         } else {
-            // комплементарно подтягиваем gyro-интеграл к GPS-курсу
+            // лёгкое сглаживание к GPS-курсу (быстрое — это и есть наш курс)
             float d = wrapDeg180(est.headingDeg - est.headingFiltDeg);
-            est.headingFiltDeg = normalizeDeg360(est.headingFiltDeg + kGpsCourseAlpha * d);
+            if (fabsf(d) > kGpsHeadingSnapDeg) {
+                est.headingFiltDeg = est.headingDeg;
+            } else {
+                est.headingFiltDeg = normalizeDeg360(est.headingFiltDeg + kGpsCourseAlphaActive * d);
+            }
         }
         est.headingValid = true;
         est.headingAgeMs = 0;
+        _lastHeadingMs = nowMs;
     }
+    // при стоянии — est.headingFiltDeg не меняется (заморожен на последнем GPS-курсе)
 
     est.lastUpdateMs = nowMs;
 }
@@ -158,7 +185,8 @@ void StateEstimator::tick(uint32_t nowMs) {
     uint32_t p = nowMs - est.lastUpdateMs;
     est.pvtAgeMs = p;
     // heading теперь живёт за счёт gyro-интеграла (onImu), не «протухает» на месте
-    est.headingAgeMs = 0;
+    est.acceptedPositionAgeMs = (_lastAcceptedPositionMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastAcceptedPositionMs);
+    est.headingAgeMs = (_lastHeadingMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastHeadingMs);
     if (est.rtcmAgeMs != 0xFFFFFFFFu) {
         est.rtcmAgeMs = p;
     }

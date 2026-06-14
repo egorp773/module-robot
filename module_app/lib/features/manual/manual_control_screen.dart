@@ -277,8 +277,8 @@ class ManualMapController extends StateNotifier<ManualMapState> {
     final carrier = wifi.gpsCarrier?.toLowerCase();
     final fresh = wifi.gpsReceivedAt != null &&
         DateTime.now().difference(wifi.gpsReceivedAt!).inMilliseconds < 2500;
-    final accurate = hAccMm != null && hAccMm <= 50;
-    final rtkUsable = carrier == 'fixed' || (carrier == 'float' && accurate);
+    final accurate = hAccMm != null && hAccMm <= 20;
+    final rtkUsable = carrier == 'fixed' && accurate;
     return wifi.isConnected &&
         fresh &&
         rtkUsable &&
@@ -548,8 +548,7 @@ class ManualMapController extends StateNotifier<ManualMapState> {
     if (!_gpsReady(wifi)) {
       ref.read(noticeProvider.notifier).show(const NoticeState(
             title: 'RTK not ready',
-            message:
-                'Wait for RTK fixed, or float with hAcc <= 5 cm, before recording.',
+            message: 'Wait for RTK fixed with hAcc <= 2 cm before recording.',
             kind: NoticeKind.warning,
           ));
       return;
@@ -2092,10 +2091,10 @@ class _RtkStatusPanel extends StatelessWidget {
     double u(double v) => v * uiScale;
     final fresh = wifi.gpsReceivedAt != null &&
         DateTime.now().difference(wifi.gpsReceivedAt!).inMilliseconds < 2500;
-    final hAccOk = wifi.gpsAccuracy != null && wifi.gpsAccuracy! <= 50;
+    final hAccOk = wifi.gpsAccuracy != null && wifi.gpsAccuracy! <= 20;
     final carrier = wifi.gpsCarrier?.toLowerCase();
     final fixed = fresh && carrier == 'fixed';
-    final usable = fixed || (fresh && carrier == 'float' && hAccOk);
+    final usable = fixed && hAccOk;
     final hAccText = wifi.gpsAccuracy == null
         ? 'hAcc -'
         : 'hAcc ${(wifi.gpsAccuracy! / 10).round() / 100} m';
@@ -2119,7 +2118,7 @@ class _RtkStatusPanel extends StatelessWidget {
               child: Text(
                 usable
                     ? 'RTK usable - map records robot GPS'
-                    : 'Waiting RTK <= 5 cm',
+                    : 'Waiting RTK <= 2 cm',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(

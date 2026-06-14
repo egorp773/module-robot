@@ -32,6 +32,8 @@ struct Estimate {
     uint32_t pvtAgeMs   = 0xFFFFFFFFu;
     uint32_t rtcmAgeMs  = 0xFFFFFFFFu;
     uint32_t headingAgeMs = 0xFFFFFFFFu;
+    uint32_t acceptedPositionAgeMs = 0xFFFFFFFFu;
+    uint16_t rejectedPositionFixes = 0;
     // filtered position (local x,y) — для nav
     float   x = 0, y = 0;
     // filtered heading (low-pass, freeze when stationary)
@@ -80,6 +82,9 @@ public:
 
 private:
     Estimate est;
+    static constexpr float kGpsCourseAlphaActive = 0.30f;
+    static constexpr float kGpsHeadingMinMpsActive = 0.03f;
+    static constexpr float kGpsHeadingSnapDeg = 45.0f;
     // Комплементарный фильтр курса (Sunray-style, Вариант A):
     //   fused = integrate(gyro) ; при движении подтягиваем к GPS-course с этим alpha.
     static constexpr float kGpsCourseAlpha   = 0.05f;   // доля коррекции по GPS-курсу за PVT
@@ -96,4 +101,6 @@ private:
     bool     _haveLastFix = false;
     double   _lastFixLat = 0, _lastFixLon = 0;
     uint32_t _lastFixMs = 0;
+    uint32_t _lastAcceptedPositionMs = 0;
+    uint32_t _lastHeadingMs = 0;
 };

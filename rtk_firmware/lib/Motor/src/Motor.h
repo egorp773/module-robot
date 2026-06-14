@@ -103,6 +103,8 @@ private:
     uint32_t _startupHoldUntilMs = 0;                // первые N мс не слать (плата FOC стартует)
     uint32_t _sendCount = 0;                         // счётчик отправленных пакетов (диагностика 50Гц)
 
+    uint32_t _commandGeneration = 0;
+
     // feedback parser
     HoverFeedback _fb{};
     HoverFeedback _fbNew{};

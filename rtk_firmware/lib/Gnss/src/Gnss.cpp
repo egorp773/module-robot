@@ -60,11 +60,23 @@ bool Gnss::begin(HardwareSerial& serial, GnssRole role) {
     _gnss.setNavigationFrequency(_role == GNSS_ROVER ? 5 : 1);
 
     if (_role == GNSS_ROVER) {
+        bool inOk = _gnss.setPortInput(COM_PORT_UART1, COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_RTCM3);
+        bool outOk = _gnss.setUART1Output(COM_TYPE_UBX);
+        Serial.printf("[GNSS] rover UART1 input UBX/NMEA/RTCM3=%d output UBX=%d\n",
+                      inOk ? 1 : 0, outOk ? 1 : 0);
         _gnss.setAutoPVT(true);
+        enableRoverRtcmStatus();
     }
 
     if (_role == GNSS_BASE) {
-        _gnss.setSurveyMode(1, 60, 2.0);
+        bool inOk = _gnss.setPortInput(COM_PORT_UART1, COM_TYPE_UBX | COM_TYPE_NMEA);
+        // ВАЖНО: на выходе нужен RTCM3 (для форвардинга) И UBX (иначе getSurveyStatus /
+        // CFG-ACK не возвращаются → waitSurveyIn вечно в таймауте, setSurveyMode/
+        // enableRTCMmessage не подтверждаются). RTCM-фильтр в base.cpp отсеет UBX по CRC.
+        bool outOk = _gnss.setUART1Output(COM_TYPE_RTCM3 | COM_TYPE_UBX);
+        Serial.printf("[GNSS] base UART1 input UBX/NMEA=%d output RTCM3+UBX=%d\n",
+                      inOk ? 1 : 0, outOk ? 1 : 0);
+        _gnss.setSurveyMode(1, BASE_SURVEY_MIN_S, BASE_SURVEY_ACC_M);
         _svinStartMs = millis();
         _surveyInProgress = true;
 
@@ -144,6 +156,21 @@ void Gnss::captureNavPvtPayload(const uint8_t *p, uint16_t len) {
     _lastPvtITow = iTOW;
 }
 
+void Gnss::captureRxmRtcmPayload(const uint8_t *p, uint16_t len) {
+    if (len < 8) return;
+
+    const bool crcFailed = (p[1] & 0x01) != 0;
+    _rtcm.lastType = rdU16(p + 6);
+    if (crcFailed) {
+        _rtcm.crcFail++;
+        return;
+    }
+
+    _rtcm.msgCount++;
+    _rtcm.lastRxMs = millis();
+    _rtcm.active = true;
+}
+
 void Gnss::parseRoverUbxByte(uint8_t b) {
     auto ck = [&](uint8_t v) { _ubxCkA += v; _ubxCkB += _ubxCkA; };
     switch (_ubxState) {
@@ -173,8 +200,12 @@ void Gnss::parseRoverUbxByte(uint8_t b) {
             else _ubxState = UBX_SYNC1;
             break;
         case UBX_CKB:
-            if (b == _ubxCkB && _ubxClass == 0x01 && _ubxId == 0x07) {
-                captureNavPvtPayload(_ubxPayload, _ubxLen);
+            if (b == _ubxCkB) {
+                if (_ubxClass == 0x01 && _ubxId == 0x07) {
+                    captureNavPvtPayload(_ubxPayload, _ubxLen);
+                } else if (_ubxClass == 0x02 && _ubxId == 0x32) {
+                    captureRxmRtcmPayload(_ubxPayload, _ubxLen);
+                }
             }
             _ubxState = UBX_SYNC1;
             break;
@@ -205,4 +236,43 @@ uint32_t Gnss::pvtAgeMs(uint32_t nowMs) const {
     if (_lastPvtMs == 0) return 0xFFFFFFFFu;
     if (nowMs < _lastPvtMs) return 0;
     return nowMs - _lastPvtMs;
+}
+
+void Gnss::sendUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
+    if (!_serial) return;
+
+    uint8_t ckA = 0;
+    uint8_t ckB = 0;
+    auto add = [&](uint8_t v) {
+        _serial->write(v);
+        ckA += v;
+        ckB += ckA;
+    };
+
+    _serial->write(0xB5);
+    _serial->write(0x62);
+    add(cls);
+    add(id);
+    add((uint8_t)(len & 0xFF));
+    add((uint8_t)(len >> 8));
+    for (uint16_t i = 0; i < len; ++i) add(payload[i]);
+    _serial->write(ckA);
+    _serial->write(ckB);
+}
+
+void Gnss::enableRoverRtcmStatus() {
+    if (!_serial || _role != GNSS_ROVER) return;
+
+    // UBX-CFG-MSG: enable UBX-RXM-RTCM (class 0x02, id 0x32) on UART1.
+    const uint8_t payload[] = {
+        0x02, 0x32, // msgClass, msgID
+        0x00,       // I2C/DDC rate
+        0x01,       // UART1 rate
+        0x00,       // UART2 rate
+        0x00,       // USB rate
+        0x00,       // SPI rate
+        0x00        // reserved
+    };
+    sendUbx(0x06, 0x01, payload, sizeof(payload));
+    Serial.println("[GNSS] rover UBX-RXM-RTCM status enabled on UART1");
 }

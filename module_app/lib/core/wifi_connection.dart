@@ -476,7 +476,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   int _reconnectAttempt = 0;
 
   Completer<void>? _pongWaiter;
-  Completer<void>? _routeAckWaiter;
+  Completer<String>? _routeAckWaiter;
   static const Duration _routeAckTimeout = Duration(milliseconds: 500);
 
   Uri get _wsUri => Uri.parse("ws://$_host:$_port/ws");
@@ -927,12 +927,11 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                   navWpIndex: wpIdx,
                   navWpTotal: wpTotal,
                   navDistToWp: distToWp,
-                  movementProgressRate:
-                      parts.length > 5 ? double.tryParse(parts[5]) : null,
+                  movementProgressRate: null,
                   movementCrossTrack:
                       parts.length > 6 ? double.tryParse(parts[6]) : null,
-                  movementStatus: parts.length > 7 && parts[7].trim().isNotEmpty
-                      ? parts[7].trim()
+                  movementStatus: parts.length > 9 && parts[9].trim().isNotEmpty
+                      ? parts[9].trim()
                       : null,
                 );
               }
@@ -944,7 +943,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
           // Generic OK/ERR responses from rover (route acks, nav ack, etc.)
           if (msgStr.startsWith("OK")) {
             if (_routeAckWaiter != null && !_routeAckWaiter!.isCompleted) {
-              _routeAckWaiter!.complete();
+              _routeAckWaiter!.complete(msgStr);
               _routeAckWaiter = null;
             }
           }
@@ -1199,6 +1198,30 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     sendRaw("AREA_END");
   }
 
+  Future<void> _sendRouteAcked(String line, String label) async {
+    if (!state.isConnected) {
+      throw StateError('not connected');
+    }
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final completer = Completer<String>();
+      _routeAckWaiter = completer;
+      sendRaw(line);
+      try {
+        await completer.future.timeout(_routeAckTimeout);
+        _routeAckWaiter = null;
+        return;
+      } catch (e) {
+        _routeAckWaiter = null;
+        if (attempt < 2) {
+          _log("× $label ack timeout, retry ${attempt + 1}/3");
+        } else {
+          _log("× $label failed after 3 attempts");
+          rethrow;
+        }
+      }
+    }
+  }
+
   Future<void> sendRouteBegin(
     int count, {
     required double originLat,
@@ -1208,7 +1231,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       throw StateError('not connected');
     }
     for (var attempt = 0; attempt < 3; attempt++) {
-      final completer = Completer<void>();
+      final completer = Completer<String>();
       _routeAckWaiter = completer;
       sendRaw(
         "ROUTE_BEGIN,$count,${originLat.toStringAsFixed(8)},"
@@ -1235,7 +1258,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       throw StateError('not connected');
     }
     for (var attempt = 0; attempt < 3; attempt++) {
-      final completer = Completer<void>();
+      final completer = Completer<String>();
       _routeAckWaiter = completer;
       sendRaw(
         "ROUTE_WP,$index,${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
@@ -1256,16 +1279,19 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     }
   }
 
-  Future<void> sendRouteEnd() async {
+  Future<void> sendRouteEnd(int expectedCount) async {
     if (!state.isConnected) {
       throw StateError('not connected');
     }
     for (var attempt = 0; attempt < 3; attempt++) {
-      final completer = Completer<void>();
+      final completer = Completer<String>();
       _routeAckWaiter = completer;
       sendRaw("ROUTE_END");
       try {
-        await completer.future.timeout(_routeAckTimeout);
+        final ack = await completer.future.timeout(_routeAckTimeout);
+        if (ack != "OK,ROUTE,$expectedCount") {
+          throw StateError("unexpected ROUTE_END ack: $ack");
+        }
         _routeAckWaiter = null;
         return;
       } catch (e) {
@@ -1280,9 +1306,33 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     }
   }
 
-  void sendForbiddenBegin(int polygonCount) {
+  Future<void> sendRouteBoundaryBegin(int count) async {
+    await _sendRouteAcked(
+        "ROUTE_BOUNDARY_BEGIN,$count", "ROUTE_BOUNDARY_BEGIN");
+  }
+
+  Future<void> sendRouteBoundaryPoint(
+    int index,
+    double xMeters,
+    double yMeters,
+  ) async {
+    await _sendRouteAcked(
+      "ROUTE_BOUNDARY_PT,$index,${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
+      "ROUTE_BOUNDARY_PT $index",
+    );
+  }
+
+  Future<void> sendRouteBoundaryEnd() async {
+    await _sendRouteAcked("ROUTE_BOUNDARY_END", "ROUTE_BOUNDARY_END");
+  }
+
+  void sendForbiddenBegin(int polygonCount,
+      [List<int> pointCounts = const []]) {
     if (!state.isConnected) return;
-    sendRaw("FORBID_BEGIN,$polygonCount");
+    final suffix = pointCounts.isEmpty
+        ? ''
+        : ',${pointCounts.map((v) => v.toString()).join(',')}';
+    sendRaw("FORBID_BEGIN,$polygonCount$suffix");
   }
 
   void sendForbiddenPoint(
@@ -1301,6 +1351,33 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   void sendForbiddenEnd() {
     if (!state.isConnected) return;
     sendRaw("FORBID_END");
+  }
+
+  Future<void> sendForbiddenBeginAck(
+    int polygonCount,
+    List<int> pointCounts,
+  ) async {
+    final suffix = pointCounts.isEmpty
+        ? ''
+        : ',${pointCounts.map((v) => v.toString()).join(',')}';
+    await _sendRouteAcked("FORBID_BEGIN,$polygonCount$suffix", "FORBID_BEGIN");
+  }
+
+  Future<void> sendForbiddenPointAck(
+    int polygonIndex,
+    int pointIndex,
+    double xMeters,
+    double yMeters,
+  ) async {
+    await _sendRouteAcked(
+      "FORBID_PT,$polygonIndex,$pointIndex,"
+          "${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
+      "FORBID_PT $polygonIndex/$pointIndex",
+    );
+  }
+
+  Future<void> sendForbiddenEndAck() async {
+    await _sendRouteAcked("FORBID_END", "FORBID_END");
   }
 
   /// Navigation commands
@@ -1327,8 +1404,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   /// Simple Go-To navigation: sends single target coordinates
   /// Robot computes local coords and navigates autonomously
   void sendGoToTarget(double lat, double lon) {
-    if (!state.isConnected) return;
-    sendRaw("GO_TO,${lat.toStringAsFixed(8)},${lon.toStringAsFixed(8)}");
+    _log("GO_TO disabled: use boundary route upload");
   }
 
   void clearLog() {

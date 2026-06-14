@@ -18,6 +18,14 @@ struct RtcmStats {
     uint32_t udpFail = 0;
     uint32_t dropped = 0;
     uint32_t crcFail = 0;
+    uint32_t lastType = 0;
+    uint32_t t1005 = 0;
+    uint32_t t1074 = 0;
+    uint32_t t1084 = 0;
+    uint32_t t1094 = 0;
+    uint32_t t1124 = 0;
+    uint32_t t1230 = 0;
+    uint32_t tOther = 0;
 } g_stats;
 
 static uint32_t crc24q(const uint8_t* data, size_t len) {
@@ -116,6 +124,42 @@ private:
 
 RtcmFrameFilter g_rtcmFilter;
 
+static void enableBaseRtcmMessages() {
+    g_gnss.ubx().enableRTCMmessage(UBX_RTCM_1005, COM_PORT_UART1, 1);
+    g_gnss.ubx().enableRTCMmessage(UBX_RTCM_1074, COM_PORT_UART1, 1);
+    g_gnss.ubx().enableRTCMmessage(UBX_RTCM_1084, COM_PORT_UART1, 1);
+    g_gnss.ubx().enableRTCMmessage(UBX_RTCM_1094, COM_PORT_UART1, 1);
+    g_gnss.ubx().enableRTCMmessage(UBX_RTCM_1124, COM_PORT_UART1, 1);
+    g_gnss.ubx().enableRTCMmessage(UBX_RTCM_1230, COM_PORT_UART1, 1);
+}
+
+static void waitSurveyIn() {
+    const uint32_t startMs = millis();
+    // 10 мин: Survey-In до 3см может копить 3-5 мин на открытом небе. Раньше было 180с —
+    // база сдавалась рано и слала RTCM с неточной позицией → rover не брал FIXED.
+    const uint32_t timeoutMs = 600000UL;
+
+    while ((millis() - startMs) < timeoutMs) {
+        bool ok = g_gnss.ubx().getSurveyStatus(2500);
+        bool active = g_gnss.ubx().getSurveyInActive();
+        bool valid = g_gnss.ubx().getSurveyInValid();
+        uint32_t dur = g_gnss.ubx().getSurveyInObservationTimeFull();
+        float acc = g_gnss.ubx().getSurveyInMeanAccuracy();
+        uint8_t siv = g_gnss.ubx().getSIV();   // спутников в решении — диагностика приёма базы
+        Serial.printf("[BASE] survey ok=%d active=%d valid=%d dur=%lu acc=%.3f m siv=%u\n",
+                      ok ? 1 : 0, active ? 1 : 0, valid ? 1 : 0, dur, acc, siv);
+        if (ok && valid) {
+            Serial.println("[BASE] survey valid, RTCM 1005 should be available");
+            enableBaseRtcmMessages();
+            return;
+        }
+        delay(1000);
+    }
+
+    Serial.println("[BASE] survey timeout, forwarding RTCM anyway");
+    enableBaseRtcmMessages();
+}
+
 static void connectWiFi() {
     WiFi.mode(WIFI_STA);
     WiFi.setTxPower(WIFI_POWER_11dBm);
@@ -147,6 +191,7 @@ void setup() {
     if (!g_gnss.begin(F9pSerial, GNSS_BASE)) {
         Serial.println("[BASE] F9P NOT FOUND");
     }
+    waitSurveyIn();
     connectWiFi();
     g_udp.begin(RTCM_UDP_PORT);
     Serial.println("[BASE] ready");
@@ -171,6 +216,17 @@ void loop() {
 
         g_stats.bytes += frameLen;
         g_stats.frames++;
+        uint16_t msgType = (((uint16_t)frame[3] << 4) | (frame[4] >> 4)) & 0x0FFF;
+        g_stats.lastType = msgType;
+        switch (msgType) {
+            case 1005: g_stats.t1005++; break;
+            case 1074: g_stats.t1074++; break;
+            case 1084: g_stats.t1084++; break;
+            case 1094: g_stats.t1094++; break;
+            case 1124: g_stats.t1124++; break;
+            case 1230: g_stats.t1230++; break;
+            default:   g_stats.tOther++; break;
+        }
 
         // UDP unicast на ровер
         g_udp.beginPacket(rover, RTCM_UDP_PORT);
@@ -182,9 +238,12 @@ void loop() {
     static uint32_t lastLog = 0;
     if (now - lastLog > 5000) {
         lastLog = now;
-        Serial.printf("[BASE] rtcmOut=%s rtcm=%lu/%lu raw=%lu drop=%lu crcFail=%lu udpOk=%lu udpFail=%lu\n",
+        Serial.printf("[BASE] rtcmOut=%s rtcm=%lu/%lu raw=%lu drop=%lu crcFail=%lu udpOk=%lu udpFail=%lu "
+                      "last=%lu types 1005=%lu 1074=%lu 1084=%lu 1094=%lu 1124=%lu 1230=%lu other=%lu\n",
             g_stats.frames > 0 ? "active" : "waiting",
             g_stats.bytes, g_stats.frames, g_stats.rawBytes,
-            g_stats.dropped, g_stats.crcFail, g_stats.udpOk, g_stats.udpFail);
+            g_stats.dropped, g_stats.crcFail, g_stats.udpOk, g_stats.udpFail,
+            g_stats.lastType, g_stats.t1005, g_stats.t1074, g_stats.t1084,
+            g_stats.t1094, g_stats.t1124, g_stats.t1230, g_stats.tOther);
     }
 }

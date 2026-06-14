@@ -14,8 +14,8 @@ import '../home/home_screen.dart' show batteryPercentProvider;
 
 String? _navStartBlockReason(WifiConnectionState wifi) {
   final carrier = wifi.gpsCarrier?.toLowerCase();
-  final hAccReady = wifi.gpsAccuracy != null && wifi.gpsAccuracy! <= 50;
-  final rtkReady = carrier == 'fixed' || (carrier == 'float' && hAccReady);
+  final hAccReady = wifi.gpsAccuracy != null && wifi.gpsAccuracy! <= 20;
+  final rtkReady = carrier == 'fixed' && hAccReady;
   final pvtFresh = wifi.gpsAgeMs != null && wifi.gpsAgeMs! <= 1000;
   final rtcmFresh = wifi.rtcmAgeMs != null && wifi.rtcmAgeMs! <= 1000;
   final imuReady =
@@ -30,8 +30,8 @@ String? _navStartBlockReason(WifiConnectionState wifi) {
     return null;
   }
   return [
-    if (!rtkReady) 'RTK is not fixed/accurate float',
-    if (!hAccReady) 'hAcc is above 50 mm',
+    if (!rtkReady) 'RTK is not fixed at <= 20 mm',
+    if (!hAccReady) 'hAcc is above 20 mm',
     if (!pvtFresh) 'PVT is stale',
     if (!rtcmFresh) 'RTCM is stale',
     if (!imuReady) 'IMU is stale or absent',
@@ -50,8 +50,10 @@ class AutoMapScreen extends ConsumerStatefulWidget {
 class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   static const double _draftLineStepMeters = 0.35;
   static const int _maxRouteWaypoints = 254;
-  static const int _maxForbiddenPolygons = 8;
+  static const int _maxBoundaryPoints = 24;
+  static const int _maxForbiddenPolygons = 16;
   static const int _maxForbiddenPoints = 24;
+  static const double _maxStartOutsideBoundaryMeters = 0.15;
 
   ManualMapState? _mapState;
   bool _isLoading = true;
@@ -183,6 +185,69 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     return map.copyWith(robot: Offset(local.x, local.y));
   }
 
+  bool _startIsInsideOrNearBoundary(ManualMapState map, Offset start) {
+    for (final zone in map.zones) {
+      final points =
+          zone.points.where((p) => p.dx.isFinite && p.dy.isFinite).toList();
+      if (points.length < 3) continue;
+      if (_pointInPolygon(start, points) ||
+          _distanceToPolygon(start, points) <= _maxStartOutsideBoundaryMeters) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool _pointInPolygon(Offset p, List<Offset> poly) {
+    var inside = false;
+    var j = poly.length - 1;
+    for (var i = 0; i < poly.length; i++) {
+      final a = poly[i];
+      final b = poly[j];
+      final intersects = ((a.dy > p.dy) != (b.dy > p.dy)) &&
+          (p.dx < (b.dx - a.dx) * (p.dy - a.dy) / (b.dy - a.dy) + a.dx);
+      if (intersects) inside = !inside;
+      j = i;
+    }
+    return inside;
+  }
+
+  static double _distanceToPolygon(Offset p, List<Offset> poly) {
+    var best = double.infinity;
+    for (var i = 0; i < poly.length; i++) {
+      best = math.min(
+        best,
+        _distanceToSegment(p, poly[i], poly[(i + 1) % poly.length]),
+      );
+    }
+    return best;
+  }
+
+  static double _distanceToSegment(Offset p, Offset a, Offset b) {
+    final ab = b - a;
+    final len2 = ab.dx * ab.dx + ab.dy * ab.dy;
+    if (len2 <= 1e-9) return (p - a).distance;
+    final t = (((p.dx - a.dx) * ab.dx + (p.dy - a.dy) * ab.dy) / len2)
+        .clamp(0.0, 1.0);
+    final q = Offset(a.dx + ab.dx * t, a.dy + ab.dy * t);
+    return (p - q).distance;
+  }
+
+  static List<Offset> _normalizedPolygon(List<Offset> points) {
+    const eps = 0.001;
+    final out = <Offset>[];
+    for (final p in points) {
+      if (!p.dx.isFinite || !p.dy.isFinite) continue;
+      if (out.isEmpty || (p - out.last).distance > eps) {
+        out.add(p);
+      }
+    }
+    if (out.length > 1 && (out.first - out.last).distance <= eps) {
+      out.removeLast();
+    }
+    return List<Offset>.unmodifiable(out);
+  }
+
   void _buildRoute(BuildContext context, WidgetRef ref) {
     final map = _mapState;
     if (map == null) return;
@@ -204,12 +269,24 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           );
       return;
     }
+    if (!_startIsInsideOrNearBoundary(map, currentStart)) {
+      ref.read(noticeProvider.notifier).show(
+            const NoticeState(
+              title: 'Start outside boundary',
+              message:
+                  'Live robot position is not inside the green zone. Move it inside the mapped boundary before building autonomy.',
+              kind: NoticeKind.danger,
+            ),
+          );
+      return;
+    }
     var cleaningRoute = CleaningRoutePlanner.planRoute(
       map,
       lineStep: _draftLineStepMeters,
       borderPasses: 1,
       startOverride: currentStart,
-      maxStartDistanceMeters: double.infinity,
+      maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
+      forbiddenMarginMeters: _maxStartOutsideBoundaryMeters,
       debugPrint: true,
     );
     cleaningRoute ??= CleaningRoutePlanner.planRoute(
@@ -218,7 +295,8 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       borderPasses: 1,
       startOverride: currentStart,
       boundaryMarginMeters: 0.05,
-      maxStartDistanceMeters: double.infinity,
+      maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
+      forbiddenMarginMeters: _maxStartOutsideBoundaryMeters,
       debugPrint: true,
     );
 
@@ -324,10 +402,40 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         return;
       }
 
+      final boundaryPolygons = map.zones
+          .map((poly) => _normalizedPolygon(poly.points))
+          .where((points) => points.length >= 3)
+          .toList(growable: false);
+
+      if (boundaryPolygons.length != 1) {
+        const msg =
+            'Route upload blocked: firmware safety requires exactly one green boundary zone.';
+        setState(() => _routeWorkflowError = msg);
+        _showNotice(
+          ref,
+          title: 'Boundary zone required',
+          message: msg,
+          kind: NoticeKind.danger,
+        );
+        return;
+      }
+
+      final boundaryPoints = boundaryPolygons.single;
+      if (boundaryPoints.length > _maxBoundaryPoints) {
+        const msg =
+            'Boundary zone is too complex for firmware safety: max $_maxBoundaryPoints points.';
+        setState(() => _routeWorkflowError = msg);
+        _showNotice(
+          ref,
+          title: 'Boundary too complex',
+          message: msg,
+          kind: NoticeKind.danger,
+        );
+        return;
+      }
+
       final forbiddenPolygons = map.forbiddens
-          .map((poly) => poly.points
-              .where((p) => p.dx.isFinite && p.dy.isFinite)
-              .toList(growable: false))
+          .map((poly) => _normalizedPolygon(poly.points))
           .where((points) => points.length >= 3)
           .toList(growable: false);
 
@@ -365,7 +473,26 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           });
         }
       }
-      await routeCtrl.sendRouteEnd();
+      await routeCtrl.sendRouteBoundaryBegin(boundaryPoints.length);
+      for (var i = 0; i < boundaryPoints.length; i++) {
+        final p = boundaryPoints[i];
+        await routeCtrl.sendRouteBoundaryPoint(i, p.dx, p.dy);
+      }
+      await routeCtrl.sendRouteBoundaryEnd();
+
+      await routeCtrl.sendForbiddenBeginAck(
+        forbiddenPolygons.length,
+        forbiddenPolygons.map((poly) => poly.length).toList(growable: false),
+      );
+      for (var polyIdx = 0; polyIdx < forbiddenPolygons.length; polyIdx++) {
+        final poly = forbiddenPolygons[polyIdx];
+        for (var pointIdx = 0; pointIdx < poly.length; pointIdx++) {
+          final p = poly[pointIdx];
+          await routeCtrl.sendForbiddenPointAck(polyIdx, pointIdx, p.dx, p.dy);
+        }
+      }
+      await routeCtrl.sendForbiddenEndAck();
+      await routeCtrl.sendRouteEnd(_route.length);
 
       setState(() {
         _routeSent = true;
@@ -376,7 +503,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         ref,
         title: 'Route sent',
         message:
-            'Robot received ${_route.length} exact waypoints from the app.',
+            'Robot received ${_route.length} waypoints, boundary, and forbidden zones.',
         kind: NoticeKind.info,
       );
     } catch (e) {
@@ -465,6 +592,14 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
 
   @override
   Widget build(BuildContext context) {
+    ref.listen<WifiConnectionState>(wifiConnectionProvider, (previous, next) {
+      if ((previous?.isConnected ?? false) && !next.isConnected && _routeSent) {
+        setState(() {
+          _routeSent = false;
+          _routeWorkflowError = 'Connection lost: send the route again.';
+        });
+      }
+    });
     final wifi = ref.watch(wifiConnectionProvider);
     final accent = wifi.isConnected ? Colors.white : const Color(0xFF6E6E6E);
     final notice = ref.watch(noticeProvider);

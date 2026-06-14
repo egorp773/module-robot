@@ -71,6 +71,9 @@ private:
     void capturePvt(const UBX_NAV_PVT_data_t *pvt);
     void parseRoverUbxByte(uint8_t b);
     void captureNavPvtPayload(const uint8_t *p, uint16_t len);
+    void captureRxmRtcmPayload(const uint8_t *p, uint16_t len);
+    void sendUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len);
+    void enableRoverRtcmStatus();
 
     SFE_UBLOX_GNSS _gnss;
     HardwareSerial* _serial = nullptr;

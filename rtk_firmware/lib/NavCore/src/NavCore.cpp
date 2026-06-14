@@ -56,18 +56,26 @@ bool navPointInPolygon(const NavPoint& pt, const NavPoint* poly, int n) {
 
 bool navSegmentsIntersect(const NavPoint& a, const NavPoint& b,
                           const NavPoint& c, const NavPoint& d) {
-    auto onSeg = [](const NavPoint& p, const NavPoint& q, const NavPoint& r) {
-        return q.x <= max(p.x, r.x) && q.x >= min(p.x, r.x) &&
-               q.y <= max(p.y, r.y) && q.y >= min(p.y, r.y);
+    auto orient = [](const NavPoint& p, const NavPoint& q, const NavPoint& r) {
+        float v = (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y);
+        if (fabsf(v) < 1e-7f) return 0;
+        return (v > 0.0f) ? 1 : 2;
     };
-    NavPoint r = navSub(b, a);
-    NavPoint s = navSub(d, c);
-    float denom = navCross(r, s);
-    if (fabsf(denom) < 1e-9f) return false;       // parallel
-    NavPoint ac = navSub(c, a);
-    float t = navCross(ac, s) / denom;
-    float u = navCross(ac, r) / denom;
-    return (t >= 0 && t <= 1 && u >= 0 && u <= 1);
+    auto onSeg = [](const NavPoint& p, const NavPoint& q, const NavPoint& r) {
+        const float eps = 1e-6f;
+        return q.x <= max(p.x, r.x) + eps && q.x + eps >= min(p.x, r.x) &&
+               q.y <= max(p.y, r.y) + eps && q.y + eps >= min(p.y, r.y);
+    };
+    int o1 = orient(a, b, c);
+    int o2 = orient(a, b, d);
+    int o3 = orient(c, d, a);
+    int o4 = orient(c, d, b);
+    if (o1 != o2 && o3 != o4) return true;
+    if (o1 == 0 && onSeg(a, c, b)) return true;
+    if (o2 == 0 && onSeg(a, d, b)) return true;
+    if (o3 == 0 && onSeg(c, a, d)) return true;
+    if (o4 == 0 && onSeg(c, b, d)) return true;
+    return false;
 }
 
 bool navLineHitsPolygon(const NavPoint& a, const NavPoint& b,

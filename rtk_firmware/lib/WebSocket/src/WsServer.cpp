@@ -131,6 +131,10 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         int count = 0;
         double lat = 0, lon = 0;
         if (sscanf(line.c_str(), "ROUTE_BEGIN,%d,%lf,%lf", &count, &lat, &lon) == 3) {
+            if (_navRequested || _route->isRunning()) {
+                sendText(client, "ERR,NAV_ACTIVE");
+                return;
+            }
             if (_route->beginUpload(count, lat, lon)) {
                 _est->setOrigin(lat, lon);
                 sendText(client, "OK");
@@ -154,6 +158,71 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         } else {
             sendText(client, "ERR,ROUTE_WP_FORMAT");
         }
+        return;
+    }
+    if (line.startsWith("ROUTE_BOUNDARY_BEGIN,")) {
+        int count = 0;
+        if (sscanf(line.c_str(), "ROUTE_BOUNDARY_BEGIN,%d", &count) == 1) {
+            sendText(client, _route->beginBoundary(count) ? "OK" : "ERR,ROUTE_BOUNDARY_BEGIN");
+        } else {
+            sendText(client, "ERR,ROUTE_BOUNDARY_BEGIN");
+        }
+        return;
+    }
+    if (line.startsWith("ROUTE_BOUNDARY_PT,")) {
+        int idx = 0;
+        float x = 0, y = 0;
+        if (sscanf(line.c_str(), "ROUTE_BOUNDARY_PT,%d,%f,%f", &idx, &x, &y) == 3) {
+            sendText(client, _route->addBoundaryPoint(idx, x, y) ? "OK" : "ERR,ROUTE_BOUNDARY_PT");
+        } else {
+            sendText(client, "ERR,ROUTE_BOUNDARY_PT_FORMAT");
+        }
+        return;
+    }
+    if (line == "ROUTE_BOUNDARY_END") {
+        sendText(client, _route->endBoundary() ? "OK" : "ERR,ROUTE_BOUNDARY_END");
+        return;
+    }
+    if (line.startsWith("FORBID_BEGIN,")) {
+        int counts[NavCore::MAX_OBSTACLES] = {0};
+        char buf[256];
+        line.toCharArray(buf, sizeof(buf));
+        char* ctx = nullptr;
+        char* tok = strtok_r(buf, ",", &ctx);
+        tok = strtok_r(nullptr, ",", &ctx);
+        int count = tok ? atoi(tok) : -1;
+        bool ok = count >= 0 && count <= NavCore::MAX_OBSTACLES;
+        for (int i = 0; ok && i < count; ++i) {
+            tok = strtok_r(nullptr, ",", &ctx);
+            if (!tok) {
+                ok = false;
+                break;
+            }
+            counts[i] = atoi(tok);
+            if (counts[i] < 3 || counts[i] > NavCore::MAX_OBSTACLE_POINTS) {
+                ok = false;
+            }
+        }
+        if (ok && strtok_r(nullptr, ",", &ctx) != nullptr) ok = false;
+        if (ok) {
+            sendText(client, _route->beginForbidden(count, counts) ? "OK" : "ERR,FORBID_BEGIN");
+        } else {
+            sendText(client, "ERR,FORBID_BEGIN");
+        }
+        return;
+    }
+    if (line.startsWith("FORBID_PT,")) {
+        int polyIdx = 0, ptIdx = 0;
+        float x = 0, y = 0;
+        if (sscanf(line.c_str(), "FORBID_PT,%d,%d,%f,%f", &polyIdx, &ptIdx, &x, &y) == 4) {
+            sendText(client, _route->addForbiddenPoint(polyIdx, ptIdx, x, y) ? "OK" : "ERR,FORBID_PT");
+        } else {
+            sendText(client, "ERR,FORBID_PT_FORMAT");
+        }
+        return;
+    }
+    if (line == "FORBID_END") {
+        sendText(client, _route->endForbidden() ? "OK" : "ERR,FORBID_END");
         return;
     }
     if (line == "ROUTE_END") {
