@@ -57,7 +57,7 @@ bool Gnss::begin(HardwareSerial& serial, GnssRole role) {
     }
 
     g_pvtTarget = this;
-    _gnss.setNavigationFrequency(1);
+    _gnss.setNavigationFrequency(_role == GNSS_ROVER ? 5 : 1);
 
     if (_role == GNSS_ROVER) {
         _gnss.setAutoPVT(true);

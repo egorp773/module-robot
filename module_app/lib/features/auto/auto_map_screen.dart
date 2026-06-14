@@ -14,11 +14,27 @@ import '../home/home_screen.dart' show batteryPercentProvider;
 
 String? _navStartBlockReason(WifiConnectionState wifi) {
   final carrier = wifi.gpsCarrier?.toLowerCase();
-  final rtkReady = carrier == 'fixed' || carrier == 'float';
+  final rtkReady = carrier == 'fixed';
+  final hAccReady = wifi.gpsAccuracy != null && wifi.gpsAccuracy! <= 50;
+  final pvtFresh = wifi.gpsAgeMs != null && wifi.gpsAgeMs! <= 1000;
+  final rtcmFresh = wifi.rtcmAgeMs != null && wifi.rtcmAgeMs! <= 1000;
+  final imuReady =
+      wifi.imuFresh == true && wifi.imuAgeMs != null && wifi.imuAgeMs! <= 200;
   final motorReady = wifi.motorFeedback == true;
-  if (rtkReady && motorReady) return null;
+  if (rtkReady &&
+      hAccReady &&
+      pvtFresh &&
+      rtcmFresh &&
+      imuReady &&
+      motorReady) {
+    return null;
+  }
   return [
-    if (!rtkReady) 'RTK is not float/fixed',
+    if (!rtkReady) 'RTK is not fixed',
+    if (!hAccReady) 'hAcc is above 50 mm',
+    if (!pvtFresh) 'PVT is stale',
+    if (!rtcmFresh) 'RTCM is stale',
+    if (!imuReady) 'IMU is stale or absent',
     if (!motorReady) 'motor controller feedback is absent',
   ].join('; ');
 }
@@ -254,112 +270,115 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     setState(() => _routeSending = true);
     try {
       if (_route.isEmpty) {
-      _showNotice(
-        ref,
-        title: 'Нет маршрута',
-        message: 'Сначала постройте маршрут.',
-        kind: NoticeKind.warning,
-      );
-      return;
-    }
-
-    final wifi = ref.read(wifiConnectionProvider);
-    if (!wifi.isConnected) {
-      _showNotice(
-        ref,
-        title: 'Не подключено',
-        message: 'Подключитесь к роботу перед отправкой маршрута.',
-        kind: NoticeKind.warning,
-      );
-      return;
-    }
-
-    final map = _mapState;
-    if (map == null ||
-        map.coordinateType != 'gps' ||
-        map.refLat == null ||
-        map.refLon == null) {
-      const msg =
-          'Route upload blocked: GPS origin/local-meter map is not ready.';
-      setState(() => _routeWorkflowError = msg);
-      _showNotice(
-        ref,
-        title: 'Маршрут не GPS',
-        message: msg,
-        kind: NoticeKind.danger,
-      );
-      return;
-    }
-
-    if (_route.length > _maxRouteWaypoints) {
-      final msg =
-          'Route has ${_route.length} waypoints, limit is $_maxRouteWaypoints.';
-      setState(() => _routeWorkflowError = msg);
-      _showNotice(
-        ref,
-        title: 'Route is too long',
-        message: msg,
-        kind: NoticeKind.danger,
-      );
-      return;
-    }
-
-    final forbiddenPolygons = map.forbiddens
-        .map((poly) => poly.points
-            .where((p) => p.dx.isFinite && p.dy.isFinite)
-            .toList(growable: false))
-        .where((points) => points.length >= 3)
-        .toList(growable: false);
-
-    if (forbiddenPolygons.length > _maxForbiddenPolygons ||
-        forbiddenPolygons
-            .any((points) => points.length > _maxForbiddenPoints)) {
-      final msg =
-          'Forbidden zones exceed firmware limits: max $_maxForbiddenPolygons zones, '
-          '$_maxForbiddenPoints points each.';
-      setState(() => _routeWorkflowError = msg);
-      _showNotice(
-        ref,
-        title: 'Forbidden zones too complex',
-        message: msg,
-        kind: NoticeKind.danger,
-      );
-      return;
-    }
-
-    final routeCtrl = ref.read(wifiConnectionProvider.notifier);
-    routeCtrl.sendForbiddenBegin(forbiddenPolygons.length);
-    for (var polyIndex = 0; polyIndex < forbiddenPolygons.length; polyIndex++) {
-      final points = forbiddenPolygons[polyIndex];
-      for (var pointIndex = 0; pointIndex < points.length; pointIndex++) {
-        final p = points[pointIndex];
-        routeCtrl.sendForbiddenPoint(polyIndex, pointIndex, p.dx, p.dy);
+        _showNotice(
+          ref,
+          title: 'Нет маршрута',
+          message: 'Сначала постройте маршрут.',
+          kind: NoticeKind.warning,
+        );
+        return;
       }
-    }
-    routeCtrl.sendForbiddenEnd();
 
-    routeCtrl.sendRouteBegin(
-      _route.length,
-      originLat: map.refLat!,
-      originLon: map.refLon!,
-    );
-    for (var i = 0; i < _route.length; i++) {
-      final p = _route[i];
-      await routeCtrl.sendRoutePoint(i, p.dx, p.dy);
-    }
-    await routeCtrl.sendRouteEnd();
+      final wifi = ref.read(wifiConnectionProvider);
+      if (!wifi.isConnected) {
+        _showNotice(
+          ref,
+          title: 'Не подключено',
+          message: 'Подключитесь к роботу перед отправкой маршрута.',
+          kind: NoticeKind.warning,
+        );
+        return;
+      }
 
-    setState(() {
-      _routeSent = true;
-      _routeWorkflowError = null;
-    });
+      final map = _mapState;
+      if (map == null ||
+          map.coordinateType != 'gps' ||
+          map.refLat == null ||
+          map.refLon == null) {
+        const msg =
+            'Route upload blocked: GPS origin/local-meter map is not ready.';
+        setState(() => _routeWorkflowError = msg);
+        _showNotice(
+          ref,
+          title: 'Маршрут не GPS',
+          message: msg,
+          kind: NoticeKind.danger,
+        );
+        return;
+      }
 
-    _showNotice(
-      ref,
-      title: 'Route sent',
-      message: 'Robot received ${_route.length} exact waypoints from the app.',
-      kind: NoticeKind.info,
-    );
+      if (_route.length > _maxRouteWaypoints) {
+        final msg =
+            'Route has ${_route.length} waypoints, limit is $_maxRouteWaypoints.';
+        setState(() => _routeWorkflowError = msg);
+        _showNotice(
+          ref,
+          title: 'Route is too long',
+          message: msg,
+          kind: NoticeKind.danger,
+        );
+        return;
+      }
+
+      final forbiddenPolygons = map.forbiddens
+          .map((poly) => poly.points
+              .where((p) => p.dx.isFinite && p.dy.isFinite)
+              .toList(growable: false))
+          .where((points) => points.length >= 3)
+          .toList(growable: false);
+
+      if (forbiddenPolygons.length > _maxForbiddenPolygons ||
+          forbiddenPolygons
+              .any((points) => points.length > _maxForbiddenPoints)) {
+        const msg =
+            'Forbidden zones exceed firmware limits: max $_maxForbiddenPolygons zones, '
+            '$_maxForbiddenPoints points each.';
+        setState(() => _routeWorkflowError = msg);
+        _showNotice(
+          ref,
+          title: 'Forbidden zones too complex',
+          message: msg,
+          kind: NoticeKind.danger,
+        );
+        return;
+      }
+
+      final routeCtrl = ref.read(wifiConnectionProvider.notifier);
+      routeCtrl.sendForbiddenBegin(forbiddenPolygons.length);
+      for (var polyIndex = 0;
+          polyIndex < forbiddenPolygons.length;
+          polyIndex++) {
+        final points = forbiddenPolygons[polyIndex];
+        for (var pointIndex = 0; pointIndex < points.length; pointIndex++) {
+          final p = points[pointIndex];
+          routeCtrl.sendForbiddenPoint(polyIndex, pointIndex, p.dx, p.dy);
+        }
+      }
+      routeCtrl.sendForbiddenEnd();
+
+      routeCtrl.sendRouteBegin(
+        _route.length,
+        originLat: map.refLat!,
+        originLon: map.refLon!,
+      );
+      for (var i = 0; i < _route.length; i++) {
+        final p = _route[i];
+        await routeCtrl.sendRoutePoint(i, p.dx, p.dy);
+      }
+      await routeCtrl.sendRouteEnd();
+
+      setState(() {
+        _routeSent = true;
+        _routeWorkflowError = null;
+      });
+
+      _showNotice(
+        ref,
+        title: 'Route sent',
+        message:
+            'Robot received ${_route.length} exact waypoints from the app.',
+        kind: NoticeKind.info,
+      );
     } finally {
       if (mounted) setState(() => _routeSending = false);
     }
@@ -886,6 +905,15 @@ class _AutoWorkflowPanel extends StatelessWidget {
         : 'Time: ${(routeRunTimeS / 60.0).toStringAsFixed(1)} min';
     final carrier = wifi.gpsCarrier ?? 'none';
     final rtkStatus = 'RTK: $carrier';
+    final imuStatus = wifi.imuYaw == null
+        ? 'IMU: -'
+        : 'IMU: ${wifi.imuYaw!.toStringAsFixed(0)} deg/'
+            '${wifi.imuAgeMs ?? -1} ms';
+    final rtcmAgeLabel = wifi.rtcmAgeMs == null
+        ? 'RTCM age: -'
+        : 'RTCM age: ${wifi.rtcmAgeMs} ms';
+    final pvtAgeLabel =
+        wifi.gpsAgeMs == null ? 'PVT age: -' : 'PVT age: ${wifi.gpsAgeMs} ms';
     final motorStatus =
         wifi.motorFeedback == true ? 'Motor: linked' : 'Motor: no feedback';
     // Heading / distance to target — these are the live numbers that show
@@ -906,13 +934,12 @@ class _AutoWorkflowPanel extends StatelessWidget {
         ? 'XTE: -'
         : 'XTE: ${wifi.movementCrossTrack!.toStringAsFixed(2)} m';
     final moveLabel = wifi.movementStatus ?? '-';
-    final batLabel = batteryPercent == null
-        ? 'BAT: -'
-        : 'BAT: $batteryPercent%';
-    final startEnabled = routeSent && wifi.isConnected;
+    final batLabel =
+        batteryPercent == null ? 'BAT: -' : 'BAT: $batteryPercent%';
     final startBlockReason = !wifi.isConnected
         ? 'not connected'
         : (!routeSent ? 'route not sent' : _navStartBlockReason(wifi));
+    final startEnabled = startBlockReason == null;
     final startStatus =
         startBlockReason == null ? 'Start: ready' : 'Start: blocked';
 
@@ -941,6 +968,9 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 _StatusPill(label: batLabel),
                 _StatusPill(label: gpsStatus),
                 _StatusPill(label: rtkStatus),
+                _StatusPill(label: rtcmAgeLabel),
+                _StatusPill(label: pvtAgeLabel),
+                _StatusPill(label: imuStatus),
                 _StatusPill(label: motorStatus),
                 _StatusPill(label: gpsCoords),
                 _StatusPill(label: startStatus),
@@ -967,7 +997,8 @@ class _AutoWorkflowPanel extends StatelessWidget {
                   child: _WorkflowButton(
                     icon: Icons.upload_rounded,
                     label: 'Send route',
-                    enabled: routePoints > 0 && wifi.isConnected && !routeSending,
+                    enabled:
+                        routePoints > 0 && wifi.isConnected && !routeSending,
                     busy: routeSending,
                     onTap: onSendRoute,
                   ),
@@ -1052,7 +1083,8 @@ class _WorkflowButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final effectiveEnabled = enabled && !busy;
-    final color = effectiveEnabled ? Colors.white : Colors.white.withOpacity(0.34);
+    final color =
+        effectiveEnabled ? Colors.white : Colors.white.withOpacity(0.34);
 
     return InkWell(
       borderRadius: BorderRadius.circular(14),
@@ -1594,10 +1626,8 @@ class _GridPainter extends CustomPainter {
       const baseHalf = 4.0;
       final perpX = -dirY;
       final perpY = dirX;
-      final base1 = rp +
-          Offset(perpX * baseHalf, perpY * baseHalf);
-      final base2 = rp -
-          Offset(perpX * baseHalf, perpY * baseHalf);
+      final base1 = rp + Offset(perpX * baseHalf, perpY * baseHalf);
+      final base2 = rp - Offset(perpX * baseHalf, perpY * baseHalf);
       final arrowPath = Path()
         ..moveTo(tip.dx, tip.dy)
         ..lineTo(base1.dx, base1.dy)

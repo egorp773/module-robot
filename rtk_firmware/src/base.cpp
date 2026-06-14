@@ -11,11 +11,110 @@ Gnss g_gnss;
 WiFiUDP    g_udp;
 
 struct RtcmStats {
+    uint32_t rawBytes = 0;
     uint32_t bytes = 0;
-    uint32_t pkts  = 0;
+    uint32_t frames = 0;
     uint32_t udpOk = 0;
     uint32_t udpFail = 0;
+    uint32_t dropped = 0;
+    uint32_t crcFail = 0;
 } g_stats;
+
+static uint32_t crc24q(const uint8_t* data, size_t len) {
+    uint32_t crc = 0;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint32_t)data[i] << 16;
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            crc <<= 1;
+            if (crc & 0x1000000UL) crc ^= 0x1864CFBUL;
+        }
+    }
+    return crc & 0xFFFFFFUL;
+}
+
+class RtcmFrameFilter {
+public:
+    bool push(uint8_t b, const uint8_t*& frame, size_t& len) {
+        frame = nullptr;
+        len = 0;
+
+        switch (_state) {
+            case WAIT_D3:
+                if (b == 0xD3) {
+                    _buf[0] = b;
+                    _idx = 1;
+                    _state = LEN1;
+                } else {
+                    g_stats.dropped++;
+                }
+                break;
+            case LEN1:
+                if ((b & 0xFC) != 0) {
+                    reset();
+                    if (b == 0xD3) {
+                        _buf[0] = b;
+                        _idx = 1;
+                        _state = LEN1;
+                    } else {
+                        g_stats.dropped++;
+                    }
+                    break;
+                }
+                _buf[_idx++] = b;
+                _lenHi = b;
+                _state = LEN2;
+                break;
+            case LEN2: {
+                _buf[_idx++] = b;
+                const uint16_t payloadLen = ((uint16_t)(_lenHi & 0x03) << 8) | b;
+                _expected = 3 + payloadLen + 3;
+                if (payloadLen == 0 || _expected > sizeof(_buf)) {
+                    reset();
+                    g_stats.dropped++;
+                    break;
+                }
+                _state = BODY;
+                break;
+            }
+            case BODY:
+                _buf[_idx++] = b;
+                if (_idx >= _expected) {
+                    const uint32_t got = ((uint32_t)_buf[_expected - 3] << 16) |
+                                         ((uint32_t)_buf[_expected - 2] << 8) |
+                                         _buf[_expected - 1];
+                    const uint32_t want = crc24q(_buf, _expected - 3);
+                    if (got == want) {
+                        frame = _buf;
+                        len = _expected;
+                        reset();
+                        return true;
+                    }
+                    g_stats.crcFail++;
+                    reset();
+                }
+                break;
+        }
+        return false;
+    }
+
+private:
+    enum State : uint8_t { WAIT_D3, LEN1, LEN2, BODY };
+
+    void reset() {
+        _state = WAIT_D3;
+        _idx = 0;
+        _expected = 0;
+        _lenHi = 0;
+    }
+
+    State _state = WAIT_D3;
+    uint8_t _buf[1024]{};
+    size_t _idx = 0;
+    size_t _expected = 0;
+    uint8_t _lenHi = 0;
+};
+
+RtcmFrameFilter g_rtcmFilter;
 
 static void connectWiFi() {
     WiFi.mode(WIFI_STA);
@@ -55,21 +154,27 @@ void setup() {
 
 void loop() {
     uint32_t now = millis();
-    g_gnss.loop();
+    // Do not call g_gnss.loop() here: it reads from the same UART and can
+    // split RTCM3 frames before the UDP forwarder sees them.
 
-    static uint8_t buf[512];
     IPAddress rover;
     rover.fromString(ROVER_IP);
 
     while (F9pSerial.available()) {
-        int n = F9pSerial.readBytes(buf, sizeof(buf));
-        if (n <= 0) break;
-        g_stats.bytes += n;
-        g_stats.pkts++;
+        int ch = F9pSerial.read();
+        if (ch < 0) break;
+        g_stats.rawBytes++;
+
+        const uint8_t* frame = nullptr;
+        size_t frameLen = 0;
+        if (!g_rtcmFilter.push((uint8_t)ch, frame, frameLen)) continue;
+
+        g_stats.bytes += frameLen;
+        g_stats.frames++;
 
         // UDP unicast на ровер
         g_udp.beginPacket(rover, RTCM_UDP_PORT);
-        g_udp.write(buf, n);
+        g_udp.write(frame, frameLen);
         if (g_udp.endPacket()) g_stats.udpOk++;
         else                    g_stats.udpFail++;
     }
@@ -77,10 +182,9 @@ void loop() {
     static uint32_t lastLog = 0;
     if (now - lastLog > 5000) {
         lastLog = now;
-        uint16_t accMm = 0; uint32_t durS = 0;
-        bool complete = g_gnss.baseSurveyComplete(accMm, durS);
-        Serial.printf("[BASE] svin=%s rtcm=%lu/%lu udpOk=%lu udpFail=%lu\n",
-            complete ? "VALID" : (g_gnss.baseSurveyInProgress() ? "running" : "off"),
-            g_stats.bytes, g_stats.pkts, g_stats.udpOk, g_stats.udpFail);
+        Serial.printf("[BASE] rtcmOut=%s rtcm=%lu/%lu raw=%lu drop=%lu crcFail=%lu udpOk=%lu udpFail=%lu\n",
+            g_stats.frames > 0 ? "active" : "waiting",
+            g_stats.bytes, g_stats.frames, g_stats.rawBytes,
+            g_stats.dropped, g_stats.crcFail, g_stats.udpOk, g_stats.udpFail);
     }
 }

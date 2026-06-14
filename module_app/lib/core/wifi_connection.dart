@@ -753,7 +753,6 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                     imuAgeMs: int.tryParse(parts[17]),
                     imuFresh: parts[18].trim() == '1',
                     imuReceivedAt: imuYaw == null ? null : now,
-                    motorFeedback: true,
                   );
                   _maybeLogTelemetrySummary();
                 }
