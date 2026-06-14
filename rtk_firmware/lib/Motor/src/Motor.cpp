@@ -30,6 +30,25 @@ void Motor::begin(HardwareSerial& serial, float wheelBaseM, uint8_t rxPin, uint8
     _batVoltsFilt = 0.0f;
 }
 
+void Motor::txTaskTrampoline(void* arg) {
+    Motor* self = (Motor*)arg;
+    // Ровный 50Гц поток на плату, независимо от блокировок главного цикла.
+    const TickType_t period = pdMS_TO_TICKS(HOVER_SEND_MS);
+    TickType_t last = xTaskGetTickCount();
+    for (;;) {
+        self->loop(millis());
+        vTaskDelayUntil(&last, period);
+    }
+}
+
+void Motor::startTxTask() {
+    if (_taskRunning) return;
+    _taskRunning = true;
+    // Ядро 0 (главный Arduino loop живёт на ядре 1) — поток мотора не страдает от
+    // долгих GNSS/IMU/WiFi вызовов в setup()/loop(). Приоритет выше idle.
+    xTaskCreatePinnedToCore(txTaskTrampoline, "motorTx", 4096, this, 3, &_txTask, 0);
+}
+
 void Motor::sendHover(int16_t steer, int16_t speed) {
     if (!_serial) return;
     HoverCommand cmd;
@@ -51,13 +70,18 @@ static void pctToHover(int leftPct, int rightPct, int16_t& speedOut, int16_t& st
 void Motor::setManualPercent(int leftPct, int rightPct) {
     leftPct  = (int)clamp16(leftPct,  -HOVER_MAX_PERCENT, HOVER_MAX_PERCENT);
     rightPct = (int)clamp16(rightPct, -HOVER_MAX_PERCENT, HOVER_MAX_PERCENT);
+    int16_t sp, st;
+    pctToHover(leftPct, rightPct, sp, st);
+    sp = clamp16(sp, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+    st = clamp16(st, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+    taskENTER_CRITICAL(&_mux);
     _curLeftPct = leftPct;
     _curRightPct = rightPct;
-    pctToHover(leftPct, rightPct, _targetSpeed, _targetSteer);
-    _targetSpeed = clamp16(_targetSpeed, -HOVER_MAX_CMD, HOVER_MAX_CMD);
-    _targetSteer = clamp16(_targetSteer, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+    _targetSpeed = sp;
+    _targetSteer = st;
     _enabled = true;
     _lastSetMs = millis();
+    taskEXIT_CRITICAL(&_mux);
 }
 
 void Motor::setLinearAngularSpeed(float linearMps, float angularRadps, bool useRamp) {
@@ -71,43 +95,67 @@ void Motor::setLinearAngularSpeed(float linearMps, float angularRadps, bool useR
     int rightPct = (int)roundf(vR * scale);
     leftPct  = (int)clamp16(leftPct,  -HOVER_MAX_PERCENT, HOVER_MAX_PERCENT);
     rightPct = (int)clamp16(rightPct, -HOVER_MAX_PERCENT, HOVER_MAX_PERCENT);
+    int16_t sp, st;
+    pctToHover(leftPct, rightPct, sp, st);
+    sp = clamp16(sp, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+    st = clamp16(st, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+    taskENTER_CRITICAL(&_mux);
     _curLeftPct = leftPct;
     _curRightPct = rightPct;
-    pctToHover(leftPct, rightPct, _targetSpeed, _targetSteer);
-    _targetSpeed = clamp16(_targetSpeed, -HOVER_MAX_CMD, HOVER_MAX_CMD);
-    _targetSteer = clamp16(_targetSteer, -HOVER_MAX_CMD, HOVER_MAX_CMD);
+    _targetSpeed = sp;
+    _targetSteer = st;
     _enabled = true;
     _lastSetMs = millis();
+    taskEXIT_CRITICAL(&_mux);
 }
 
 void Motor::stopImmediately() {
+    taskENTER_CRITICAL(&_mux);
     _targetSpeed = _targetSteer = 0;
     _cmdSpeed = _cmdSteer = 0;
     _curLeftPct = _curRightPct = 0;
+    _lastSetMs = millis();
+    taskEXIT_CRITICAL(&_mux);
     if (_serial) sendHover(0, 0);
 }
 
 void Motor::enable(bool en) {
-    _enabled = en;
-    if (!en) stopImmediately();
+    if (!en) { stopImmediately(); _enabled = false; return; }
+    _enabled = true;
 }
 
 void Motor::loop(uint32_t nowMs) {
     receiveFeedback();
 
-    // failsafe: давно не было новой команды -> цель в ноль (плавно через slew)
-    if (_enabled && _lastSetMs != 0 && (nowMs - _lastSetMs) > HOVER_CMD_TIMEOUT_MS) {
-        _targetSpeed = 0;
-        _targetSteer = 0;
+    // Startup hold: первые N мс после begin() НЕ шлём команды — даём плате hoverboard-FOC
+    // время на инициализацию (иначе она пищит «нет сигнала» при первом мусорном пакете).
+    if (_startupHoldUntilMs != 0) {
+        if (nowMs < _startupHoldUntilMs) return;
+        _startupHoldUntilMs = 0;
     }
 
     if (nowMs - _lastSendMs < HOVER_SEND_MS) return;
     _lastSendMs = nowMs;
 
+    // Атомарный снимок цели (пишется из главного ядра, читается здесь на ядре 0).
+    taskENTER_CRITICAL(&_mux);
+    int16_t  tgtSpeed = _targetSpeed;
+    int16_t  tgtSteer = _targetSteer;
+    bool     en       = _enabled;
+    uint32_t lastSet  = _lastSetMs;
+    taskEXIT_CRITICAL(&_mux);
+
+    // failsafe: давно не было новой команды -> цель в ноль (плавно через slew)
+    if (en && lastSet != 0 && (nowMs - lastSet) > HOVER_CMD_TIMEOUT_MS) {
+        tgtSpeed = 0;
+        tgtSteer = 0;
+    }
+
     // slew к цели в домене команды (сглаживание как в sound.ino)
-    _cmdSpeed = slewToward(_cmdSpeed, _targetSpeed, HOVER_SLEW_SPEED);
-    _cmdSteer = slewToward(_cmdSteer, _targetSteer, HOVER_SLEW_STEER);
+    _cmdSpeed = slewToward(_cmdSpeed, tgtSpeed, HOVER_SLEW_SPEED);
+    _cmdSteer = slewToward(_cmdSteer, tgtSteer, HOVER_SLEW_STEER);
     sendHover(_cmdSteer, _cmdSpeed);
+    _sendCount++;
 }
 
 void Motor::receiveFeedback() {

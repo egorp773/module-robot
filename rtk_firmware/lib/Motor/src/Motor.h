@@ -40,11 +40,23 @@ public:
     // Ручной режим из app: left/right в процентах (-100..100).
     void setManualPercent(int leftPct, int rightPct);
 
+    // Запустить фоновую TX-задачу на ядре 0: она сама крутит loop() ровным 50Гц,
+    // не завися от блокировок главного цикла (GNSS/IMU/WiFi init и т.п.) — иначе
+    // поток команд на плату рвётся и hoverboard пищит «нет сигнала». Вызывать ОДИН
+    // раз сразу после begin(). После запуска главному циклу loop() звать НЕ нужно.
+    void startTxTask();
+    bool txTaskRunning() const { return _taskRunning; }
+
     void stopImmediately();
     void enable(bool en);
+    // Задать «тишину» на N мс после старта — плата hoverboard FOC не любит пакеты
+    // пока не стабилизировалась. По умолчанию 1500мс (вызов не обязателен).
+    void setStartupHoldMs(uint32_t ms) { _startupHoldUntilMs = millis() + ms; }
     bool enabled() const { return _enabled; }
 
     // Вызывать часто из loop(): шлёт команду (каждые HOVER_SEND_MS) + читает фидбэк.
+    // ПРИМ.: при работающей TX-задаче (см. begin) вызывать вручную НЕ нужно — задача
+    // на ядре 0 сама крутит loop() ровным 50Гц независимо от блокировок главного цикла.
     void loop(uint32_t nowMs);
 
     // ---- телеметрия (реальная, из фидбэка) ----
@@ -58,6 +70,7 @@ public:
     // последняя посланная команда (для телеметрии/отладки)
     int   lastSpeedCmd() const { return _cmdSpeed; }
     int   lastSteerCmd() const { return _cmdSteer; }
+    uint32_t sendCount() const { return _sendCount; }
     // совместимость со старой телеметрией WsServer (left/right "pwm"-эквивалент)
     int   currentLeftPwm()  const { return _curLeftPct; }
     int   currentRightPwm() const { return _curRightPct; }
@@ -67,6 +80,13 @@ private:
     void receiveFeedback();
     static int16_t clamp16(int32_t v, int16_t lo, int16_t hi);
     static int16_t slewToward(int16_t cur, int16_t target, int16_t maxStep);
+    static void txTaskTrampoline(void* arg);   // FreeRTOS entry -> ((Motor*)arg)->loop()
+
+    // Фоновая TX-задача на ядре 0 (изоляция потока команд от блокировок главного цикла).
+    TaskHandle_t   _txTask = nullptr;
+    volatile bool  _taskRunning = false;
+    // Спинлок для записи цели из главного цикла / чтения в TX-задаче (разные ядра).
+    portMUX_TYPE   _mux = portMUX_INITIALIZER_UNLOCKED;
 
     HardwareSerial* _serial = nullptr;
     float _wheelBase = ROVER_WHEELBASE_M;
@@ -80,6 +100,8 @@ private:
 
     uint32_t _lastSendMs = 0;
     uint32_t _lastSetMs  = 0;                        // когда последний раз задавали команду
+    uint32_t _startupHoldUntilMs = 0;                // первые N мс не слать (плата FOC стартует)
+    uint32_t _sendCount = 0;                         // счётчик отправленных пакетов (диагностика 50Гц)
 
     // feedback parser
     HoverFeedback _fb{};

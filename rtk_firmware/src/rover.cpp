@@ -60,9 +60,18 @@ static float wrapDeg180Local(float d) {
     return d;
 }
 
+// Раньше прокачивала g_motor.loop() вручную во время ожидания. Теперь поток команд
+// держит фоновая TX-задача на ядре 0 (g_motor.startTxTask), поэтому здесь просто ждём —
+// дёргать loop() вручную НЕЛЬЗЯ: будет гонка двух нитей за один Serial2.
+static void serviceMotorFor(uint32_t durationMs) {
+    delay(durationMs);
+}
+
 static void connectWiFi() {
     WiFi.mode(WIFI_STA);
-    WiFi.setTxPower(WIFI_POWER_11dBm);
+    // ВАЖНО: НЕ снижать TX power здесь. 11dBm наводит помехи на UART2 к hoverboard
+    // → плата видит мусор в протоколе → пищит. 11dBm включаем ПОЗЖЕ, после мотора и RTK.
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     IPAddress ip, gw, sn, dns;
     ip.fromString(ROVER_IP);
     gw.fromString("192.168.31.1");
@@ -72,7 +81,7 @@ static void connectWiFi() {
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     int t = 0;
     while (WiFi.status() != WL_CONNECTED && t < 30) {
-        delay(500);
+        serviceMotorFor(500);
         Serial.print(".");
         t++;
     }
@@ -209,6 +218,19 @@ void setup() {
     pinMode(PIN_RELAY_ATTACH, OUTPUT); digitalWrite(PIN_RELAY_ATTACH, LOW);
     pinMode(PIN_RELAY_MOUNT,  OUTPUT); digitalWrite(PIN_RELAY_MOUNT,  LOW);
 
+    // Мотор ИНИЦИАЛИЗИРУЕМ ПЕРВЫМ (как в sound.ino): Serial2.begin + первый пакет 0,0
+    // ДО любого WiFi/IMU/GNSS — чтобы плата hoverboard сразу увидела валидный протокол
+    // и не уходила в защитный писк «нет сигнала».
+    g_motor.begin(MotorSerial, ROVER_WHEELBASE_M, PIN_MOTOR_RX, PIN_MOTOR_TX);
+    g_motor.stopImmediately();
+    // КЛЮЧЕВОЕ: поток команд 50Гц ведёт отдельная задача на ядре 0. Иначе блокирующие
+    // init ниже (g_gnss.begin до 1.5с ретраев, g_imu.begin I2C-скан, WiFi) РВУТ поток
+    // на главном ядре → плата hoverboard видит пропажу сигнала после первого пакета и
+    // пищит. Задача шлёт ровный 50Гц независимо от любых блокировок setup()/loop().
+    g_motor.startTxTask();
+    Serial.printf("[ROVER] motor Serial2 ready RX=%d TX=%d @%d (50Hz TX task on core0)\n",
+                  PIN_MOTOR_RX, PIN_MOTOR_TX, HOVER_BAUD);
+
     connectWiFi();
 
     g_imu.begin(PIN_IMU_SDA, PIN_IMU_SCL);
@@ -217,8 +239,6 @@ void setup() {
     g_est.seedHeadingDeg(ROVER_INITIAL_HEADING_DEG);   // 176° — реальный старт-курс робота
     g_route.begin();
     g_safety.begin();
-    g_motor.begin(MotorSerial, ROVER_WHEELBASE_M, PIN_MOTOR_RX, PIN_MOTOR_TX);
-    g_motor.stopImmediately();
 
     g_rtcm.begin(g_gnss, BASE_IP, RTCM_TCP_PORT, RTCM_UDP_PORT);
     g_ws.begin(g_est, g_imu, g_gnss, g_rtcm, g_route, g_motor, g_safety, WS_PORT);
@@ -233,7 +253,16 @@ void loop() {
     g_imu.loop();
     g_gnss.loop();
     g_rtcm.loop();
-    g_motor.loop(now);
+    // g_motor.loop() НЕ зовём — поток команд ведёт TX-задача на ядре 0 (startTxTask).
+
+    // WiFi 11dBm включаем ПОЗЖЕ (через 3 сек), когда мотор уже стабильно шлёт — иначе
+    // TX-помехи 11dBm наводят мусор на UART2 к hoverboard и она пищит.
+    static uint32_t g_lowTxAt = 3000;
+    if (g_lowTxAt != 0 && millis() > g_lowTxAt) {
+        WiFi.setTxPower(WIFI_POWER_11dBm);
+        g_lowTxAt = 0;
+        Serial.println("[ROVER] wifi tx power -> 11dBm");
+    }
 
     if (g_gnss.consumeFreshPvt()) {
         g_est.onPvt(now,
@@ -266,8 +295,6 @@ void loop() {
             g_follow.running = true;
         }
         stepFollower();
-    } else {
-        g_motor.setLinearAngularSpeed(0, 0, true);
     }
 
     NavStateOut nso;
@@ -307,11 +334,15 @@ void loop() {
         const auto& e = g_est.get();
         const char* src = (g_rtcm.source() == RTCM_UDP) ? "udp" : "none";
         Serial.printf("[ROVER] sol=%d sv=%d hAcc=%.3f head=%.1f gpsHead=%.1f yawRate=%.1f imuYaw=%.1f "
-                      "spd=%.2f pvtAge=%u rtcmAge=%lu src=%s imuAge=%u bat=%d safety=%d reason=%s\n",
+                      "spd=%.2f pvtAge=%u rtcmAge=%lu src=%s imuAge=%u bat=%d "
+                      "motFB=%d motL=%d motR=%d sp=%d st=%d safety=%d reason=%s\n",
             (int)e.sol, e.numSv, e.hAcc, e.headingFiltDeg, e.headingDeg,
             g_imu.yawRateDps(), g_imu.yawDeg(), e.speedMps, e.pvtAgeMs,
             g_rtcm.transportAgeMs(now), src,
             g_imu.ageMs(now), g_motor.batteryPercent(),
+            g_motor.haveFeedback() ? 1 : 0,
+            g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
+            g_motor.lastSpeedCmd(), g_motor.lastSteerCmd(),
             (int)g_safety.level(), g_safety.reason());
     }
 }

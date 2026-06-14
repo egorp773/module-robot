@@ -34,6 +34,7 @@ coverage/
 
 # ESP32 / Arduino / PlatformIO generated files
 .pio/
+.sound_build/
 .pioenvs/
 .piolibdeps/
 *.elf
