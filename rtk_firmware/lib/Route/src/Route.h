@@ -45,6 +45,7 @@ private:
     NavCore _core;
     RouteState _state = ROUTE_NONE;
     int _expectedCount = 0;
+    int _uploadedCount = 0;
     double _originLat = 0, _originLon = 0;
     bool _running = false;
     bool _paused = false;

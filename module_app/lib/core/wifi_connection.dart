@@ -1199,20 +1199,41 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     sendRaw("AREA_END");
   }
 
-  void sendRouteBegin(
+  Future<void> sendRouteBegin(
     int count, {
     required double originLat,
     required double originLon,
-  }) {
-    if (!state.isConnected) return;
-    sendRaw(
-      "ROUTE_BEGIN,$count,${originLat.toStringAsFixed(8)},"
-      "${originLon.toStringAsFixed(8)}",
-    );
+  }) async {
+    if (!state.isConnected) {
+      throw StateError('not connected');
+    }
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final completer = Completer<void>();
+      _routeAckWaiter = completer;
+      sendRaw(
+        "ROUTE_BEGIN,$count,${originLat.toStringAsFixed(8)},"
+        "${originLon.toStringAsFixed(8)}",
+      );
+      try {
+        await completer.future.timeout(const Duration(milliseconds: 1500));
+        _routeAckWaiter = null;
+        return;
+      } catch (e) {
+        _routeAckWaiter = null;
+        if (attempt < 2) {
+          _log("× ROUTE_BEGIN ack timeout, retry ${attempt + 1}/3");
+        } else {
+          _log("× ROUTE_BEGIN failed after 3 attempts");
+          rethrow;
+        }
+      }
+    }
   }
 
   Future<void> sendRoutePoint(int index, double xMeters, double yMeters) async {
-    if (!state.isConnected) return;
+    if (!state.isConnected) {
+      throw StateError('not connected');
+    }
     for (var attempt = 0; attempt < 3; attempt++) {
       final completer = Completer<void>();
       _routeAckWaiter = completer;
@@ -1229,13 +1250,16 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
           _log("× ROUTE_WP $index ack timeout, retry ${attempt + 1}/3");
         } else {
           _log("× ROUTE_WP $index failed after 3 attempts");
+          rethrow;
         }
       }
     }
   }
 
   Future<void> sendRouteEnd() async {
-    if (!state.isConnected) return;
+    if (!state.isConnected) {
+      throw StateError('not connected');
+    }
     for (var attempt = 0; attempt < 3; attempt++) {
       final completer = Completer<void>();
       _routeAckWaiter = completer;
@@ -1250,6 +1274,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
           _log("× ROUTE_END ack timeout, retry ${attempt + 1}/3");
         } else {
           _log("× ROUTE_END failed after 3 attempts");
+          rethrow;
         }
       }
     }

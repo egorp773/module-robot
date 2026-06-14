@@ -274,16 +274,19 @@ class ManualMapController extends StateNotifier<ManualMapState> {
     final lat = wifi.gpsLat;
     final lon = wifi.gpsLon;
     final hAccMm = wifi.gpsAccuracy;
+    final carrier = wifi.gpsCarrier?.toLowerCase();
     final fresh = wifi.gpsReceivedAt != null &&
         DateTime.now().difference(wifi.gpsReceivedAt!).inMilliseconds < 2500;
+    final accurate = hAccMm != null && hAccMm <= 50;
+    final rtkUsable = carrier == 'fixed' || (carrier == 'float' && accurate);
     return wifi.isConnected &&
         fresh &&
-        wifi.gpsCarrier == 'fixed' &&
+        rtkUsable &&
         lat != null &&
         lon != null &&
         lat.abs() > 0.000001 &&
         lon.abs() > 0.000001 &&
-        (hAccMm == null || hAccMm <= 80);
+        accurate;
   }
 
   void syncRobotFromGps(WifiConnectionState wifi, {bool force = false}) {
@@ -545,7 +548,8 @@ class ManualMapController extends StateNotifier<ManualMapState> {
     if (!_gpsReady(wifi)) {
       ref.read(noticeProvider.notifier).show(const NoticeState(
             title: 'RTK not ready',
-            message: 'Wait for RTK fixed and hAcc <= 8 cm before recording.',
+            message:
+                'Wait for RTK fixed, or float with hAcc <= 5 cm, before recording.',
             kind: NoticeKind.warning,
           ));
       return;
@@ -2088,13 +2092,16 @@ class _RtkStatusPanel extends StatelessWidget {
     double u(double v) => v * uiScale;
     final fresh = wifi.gpsReceivedAt != null &&
         DateTime.now().difference(wifi.gpsReceivedAt!).inMilliseconds < 2500;
-    final fixed = fresh && wifi.gpsCarrier == 'fixed';
+    final hAccOk = wifi.gpsAccuracy != null && wifi.gpsAccuracy! <= 50;
+    final carrier = wifi.gpsCarrier?.toLowerCase();
+    final fixed = fresh && carrier == 'fixed';
+    final usable = fixed || (fresh && carrier == 'float' && hAccOk);
     final hAccText = wifi.gpsAccuracy == null
         ? 'hAcc -'
         : 'hAcc ${(wifi.gpsAccuracy! / 10).round() / 100} m';
     final satText =
         wifi.gpsSatellites == null ? 'SV -' : 'SV ${wifi.gpsSatellites}';
-    final color = fixed ? const Color(0xFF38F6A7) : const Color(0xFFFFD166);
+    final color = usable ? const Color(0xFF38F6A7) : const Color(0xFFFFD166);
 
     return _GlassCard(
       borderColor: color.withOpacity(0.18),
@@ -2103,16 +2110,16 @@ class _RtkStatusPanel extends StatelessWidget {
         child: Row(
           children: [
             Icon(
-              fixed ? Icons.gps_fixed_rounded : Icons.gps_not_fixed_rounded,
+              usable ? Icons.gps_fixed_rounded : Icons.gps_not_fixed_rounded,
               color: color,
               size: u(18).clamp(16.0, 18.0),
             ),
             SizedBox(width: u(8)),
             Expanded(
               child: Text(
-                fixed
-                    ? 'RTK fixed - map records robot GPS'
-                    : 'Waiting RTK fixed',
+                usable
+                    ? 'RTK usable - map records robot GPS'
+                    : 'Waiting RTK <= 5 cm',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(

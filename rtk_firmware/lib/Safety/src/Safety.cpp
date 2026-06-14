@@ -60,7 +60,11 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
                 set(SAFETY_OK, "rtk_fixed");
             }
         } else if (in.sol == SOL_FLOAT) {
-            set(SAFETY_HOLD, "rtk_float_wait_fixed");
+            if (in.hAcc <= SAFE_HACC_FIXED_M) {
+                set(SAFETY_DEGRADED, "rtk_float_accurate");
+            } else {
+                set(SAFETY_HOLD, "rtk_float_hacc");
+            }
         }
         return;
     }

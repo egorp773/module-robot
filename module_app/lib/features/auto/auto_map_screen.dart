@@ -14,8 +14,8 @@ import '../home/home_screen.dart' show batteryPercentProvider;
 
 String? _navStartBlockReason(WifiConnectionState wifi) {
   final carrier = wifi.gpsCarrier?.toLowerCase();
-  final rtkReady = carrier == 'fixed';
   final hAccReady = wifi.gpsAccuracy != null && wifi.gpsAccuracy! <= 50;
+  final rtkReady = carrier == 'fixed' || (carrier == 'float' && hAccReady);
   final pvtFresh = wifi.gpsAgeMs != null && wifi.gpsAgeMs! <= 1000;
   final rtcmFresh = wifi.rtcmAgeMs != null && wifi.rtcmAgeMs! <= 1000;
   final imuReady =
@@ -30,7 +30,7 @@ String? _navStartBlockReason(WifiConnectionState wifi) {
     return null;
   }
   return [
-    if (!rtkReady) 'RTK is not fixed',
+    if (!rtkReady) 'RTK is not fixed/accurate float',
     if (!hAccReady) 'hAcc is above 50 mm',
     if (!pvtFresh) 'PVT is stale',
     if (!rtcmFresh) 'RTCM is stale',
@@ -344,19 +344,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       }
 
       final routeCtrl = ref.read(wifiConnectionProvider.notifier);
-      routeCtrl.sendForbiddenBegin(forbiddenPolygons.length);
-      for (var polyIndex = 0;
-          polyIndex < forbiddenPolygons.length;
-          polyIndex++) {
-        final points = forbiddenPolygons[polyIndex];
-        for (var pointIndex = 0; pointIndex < points.length; pointIndex++) {
-          final p = points[pointIndex];
-          routeCtrl.sendForbiddenPoint(polyIndex, pointIndex, p.dx, p.dy);
-        }
-      }
-      routeCtrl.sendForbiddenEnd();
-
-      routeCtrl.sendRouteBegin(
+      await routeCtrl.sendRouteBegin(
         _route.length,
         originLat: map.refLat!,
         originLon: map.refLon!,
@@ -378,6 +366,20 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         message:
             'Robot received ${_route.length} exact waypoints from the app.',
         kind: NoticeKind.info,
+      );
+    } catch (e) {
+      final msg = 'Route upload failed: $e';
+      if (mounted) {
+        setState(() {
+          _routeSent = false;
+          _routeWorkflowError = msg;
+        });
+      }
+      _showNotice(
+        ref,
+        title: 'Route upload failed',
+        message: msg,
+        kind: NoticeKind.danger,
       );
     } finally {
       if (mounted) setState(() => _routeSending = false);
