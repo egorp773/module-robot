@@ -138,6 +138,7 @@ static void waitSurveyIn() {
     // 10 мин: Survey-In до 3см может копить 3-5 мин на открытом небе. Раньше было 180с —
     // база сдавалась рано и слала RTCM с неточной позицией → rover не брал FIXED.
     const uint32_t timeoutMs = 600000UL;
+    bool fallbackStarted = false;
 
     while ((millis() - startMs) < timeoutMs) {
         bool ok = g_gnss.ubx().getSurveyStatus(2500);
@@ -152,6 +153,23 @@ static void waitSurveyIn() {
             Serial.println("[BASE] survey valid, RTCM 1005 should be available");
             enableBaseRtcmMessages();
             return;
+        }
+
+        if (!fallbackStarted && ok && active &&
+            dur >= BASE_SURVEY_FALLBACK_AFTER_S &&
+            acc <= BASE_SURVEY_FALLBACK_ACC_M) {
+            fallbackStarted = true;
+            Serial.printf("[BASE] survey precision stuck at %.3f m after %lu s; "
+                          "switching to fallback %us/%.1fm\n",
+                          acc, dur,
+                          (unsigned)BASE_SURVEY_FALLBACK_MIN_S,
+                          (double)BASE_SURVEY_FALLBACK_ACC_M);
+            g_gnss.ubx().setSurveyMode(0, 0, 0);
+            delay(500);
+            g_gnss.ubx().setSurveyMode(1,
+                                       BASE_SURVEY_FALLBACK_MIN_S,
+                                       BASE_SURVEY_FALLBACK_ACC_M);
+            enableBaseRtcmMessages();
         }
         delay(1000);
     }

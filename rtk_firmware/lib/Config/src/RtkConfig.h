@@ -39,6 +39,9 @@
 // Для FIXED абсолютная точность базы не критична — RTK относителен; важна стабильность.
 #define BASE_SURVEY_ACC_M   1.0f
 #define BASE_SURVEY_MIN_S   300
+#define BASE_SURVEY_FALLBACK_ACC_M 25.0f
+#define BASE_SURVEY_FALLBACK_MIN_S 60
+#define BASE_SURVEY_FALLBACK_AFTER_S 300
 #define BASE_TCP_RX_TIMEOUT_MS 4000
 
 // ---------------- Hoverboard motor protocol (эталон: sound.ino, рабочий) ----------------
