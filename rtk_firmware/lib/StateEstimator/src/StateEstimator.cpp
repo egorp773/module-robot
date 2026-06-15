@@ -39,10 +39,13 @@ float StateEstimator::wrapDeg180(float d) {
 void StateEstimator::llaToLocalMeters(double lat, double lon,
                                      double originLat, double originLon,
                                      float &x, float &y) {
-    // Формула ИДЕНТИЧНА приложению (gps_projection.dart) — иначе координаты разъедутся.
+    // Формула ИДЕНТИЧНА приложению (gps_display_math.dart) — drift < 7см на 30м поля.
+    // 6φ и 5φ члены дают <0.001% drift на площади 1км², оставлены для совпадения с app.
     double phi = originLat * M_PI / 180.0;
-    double mPerDegLat = 111132.92 - 559.82 * cos(2*phi) + 1.175 * cos(4*phi);
-    double mPerDegLon = 111412.84 * cos(phi) - 93.5 * cos(3*phi);
+    double mPerDegLat = 111132.92 - 559.82 * cos(2*phi) + 1.175 * cos(4*phi)
+                        - 0.0023 * cos(6*phi);
+    double mPerDegLon = 111412.84 * cos(phi) - 93.5 * cos(3*phi)
+                        + 0.118 * cos(5*phi);
     double north = (lat - originLat) * mPerDegLat;
     double east  = (lon - originLon) * mPerDegLon;
     x = (float)east;    // x = East
@@ -61,9 +64,10 @@ bool StateEstimator::setOrigin(double lat, double lon) {
     est.x = newX;
     est.y = newY;
     // Сброс EKF в новую систему координат. Heading — из последнего засеянного
-    // headingFiltDeg (в радианах). Без знания heading — оставляем 0, fixHeading придёт
-    // с первым PVT.
-    float hRad = (est.headingFiltDeg > 0) ? (est.headingFiltDeg * 3.14159265f / 180.0f) : 0.0f;
+    // headingFiltDeg (в радианах). headingFiltDeg в [0, 360], поэтому ВСЕГДА конвертим
+    // (раньше был баг: при heading=0 (North) условие `> 0` ложно → hRad=0 → EKF
+    // считал что heading=0 (East по нашей формуле atan2).
+    float hRad = est.headingFiltDeg * 0.01745329f;
     _ekf.reset(newX, newY, hRad);
     return true;
 }

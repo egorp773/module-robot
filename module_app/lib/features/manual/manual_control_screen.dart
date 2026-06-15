@@ -324,12 +324,12 @@ class ManualMapController extends StateNotifier<ManualMapState> {
     // Центр экрана
     final center = mapSize.center(Offset.zero);
 
-    // Текущая позиция робота на экране
+    // Текущая позиция робота на экране (dy инвертирован — North вверх, как в auto_map_screen)
     final robotScreenPos = center +
         state.pan +
         Offset(
           state.robot.dx * cell,
-          state.robot.dy * cell,
+          -state.robot.dy * cell,
         );
 
     // Вычисляем нужный pan, чтобы робот был в центре
@@ -2724,7 +2724,8 @@ class _GridPainter extends CustomPainter {
     final baseCell = (18 * uiScale).clamp(14.0, 20.0);
     final cell = baseCell * s.zoom;
 
-    Offset w2s(Offset w) => center + s.pan + Offset(w.dx * cell, w.dy * cell);
+    // dy инвертирован — North вверх (как в auto_map_screen для согласованности)
+    Offset w2s(Offset w) => center + s.pan + Offset(w.dx * cell, -w.dy * cell);
 
     canvas.drawRect(
         Offset.zero & size, Paint()..color = Colors.white.withOpacity(0.03));

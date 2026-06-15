@@ -846,12 +846,12 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                                             final baseCell = (18 * uiScale)
                                                 .clamp(14.0, 20.0);
                                             final cell = baseCell * _zoom;
-                                            // Текущая позиция робота на экране
+                                            // Текущая позиция робота на экране (dy инвертирован — North вверх)
                                             final robotScreenPos = center +
                                                 _pan +
                                                 Offset(
                                                   _mapState!.robot.dx * cell,
-                                                  _mapState!.robot.dy * cell,
+                                                  -_mapState!.robot.dy * cell,
                                                 );
                                             // Вычисляем нужный pan, чтобы робот был в центре
                                             final newPan = _pan -
@@ -1753,7 +1753,10 @@ class _GridPainter extends CustomPainter {
     final baseCell = (18 * uiScale).clamp(14.0, 20.0);
     final cell = baseCell * zoom;
 
-    Offset w2s(Offset w) => center + pan + Offset(w.dx * cell, w.dy * cell);
+    // w.dy = North (положительное = на север), но в screen space y растёт вниз.
+    // Поэтому инвертируем dy: "север" рисуется вверху экрана. Так heading arrow
+    // (Up vector = (0,-1)) согласован с маршрутом — оба показывают North вверх.
+    Offset w2s(Offset w) => center + pan + Offset(w.dx * cell, -w.dy * cell);
 
     canvas.drawRect(
         Offset.zero & size, Paint()..color = Colors.white.withOpacity(0.03));

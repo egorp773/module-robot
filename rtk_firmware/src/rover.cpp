@@ -427,6 +427,21 @@ void loop() {
     g_est.onHoverboardFeedback(now, g_motor.speedLeftMeas(), g_motor.speedRightMeas());
     g_est.tick(now);
 
+    // Auto-origin: если origin ещё не задан, но есть валидный fix — захватываем текущую
+    // позицию как origin. Иначе est.x, est.y останутся 0,0 пока пользователь не отправит
+    // маршрут, и карта в приложении будет показывать робота в (0,0) — "он в разных точках".
+    {
+        static uint32_t lastAutoOriginLogMs = 0;
+        if (!g_est.get().originSet && g_est.get().sol == SOL_FIXED) {
+            g_est.setOrigin(g_est.get().lat, g_est.get().lon);
+            if (now - lastAutoOriginLogMs > 2000) {
+                Serial.printf("[AUTO-ORIGIN] captured: lat=%.7f lon=%.7f\n",
+                              g_est.get().originLat, g_est.get().originLon);
+                lastAutoOriginLogMs = now;
+            }
+        }
+    }
+
     SafetyInput si;
     si.wsConnected  = g_ws.isConnected();
     si.lastWsRxMs   = g_ws.lastRxMs();
