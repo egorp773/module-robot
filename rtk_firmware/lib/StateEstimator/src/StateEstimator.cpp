@@ -74,26 +74,17 @@ void StateEstimator::seedHeadingDeg(float headingDeg) {
 }
 
 // --- IMU: НЕ участвует в курсе (GPS-only heading) ---
-// Раньше здесь интегрировался yaw rate гироскопа в курс. Это давало крутку на месте:
-// при неверной калибровке знака/дрейфе BNO085 курс «убегал», ошибка курса росла,
-// робот бесконечно разворачивался. Курс теперь берём ТОЛЬКО из GPS motion heading
-// (см. onPvt). IMU оставлен для будущего tilt-детекта, но в навигацию не вмешивается.
-// Эталон: коммит 5917838 "Use GPS-only heading: remove IMU from navigation".
+// На предыдущих итерациях здесь интегрировался yaw rate гироскопа в headingFiltDeg.
+// Это вызывало дрейф курса на 5-15° за минуту из-за drift BNO085, и в комбинации с
+// медленным GPS-обновлением (5 Hz, замороженным при скорости <3 см/с) робот уезжал
+// с маршрута. Сейчас курс берётся ТОЛЬКО из GPS motion heading в onPvt().
+// IMU оставлен подключённым (для будущего tilt-детекта и для safety IMU-fresh гейта),
+// но в навигацию НЕ вмешивается.
 void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh) {
+    (void)yawRateDps;
     if (!imuFresh) { _lastImuMs = nowMs; return; }
-    if (!_headingSeeded) { _lastImuMs = nowMs; return; }
-    float dt = (_lastImuMs == 0) ? 0.0f : (nowMs - _lastImuMs) * 0.001f;
     _lastImuMs = nowMs;
-    if (dt <= 0.0f || dt > 0.25f) return;
-    float rate = fabsf(yawRateDps) < kImuYawRateDeadbandDps ? 0.0f : yawRateDps;
-    float delta = rate * dt;
-    if (delta > kImuMaxDeltaDeg) delta = kImuMaxDeltaDeg;
-    if (delta < -kImuMaxDeltaDeg) delta = -kImuMaxDeltaDeg;
-    est.headingFiltDeg = normalizeDeg360(est.headingFiltDeg + delta);
-    est.headingValid = true;
-    _lastHeadingMs = nowMs;
-    est.headingAgeMs = 0;
-    // курс НЕ трогаем — он живёт за счёт GPS-курса (onPvt) и замораживается на месте
+    // intentionally no-op: headingFiltDeg живёт за счёт GPS в onPvt()
 }
 
 void StateEstimator::onPvt(uint32_t nowMs,

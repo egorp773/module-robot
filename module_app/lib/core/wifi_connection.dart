@@ -480,8 +480,11 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   bool Function(String)? _commandAckMatcher;
   Completer<String>? _routeAckWaiter;
   bool Function(String)? _routeAckMatcher;
-  static const Duration _commandAckTimeout = Duration(seconds: 2);
-  static const Duration _routeAckTimeout = _commandAckTimeout;
+  // WiFi на 11 dBm + TCP/IP стек ESP32 могут давать 2-4 с задержку. 2 с таймаут
+  // приводил к ложным фейлам и карусели "press 15 раз". Поднимаем.
+  static const Duration _commandAckTimeout = Duration(seconds: 5);
+  // Per-waypoint ждём подольше — пакеты склеиваются/теряются на границах.
+  static const Duration _routeAckTimeout = Duration(seconds: 8);
 
   Uri get _wsUri => Uri.parse("ws://$_host:$_port/ws");
 
@@ -657,12 +660,23 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     _scheduleReconnect(error);
   }
 
-  Future<void> _closeSocketOnly() async {
-    _pongWaiter = null;
+  void _failAckWaiters(String reason) {
+    // Завершаем ожидающие completer'ы с ошибкой (не молча!), чтобы их `await` сразу
+    // получил TimeoutException/StateError и вышел из retry-цикла.
+    if (_commandAckWaiter != null && !_commandAckWaiter!.isCompleted) {
+      _commandAckWaiter!.completeError(StateError(reason));
+    }
     _commandAckWaiter = null;
     _commandAckMatcher = null;
+    if (_routeAckWaiter != null && !_routeAckWaiter!.isCompleted) {
+      _routeAckWaiter!.completeError(StateError(reason));
+    }
     _routeAckWaiter = null;
     _routeAckMatcher = null;
+  }
+
+  Future<void> _closeSocketOnly() async {
+    _failAckWaiters("connection closed");
     await _sub?.cancel();
     _sub = null;
     try {
@@ -1229,7 +1243,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     if (!state.isConnected) {
       throw StateError('not connected');
     }
-    for (var attempt = 0; attempt < 3; attempt++) {
+    for (var attempt = 0; attempt < 2; attempt++) {
       final completer = Completer<String>();
       _commandAckWaiter = completer;
       _commandAckMatcher = matcher;
@@ -1242,10 +1256,10 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       } catch (e) {
         _commandAckWaiter = null;
         _commandAckMatcher = null;
-        if (attempt < 2) {
-          _log("× $label ack timeout, retry ${attempt + 1}/3");
+        if (attempt == 0) {
+          _log("× $label ack timeout, retry 1/1");
         } else {
-          _log("× $label failed after 3 attempts");
+          _log("× $label failed after 2 attempts");
           rethrow;
         }
       }
@@ -1284,7 +1298,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     if (!state.isConnected) {
       throw StateError('not connected');
     }
-    for (var attempt = 0; attempt < 3; attempt++) {
+    for (var attempt = 0; attempt < 2; attempt++) {
       final completer = Completer<String>();
       _routeAckWaiter = completer;
       _routeAckMatcher = (ack) => ack == "OK,ROUTE_BEGIN";
@@ -1300,10 +1314,10 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       } catch (e) {
         _routeAckWaiter = null;
         _routeAckMatcher = null;
-        if (attempt < 2) {
-          _log("× ROUTE_BEGIN ack timeout, retry ${attempt + 1}/3");
+        if (attempt == 0) {
+          _log("× ROUTE_BEGIN ack timeout, retry 1/1");
         } else {
-          _log("× ROUTE_BEGIN failed after 3 attempts");
+          _log("× ROUTE_BEGIN failed after 2 attempts");
           rethrow;
         }
       }
@@ -1314,7 +1328,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     if (!state.isConnected) {
       throw StateError('not connected');
     }
-    for (var attempt = 0; attempt < 3; attempt++) {
+    for (var attempt = 0; attempt < 2; attempt++) {
       final completer = Completer<String>();
       _routeAckWaiter = completer;
       _routeAckMatcher = (ack) => ack == "OK,ROUTE_WP,$index";
@@ -1329,10 +1343,10 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       } catch (e) {
         _routeAckWaiter = null;
         _routeAckMatcher = null;
-        if (attempt < 2) {
-          _log("× ROUTE_WP $index ack timeout, retry ${attempt + 1}/3");
+        if (attempt == 0) {
+          _log("× ROUTE_WP $index ack timeout, retry 1/1");
         } else {
-          _log("× ROUTE_WP $index failed after 3 attempts");
+          _log("× ROUTE_WP $index failed after 2 attempts");
           rethrow;
         }
       }
@@ -1343,7 +1357,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     if (!state.isConnected) {
       throw StateError('not connected');
     }
-    for (var attempt = 0; attempt < 3; attempt++) {
+    for (var attempt = 0; attempt < 2; attempt++) {
       final completer = Completer<String>();
       _routeAckWaiter = completer;
       _routeAckMatcher = (ack) => ack == "OK,ROUTE,$expectedCount";
@@ -1359,10 +1373,10 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       } catch (e) {
         _routeAckWaiter = null;
         _routeAckMatcher = null;
-        if (attempt < 2) {
-          _log("× ROUTE_END ack timeout, retry ${attempt + 1}/3");
+        if (attempt == 0) {
+          _log("× ROUTE_END ack timeout, retry 1/1");
         } else {
-          _log("× ROUTE_END failed after 3 attempts");
+          _log("× ROUTE_END failed after 2 attempts");
           rethrow;
         }
       }

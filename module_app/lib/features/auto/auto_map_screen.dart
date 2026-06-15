@@ -322,7 +322,16 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   }
 
   Future<void> _sendRoute(BuildContext context, WidgetRef ref) async {
-    if (_routeSending) return;
+    if (_routeSending) {
+      // Не глотаем нажатие молча — даём понять, что уже в процессе.
+      _showNotice(
+        ref,
+        title: 'Отправка уже идёт',
+        message: 'Подождите, прогресс ${_routeSendProgress}/${_route.length}.',
+        kind: NoticeKind.info,
+      );
+      return;
+    }
     setState(() {
       _routeSending = true;
       _routeSendProgress = 0;

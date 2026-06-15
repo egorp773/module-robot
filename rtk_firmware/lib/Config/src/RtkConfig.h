@@ -62,7 +62,7 @@
 // pctToHover(8,8) = 8*2*300/(2*70) = команда платы 34/300. Чтобы автономка на полном ходу
 // давала ту же команду 34, нужно leftPct=8 при baseSpeed=ROVER_MAX_SPEED_MPS:
 //   scale = ROVER_AUTO_MAX_PERCENT / ROVER_MAX_SPEED_MPS = 8 / 0.25 = 32
-//   baseSpeed 0.25 * 32 = 8 → pctToHover(8,8) = 34. Совпадает с ручным 16%.
+//   baseSpeed 0.25 * 32 = 8 → pctToHover(8,8) = 34. Совпадает с ручной 16%.
 #define ROVER_AUTO_MAX_PERCENT 8
 #define ROVER_MAX_SPEED_MPS  0.25f
 // FLOAT едет с той же скоростью что и FIXED (на FLOAT hAcc уже ~2см, безопасно) —
@@ -73,14 +73,19 @@
 #define ROVER_INITIAL_HEADING_DEG 176.0f  // физ. старт-курс робота (выставлен на улице)
 #define ROVER_ARRIVAL_RADIUS 0.10f
 #define ROVER_ARRIVAL_CONFIRM_S 1.5f
-#define ROVER_LOOKAHEAD_MIN  0.5f
-#define ROVER_LOOKAHEAD_MAX  1.2f
-#define ROVER_LOOKAHEAD_GAIN 1.5f
-#define ROVER_K_HEADING      0.55f
-#define ROVER_K_CROSSTRACK   0.08f
+// Lookahead для Stanley: целевая точка берётся НА СЕГМЕНТЕ на расстоянии lookahead
+// вперёд по сегменту, а не сам waypoint — это устраняет прыжки heading на handoff
+// и осцилляции в окрестности WP. (Sunray: LOOOKAHEAD=1.0m.)
+#define ROVER_LOOKAHEAD_M    0.70f
+// Stanley controller (Sunray: STANLEY_CONTROL_P=3.0, K=1.0):
+//   w = k_heading*headingErr_rad + atan(k_crosstrack*ct / (k_soft + |v|))
+// Усиления увеличены vs старой версии (0.55 / 0.08) — старые были насыщены clamp.
+#define ROVER_K_HEADING       2.20f
+#define ROVER_K_CROSSTRACK    0.80f
+#define ROVER_STANLEY_SOFT_SPEED 0.30f
 #define ROVER_TURN_THRESH_DEG 25.0f
-#define ROVER_ROTATE_SPEED_RADPS 0.25f
-#define ROVER_MAX_ANGULAR_RADPS 0.28f
+#define ROVER_ROTATE_SPEED_RADPS 0.40f
+#define ROVER_MAX_ANGULAR_RADPS 0.80f   // ~46°/s — хватает чтобы выйти из 60° ошибки
 // Разворот на месте: гистерезис входа/выхода + МИНИМАЛЬНАЯ угл. скорость (пробить трение гусениц).
 // ВЫВЕРИТЬ TURN_MIN на железе: робот должен реально поворачиваться, а не дёргаться на месте.
 #define ROVER_TURN_IN_PLACE_ENTER_DEG 70.0f
@@ -88,16 +93,20 @@
 #define ROVER_TURN_MIN_RADPS          0.10f
 #define ROVER_TURN_IN_PLACE_TIMEOUT_MS 2500u
 #define ROVER_TURN_IN_PLACE_COOLDOWN_MS 1200u
-#define ROVER_STANLEY_SOFT_SPEED 0.08f
-#define ROVER_HANDOFF_FRAC    0.10f   // handoff = segLen * this
-#define ROVER_HANDOFF_MAX_M   0.30f
-#define ROVER_HANDOFF_MIN_M   0.08f
-#define ROVER_BOUNDARY_TOLERANCE_M 0.05f
-#define ROVER_BOUNDARY_SAMPLE_M    0.10f
-#define ROVER_CROSSTRACK_HOLD_M    0.60f
+#define ROVER_HANDOFF_FRAC    0.30f   // handoff = segLen * this
+#define ROVER_HANDOFF_MAX_M   0.80f
+#define ROVER_HANDOFF_MIN_M   0.20f
+#define ROVER_BOUNDARY_TOLERANCE_M 0.10f
+#define ROVER_BOUNDARY_SAMPLE_M    0.15f
+// Crosstrack guard (не fault — мягкая коррекция через 0.3м, fault только через 1.0м).
+#define ROVER_CROSSTRACK_SOFT_M    0.30f
+#define ROVER_CROSSTRACK_HARD_M    1.00f
 #define ROVER_STUCK_TIMEOUT_MS     4000u
 #define ROVER_STUCK_MIN_CMD_MPS    0.05f
 #define ROVER_STUCK_MIN_MOVE_M     0.05f
+// Recovery: после 3 fault подряд в одном WP — замедляемся до degraded и пробуем
+// переиграть waypoint, а не финишируем маршрут.
+#define ROVER_FAULT_RECOVERY_COUNT 3
 
 // ---------------- Telemetry period ----------------
 #define TEL_PERIOD_MS       200

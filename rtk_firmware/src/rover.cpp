@@ -36,8 +36,6 @@ struct Follower {
     float headingErr = 0;
     float crossTrack = 0;
     float distToTarget = 0;
-    // Поля разворота на месте удалены: GPS-only heading не позволяет разворот стоя
-    // (курс набирается только в движении), поэтому всегда едем вперёд по дуге.
     bool  arrived = false;
     uint32_t arrivedSinceMs = 0;
     const char* faultReason = nullptr;
@@ -45,6 +43,10 @@ struct Follower {
     float progressX = 0;
     float progressY = 0;
     uint32_t progressSinceMs = 0;
+    // Recovery counter: сколько fault подряд в одном WP без прогресса. После порога —
+    // не финишируем маршрут, а переключаемся в degraded-режим и пробуем снова.
+    int   faultCount = 0;
+    int   lastFaultWp = -1;
 
     void reset() {
         wpIdx = 0; running = false; paused = false;
@@ -54,6 +56,8 @@ struct Follower {
         progressInit = false;
         progressX = progressY = 0;
         progressSinceMs = 0;
+        faultCount = 0;
+        lastFaultWp = -1;
     }
 } g_follow;
 
@@ -77,12 +81,28 @@ static void serviceMotorFor(uint32_t durationMs) {
 }
 
 static void followerFault(const char* reason) {
-    g_follow.running = false;
-    g_follow.arrived = false;
+    // Мягкий fault: НЕ финишируем маршрут, НЕ глушим мотоpы глобально. Считаем попытки
+    // на текущем WP. После ROVER_FAULT_RECOVERY_COUNT фейлов подряд — сдаёмся и
+    // переходим в ERROR (приложение увидит через NAV,... телеметрию). Это даёт шанс
+    // восстановиться после GPS-бленка / кратковременной потери FIXED.
     g_follow.faultReason = reason;
     g_follow.progressInit = false;
-    g_route.finish();
     g_motor.stopImmediately();
+    if (g_follow.lastFaultWp != g_follow.wpIdx) {
+        g_follow.lastFaultWp = g_follow.wpIdx;
+        g_follow.faultCount = 1;
+    } else {
+        g_follow.faultCount++;
+    }
+    if (g_follow.faultCount >= ROVER_FAULT_RECOVERY_COUNT) {
+        g_follow.running = false;
+        g_follow.arrived = false;
+        g_route.finish();
+        Serial.printf("[ROVER] fault terminal: %s (count=%d)\n", reason, g_follow.faultCount);
+    } else {
+        Serial.printf("[ROVER] fault soft: %s (count=%d/%d) — retrying\n",
+                      reason, g_follow.faultCount, ROVER_FAULT_RECOVERY_COUNT);
+    }
 }
 
 static bool checkFollowerProgress(const Estimate& e, float commandedSpeed) {
@@ -152,10 +172,14 @@ static void stepFollower() {
     const auto& e = g_est.get();
     int total = g_route.count();
     NavPoint current{e.x, e.y};
+
+    // Hard guard: выход за boundary > HARD tolerance — это однозначно потеря позиции
+    // (сдвиг origin, обрыв RTCM, накопление ошибки). После 3 попыток — ERROR.
     if (!g_route.positionAllowed(current, ROVER_BOUNDARY_TOLERANCE_M)) {
         followerFault("perimeter_violation");
         return;
     }
+
     if (total == 0 || g_follow.wpIdx >= total) {
         g_motor.setLinearAngularSpeed(0, 0, true);
         g_follow.running = false;
@@ -166,23 +190,89 @@ static void stepFollower() {
 
     const Waypoint& wp = g_route.waypoint(g_follow.wpIdx);
     const Waypoint* prevWp = (g_follow.wpIdx > 0) ? &g_route.waypoint(g_follow.wpIdx - 1) : nullptr;
-    float dx = wp.p.x - e.x;
-    float dy = wp.p.y - e.y;
-    float dist = sqrtf(dx*dx + dy*dy);
 
-    // handoff distance: для промежуточных — короче, для финала — arrival radius
+    // ===== Активный сегмент =====
+    // Сегмент = (prevWp, wp). Для первого WP prevWp = nullptr — это вырожденный случай
+    // (старт маршрута, робот ещё в начале первого сегмента).
+    float segDx, segDy, segLen;
+    if (prevWp) {
+        segDx = wp.p.x - prevWp->p.x;
+        segDy = wp.p.y - prevWp->p.y;
+    } else {
+        // Старт: "сегмент" = направление на WP (для расчёта heading, без crosstrack).
+        segDx = wp.p.x - current.x;
+        segDy = wp.p.y - current.y;
+    }
+    segLen = sqrtf(segDx * segDx + segDy * segDy);
+
+    // ===== Lookahead target на сегменте (Sunray LOOOKAHEAD) =====
+    // Целевая точка = точка на сегменте на расстоянии lookahead ВПЕРЁД от проекции
+    // робота на сегмент. Если проекция за началом — цепляем к началу; если за WP —
+    // цепляемся к WP (для коротких сегментов).
+    float t = 0.0f;
+    if (prevWp && segLen > 0.05f) {
+        t = ((current.x - prevWp->p.x) * segDx + (current.y - prevWp->p.y) * segDy) / (segLen * segLen);
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+    }
+    // Точка проекции
+    float projX, projY;
+    if (prevWp) {
+        projX = prevWp->p.x + segDx * t;
+        projY = prevWp->p.y + segDy * t;
+    } else {
+        projX = current.x; projY = current.y;
+    }
+    // Lookahead target
     bool finalWp = (g_follow.wpIdx + 1 >= total);
+    float maxLa = (prevWp && !finalWp) ? min(ROVER_LOOKAHEAD_M, segLen * 0.5f) : 0.0f;
+    float laT = t + (maxLa / max(segLen, 0.05f));
+    if (laT > 1.0f) laT = 1.0f;
+    NavPoint lookAt;
+    if (prevWp) {
+        lookAt.x = prevWp->p.x + segDx * laT;
+        lookAt.y = prevWp->p.y + segDy * laT;
+    } else {
+        lookAt = wp.p;
+    }
+    // Финальный WP: целимся прямо в WP (lookahead = 0)
+    if (finalWp) {
+        lookAt = wp.p;
+    }
+
+    // ===== Расстояние до WP (для handoff и телеметрии) =====
+    float wdx = wp.p.x - current.x;
+    float wdy = wp.p.y - current.y;
+    float distToWp = sqrtf(wdx * wdx + wdy * wdy);
+    g_follow.distToTarget = distToWp;
+
+    // ===== Crosstrack (поперечное отклонение от линии сегмента) =====
+    g_follow.crossTrack = 0;
+    if (prevWp && segLen > 0.05f) {
+        float rx = current.x - prevWp->p.x;
+        float ry = current.y - prevWp->p.y;
+        // Знак: положительный = слева от направления движения
+        g_follow.crossTrack = (segDx * ry - segDy * rx) / segLen;
+        if (fabsf(g_follow.crossTrack) > ROVER_CROSSTRACK_HARD_M) {
+            // hard: 1.0 м — действительно потеряли путь, делаем recovery
+            followerFault("cross_track_hard");
+            return;
+        }
+    }
+
+    // ===== Handoff: переключение на следующий WP =====
     float handoff;
     if (finalWp) {
         handoff = ROVER_ARRIVAL_RADIUS;
-    } else {
-        const Waypoint& next = g_route.waypoint(g_follow.wpIdx + 1);
-        float segLen = sqrtf((next.p.x - wp.p.x)*(next.p.x - wp.p.x) +
-                             (next.p.y - wp.p.y)*(next.p.y - wp.p.y));
+    } else if (prevWp) {
         handoff = max(ROVER_HANDOFF_MIN_M, min(ROVER_HANDOFF_MAX_M, segLen * ROVER_HANDOFF_FRAC));
+    } else {
+        // старт маршрута: пока нет prevWp, фиксированно ждём 0.5м отхода
+        handoff = 0.5f;
     }
-
-    if (dist < handoff) {
+    if (distToWp < handoff) {
+        g_follow.faultCount = 0;   // сброс — мы в норме
+        g_follow.lastFaultWp = -1;
         g_follow.wpIdx++;
         if (g_follow.wpIdx >= total) {
             g_follow.running = false;
@@ -195,62 +285,56 @@ static void stepFollower() {
         return;
     }
 
-    float lineDx = dx;
-    float lineDy = dy;
-    g_follow.crossTrack = 0;
-    if (prevWp) {
-        lineDx = wp.p.x - prevWp->p.x;
-        lineDy = wp.p.y - prevWp->p.y;
-        float lineLen = sqrtf(lineDx * lineDx + lineDy * lineDy);
-        if (lineLen > 0.05f) {
-            float rx = e.x - prevWp->p.x;
-            float ry = e.y - prevWp->p.y;
-            g_follow.crossTrack = (lineDx * ry - lineDy * rx) / lineLen;
-            if (fabsf(g_follow.crossTrack) > ROVER_CROSSTRACK_HOLD_M) {
-                followerFault("cross_track_limit");
-                return;
-            }
-        } else {
-            lineDx = dx;
-            lineDy = dy;
-        }
-    }
-
     if (!g_route.segmentAllowed(current, wp.p, ROVER_BOUNDARY_TOLERANCE_M, ROVER_BOUNDARY_SAMPLE_M)) {
         followerFault("route_segment_blocked");
         return;
     }
 
-    // Желаемый курс — вдоль активного сегмента пути (не только на waypoint).
-    float desiredHeading = atan2f(lineDx, lineDy) * 180.0f / M_PI;
+    // ===== Желаемый heading = направление на lookahead target =====
+    // Это плавнее, чем "вдоль сегмента" — при подходе к финалу lookahead
+    // автоматически сокращается, и headingErr естественно → 0.
+    float ldx = lookAt.x - current.x;
+    float ldy = lookAt.y - current.y;
+    if (ldx*ldx + ldy*ldy < 1e-4f) {
+        ldx = segDx; ldy = segDy;
+    }
+    float desiredHeading = atan2f(ldx, ldy) * 180.0f / M_PI;
     if (desiredHeading < 0) desiredHeading += 360.0f;
     float headingErr = wrapDeg180Local(desiredHeading - e.headingFiltDeg);
     g_follow.headingErr = headingErr;
 
-    // Базовая скорость по уровню безопасности (RTK-качество).
+    // ===== Скорость по safety + heading + crosstrack =====
     float baseSpeed = ROVER_MAX_SPEED_MPS;
     if (g_safety.level() == SAFETY_DEGRADED) baseSpeed = ROVER_FLOAT_SPEED;
     else if (g_safety.level() == SAFETY_HOLD) baseSpeed = 0;
     else if (g_safety.level() == SAFETY_ESTOP) baseSpeed = 0;
 
     float absErr = fabsf(headingErr);
+    float absCt  = fabsf(g_follow.crossTrack);
 
-    // ===== GPS-only рулёжка: ВСЕГДА едем вперёд, поворот по ДУГЕ =====
-    // Курс берётся только из GPS motion heading и обновляется лишь когда робот ДВИЖЕТСЯ.
-    // Поэтому разворот на месте невозможен: стоя, робот не узнает, что повернулся, и
-    // крутился бы вечно. Вместо этого всегда даём линейную скорость (робот едет),
-    // а большую ошибку курса отрабатываем угловой скоростью — получается поворот по дуге,
-    // во время которого GPS-курс набирается и ошибка естественно уменьшается.
-    // (Эталон поведения: OpenMower/Sunray на одной GPS-антенне.)
+    // GPS-only рулёжка: всегда едем вперёд, поворот по дуге (Stanley).
+    // Притормаживаем у цели — но не до нуля, иначе GPS heading заморозится.
+    if (distToWp < 0.30f)      baseSpeed *= 0.45f;
+    else if (distToWp < 0.60f) baseSpeed *= 0.70f;
 
-    // Притормаживаем у цели — но НЕ до нуля, иначе курс перестанет набираться.
-    if (dist < 0.30f)      baseSpeed *= 0.45f;
-    else if (dist < 0.60f) baseSpeed *= 0.70f;
-    // При большой ошибке курса едем медленнее (круче дуга), но сохраняем ход вперёд:
-    // пол 0.35 гарантирует, что робот всё равно движется и GPS обновляет курс.
-    baseSpeed *= clampf(1.0f - absErr / 120.0f, 0.35f, 1.0f);
+    // При большой heading-ошибке — медленнее (круче дуга), но пол 0.40 гарантирует
+    // что робот движется и GPS-heading обновляется.
+    baseSpeed *= clampf(1.0f - absErr / 120.0f, 0.40f, 1.0f);
 
-    // Угловая скорость: ошибка курса (P-регулятор) + Stanley cross-track.
+    // При большом crosstrack — тоже медленнее (корректирующая дуга).
+    if (absCt > ROVER_CROSSTRACK_SOFT_M) {
+        baseSpeed *= clampf(1.0f - (absCt - ROVER_CROSSTRACK_SOFT_M) / 0.5f, 0.50f, 1.0f);
+    }
+
+    // Если уже были fault на этом WP — едем осторожнее.
+    if (g_follow.faultCount > 0) {
+        baseSpeed *= 0.6f;
+    }
+
+    // ===== Stanley =====
+    // headingTerm — P по heading-ошибке (в рад/с)
+    // crosstrackTerm — atan2(K*ct, soft + |v|) — пропорционально отклонению,
+    //                  делённому на скорость (классический Stanley)
     float headingTerm = ROVER_K_HEADING * headingErr * M_PI / 180.0f;
     float crosstrackTerm = atan2f(ROVER_K_CROSSTRACK * g_follow.crossTrack,
                                   ROVER_STANLEY_SOFT_SPEED + fabsf(baseSpeed));
@@ -258,7 +342,6 @@ static void stepFollower() {
     w = clampf(w, -ROVER_MAX_ANGULAR_RADPS, ROVER_MAX_ANGULAR_RADPS);
     g_follow.linearMps   = baseSpeed;
     g_follow.angularRadps = w;
-    g_follow.distToTarget = dist;
 
     if (!checkFollowerProgress(e, baseSpeed)) {
         return;
