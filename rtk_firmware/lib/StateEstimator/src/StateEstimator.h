@@ -2,6 +2,7 @@
 
 #pragma once
 #include <Arduino.h>
+#include "RtkEkf.h"
 
 enum SolType : uint8_t {
     SOL_INVALID = 0,
@@ -59,6 +60,10 @@ public:
     // apply new RXM-RTCM info (F9P decode side)
     void onRtcmInfo(uint32_t nowMs, int lastType, int msgCount, int crcFail);
 
+    // Одометрия от hoverboard feedback: speedL_meas, speedR_meas (в единицах платы).
+    // Внутри переводим в м/с через ROVER_WHEEL_CIRCUM_M и используем для EKF predict.
+    void onHoverboardFeedback(uint32_t nowMs, int speedL_meas, int speedR_meas);
+
     // периодический tick — обновляет возраст и фильтры
     void tick(uint32_t nowMs);
 
@@ -105,4 +110,11 @@ private:
     uint32_t _lastFixMs = 0;
     uint32_t _lastAcceptedPositionMs = 0;
     uint32_t _lastHeadingMs = 0;
+
+    // EKF
+    RtkEkf _ekf;
+    uint32_t _lastPredictMs = 0;
+    float _lastSpeedLMps = 0;
+    float _lastSpeedRMps = 0;
+    float _lastYawRateRadps = 0;
 };

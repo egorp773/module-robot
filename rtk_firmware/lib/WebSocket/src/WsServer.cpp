@@ -259,7 +259,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
             sendText(client, "ERR,POSITION_STALE");
         } else if (e.rejectedPositionFixes > 0) {
             sendText(client, "ERR,GPS_JUMP");
-        } else if (e.headingAgeMs > SAFE_HEADING_AGE_MS) {
+        } else if (!e.headingValid || e.headingAgeMs > SAFE_HEADING_AGE_MS) {
             sendText(client, "ERR,HEADING_STALE");
         } else if (_imu && _imu->ageMs(now) > SAFE_IMU_AGE_MS) {
             sendText(client, "ERR,IMU_STALE");

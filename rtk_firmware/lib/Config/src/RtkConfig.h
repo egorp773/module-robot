@@ -58,6 +58,12 @@
 
 // ---------------- Rover behaviour ----------------
 #define ROVER_WHEELBASE_M   0.38f
+// Длина гусеницы по внешнему краю (примерно): 42 + 18 + 42 + 18 = 120 см,
+// но эффективная рабочая длина (без скольжения) грубо ~0.6м. Калибруется
+// по одометрии: на 1 оборот шкива гусеница проходит ~wheel_circumference.
+// Для старта — 0.6м. Точная калибровка по HITL.
+#define ROVER_WHEEL_CIRCUM_M 0.6f
+#define ROVER_HOVER_MEAS_TO_RPM  6.0f   // speed_meas / 6 ≈ RPM (зависит от прошивки hoverboard)
 #define ROVER_MAX_PWM       70
 #define ROVER_INPUT_DIV     2
 #define ROVER_CMD_TIMEOUT_MS 400

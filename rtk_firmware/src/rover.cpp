@@ -422,6 +422,9 @@ void loop() {
             g_gnss.lastNumSv(), g_gnss.lastPDop());
     }
     g_est.onImu(now, g_imu.yawRateDps(), g_imu.fresh() && g_imu.ageMs(now) < SAFE_IMU_AGE_MS);
+    // Hoverboard feedback → EKF predict. TX-задача на ядре 0 обновляет _fb в Motor;
+    // здесь читаем актуальные обороты. Если feedback ещё не пришёл, шлёт 0/0.
+    g_est.onHoverboardFeedback(now, g_motor.speedLeftMeas(), g_motor.speedRightMeas());
     g_est.tick(now);
 
     SafetyInput si;

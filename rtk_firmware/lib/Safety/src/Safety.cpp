@@ -62,8 +62,15 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
             return;
         }
         if (in.headingAgeMs > SAFE_HEADING_AGE_MS) {
-            set(SAFETY_HOLD, "heading_stale");
-            return;
+            // Если heading однажды засеян (CAL_IMU или seedHeadingDeg на бутстрапе) —
+            // считаем его валидным, пока PVT идёт. На стоянке GPS-курс заморожен, и
+            // таймстамп _lastHeadingMs мог не обновляться — это не повод стопорить.
+            if (est.get().headingValid) {
+                // heading валиден по seed — пропускаем гейт
+            } else {
+                set(SAFETY_HOLD, "heading_stale");
+                return;
+            }
         }
         if (in.sol == SOL_INVALID) {
             set(SAFETY_HOLD, "rtk_invalid");

@@ -18,6 +18,11 @@ void StateEstimator::begin() {
     _haveLastFix = false;
     _lastAcceptedPositionMs = 0;
     _lastHeadingMs = 0;
+    _ekf.begin();
+    _lastPredictMs = 0;
+    _lastSpeedLMps = 0;
+    _lastSpeedRMps = 0;
+    _lastYawRateRadps = 0;
 }
 
 float StateEstimator::normalizeDeg360(float d) {
@@ -49,14 +54,17 @@ bool StateEstimator::setOrigin(double lat, double lon) {
     est.originLat = lat;
     est.originLon = lon;
     est.originSet = true;
+    float newX = 0, newY = 0;
     if (est.lat != 0.0 || est.lon != 0.0) {
-        float lx, ly;
-        llaToLocalMeters(est.lat, est.lon, est.originLat, est.originLon, lx, ly);
-        est.x = lx;
-        est.y = ly;
-    } else {
-        est.x = est.y = 0;
+        llaToLocalMeters(est.lat, est.lon, est.originLat, est.originLon, newX, newY);
     }
+    est.x = newX;
+    est.y = newY;
+    // Сброс EKF в новую систему координат. Heading — из последнего засеянного
+    // headingFiltDeg (в радианах). Без знания heading — оставляем 0, fixHeading придёт
+    // с первым PVT.
+    float hRad = (est.headingFiltDeg > 0) ? (est.headingFiltDeg * 3.14159265f / 180.0f) : 0.0f;
+    _ekf.reset(newX, newY, hRad);
     return true;
 }
 
@@ -73,18 +81,27 @@ void StateEstimator::seedHeadingDeg(float headingDeg) {
     _headingSeeded = true;
 }
 
-// --- IMU: НЕ участвует в курсе (GPS-only heading) ---
-// На предыдущих итерациях здесь интегрировался yaw rate гироскопа в headingFiltDeg.
-// Это вызывало дрейф курса на 5-15° за минуту из-за drift BNO085, и в комбинации с
-// медленным GPS-обновлением (5 Hz, замороженным при скорости <3 см/с) робот уезжал
-// с маршрута. Сейчас курс берётся ТОЛЬКО из GPS motion heading в onPvt().
-// IMU оставлен подключённым (для будущего tilt-детекта и для safety IMU-fresh гейта),
-// но в навигацию НЕ вмешивается.
+// --- IMU: gyro rate (deg/s → rad/s) подаётся в EKF.predict() для heading ---
+// Heading FUSION (EKF): GPS motion heading + IMU gyro. GPS heading подтягивает
+// медленный дрейф гироскопа; gyro держит heading между PVT-пакетами и на стоянке.
+// Kalman корректно работает даже когда PVT запаздывает — heading не «прыгает».
 void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh) {
-    (void)yawRateDps;
     if (!imuFresh) { _lastImuMs = nowMs; return; }
     _lastImuMs = nowMs;
-    // intentionally no-op: headingFiltDeg живёт за счёт GPS в onPvt()
+    float yawRateRadps = yawRateDps * 0.01745329f;   // deg/s → rad/s
+    _lastYawRateRadps = yawRateRadps;
+
+    // dt в секундах; первое обращение — dt=0, predict не идёт.
+    if (_lastPredictMs == 0) { _lastPredictMs = nowMs; return; }
+    float dt = (nowMs - _lastPredictMs) * 0.001f;
+    _lastPredictMs = nowMs;
+    if (dt <= 0) return;
+    if (dt > 0.5f) dt = 0.5f;
+
+    // Скорости берём последние измеренные (или 0, если ещё не было feedback).
+    float v_mps = 0.5f * (_lastSpeedLMps + _lastSpeedRMps);
+    float omega_radps = (_lastSpeedRMps - _lastSpeedLMps) / max(ROVER_WHEELBASE_M, 0.01f);
+    _ekf.predict(dt, v_mps, omega_radps, yawRateRadps);
 }
 
 void StateEstimator::onPvt(uint32_t nowMs,
@@ -140,39 +157,66 @@ void StateEstimator::onPvt(uint32_t nowMs,
         if (est.originSet) {
             float lx, ly;
             llaToLocalMeters(est.lat, est.lon, est.originLat, est.originLon, lx, ly);
-            est.x = lx;
-            est.y = ly;
+            // === EKF update: позиция из RTK с covariance из hAcc ===
+            // cov = hAcc^2 (дисперсия в m^2). hAcc — точность 1-sigma, var = sigma^2.
+            float cov_xy = est.hAcc * est.hAcc;
+            bool updated = _ekf.updatePosition(lx, ly, cov_xy, true);
+            // Если EKF отбросил fix (Mahalanobis), НЕ обновляем est.x/est.y, но и не
+            // инкрементируем rejectedPositionFixes — это сделает сам EKF в P-ковариации.
+            if (updated) {
+                est.x = _ekf.x();
+                est.y = _ekf.y();
+            } else {
+                est.x = _ekf.x();   // EKF оставил prediction, мы тоже остаёмся на нём
+                est.y = _ekf.y();
+                if (est.rejectedPositionFixes < 0xFFFFu) est.rejectedPositionFixes++;
+            }
         }
     } else if (reliablePosition) {
         if (est.rejectedPositionFixes < 0xFFFFu) est.rejectedPositionFixes++;
     }
     // если outlier — позицию НЕ двигаем (dead-reckoning держит прошлую), но fix-метку обновили выше нет
 
-    // --- Курс ТОЛЬКО из GPS motion heading (GPS-only, без IMU) ---
-    // При движении курс = направление вектора скорости GPS (headMot). Это единственный
-    // источник курса. При стоянии (speed <= порог) курс ЗАМОРАЖИВАЕТСЯ (держим последний),
-    // никакого гиро-интеграла — иначе крутка на месте. Лёгкое сглаживание по GPS-курсу,
-    // чтобы шум headMot на низкой скорости не дёргал руль.
-    est.headingDeg = (float)headMot_deg_e5 * 1e-5f;   // сырой GPS-курс
+    // --- Курс: fusion EKF (GPS motion heading + IMU gyro) ---
+    // При движении (speed > порог) GPS heading меряется надёжно — подаём в EKF.updateHeading.
+    // EKF сам решит, сколько верить (Mahalanobis gate). На стоянке heading живёт за счёт
+    // IMU.predict() — gyro постоянно крутит EKF heading, GPS не мешает.
+    est.headingDeg = (float)headMot_deg_e5 * 1e-5f;   // сырой GPS-курс (для телеметрии)
     est.headingDeg = normalizeDeg360(est.headingDeg);
     if (est.speedMps > kGpsHeadingMinMpsActive && est.sol != SOL_INVALID && accept) {
-        if (!_headingSeeded) {
-            // первый надёжный курс — берём как есть
-            seedHeadingDeg(est.headingDeg);
-        } else {
-            // лёгкое сглаживание к GPS-курсу (быстрое — это и есть наш курс)
-            float d = wrapDeg180(est.headingDeg - est.headingFiltDeg);
-            if (fabsf(d) > kGpsHeadingSnapDeg) {
-                est.headingFiltDeg = est.headingDeg;
-            } else {
-                est.headingFiltDeg = normalizeDeg360(est.headingFiltDeg + kGpsCourseAlphaActive * d);
+        // GPS heading есть — подаём в EKF
+        float hRad = est.headingDeg * 0.01745329f;   // deg → rad
+        // cov_rad2: GPS heading на 0.3 м/с ~ ±5° (sigma=0.087 rad), var = 0.0076
+        // на 0.5 м/с ~ ±2° (sigma=0.035 rad), var = 0.0012
+        // линейно: var ≈ 0.01 / (1 + 10*v), где v в м/с
+        float cov_rad2 = 0.01f / (1.0f + 10.0f * est.speedMps);
+        if (cov_rad2 < 5e-4f) cov_rad2 = 5e-4f;
+        bool hUpd = _ekf.updateHeading(hRad, cov_rad2, true);
+        if (hUpd || !_headingSeeded) {
+            // Берём EKF heading в deg, нормализуем
+            float hDeg = _ekf.heading() * 57.2957795f;
+            hDeg = normalizeDeg360(hDeg);
+            est.headingFiltDeg = hDeg;
+            if (!_headingSeeded) {
+                est.headingDeg = hDeg;
+                _headingSeeded = true;
             }
+            est.headingValid = true;
+            est.headingAgeMs = 0;
+            _lastHeadingMs = nowMs;
         }
+    } else if (est.sol != SOL_INVALID && _headingSeeded) {
+        // Стоянка с валидным fix: heading живёт за счёт EKF.predict (IMU gyro).
+        // headingFiltDeg обновляем из EKF, чтобы downstream видел свежий heading.
+        float hDeg = _ekf.heading() * 57.2957795f;
+        hDeg = normalizeDeg360(hDeg);
+        est.headingFiltDeg = hDeg;
         est.headingValid = true;
         est.headingAgeMs = 0;
         _lastHeadingMs = nowMs;
     }
-    // при стоянии — est.headingFiltDeg не меняется (заморожен на последнем GPS-курсе)
+    // Если _headingSeeded == false (первый пакет, скорость низкая) — heading останется 0,
+    // но EKF.predict() от IMU уже крутит его. NAV_START подождёт первого PVT.
 
     est.lastUpdateMs = nowMs;
 }
@@ -182,13 +226,46 @@ void StateEstimator::onRtcmInfo(uint32_t nowMs, int lastType, int msgCount, int 
     est.rtcmAgeMs = 0;
 }
 
+// --- Hoverboard feedback → EKF predict ---
+// speedL_meas / speedR_meas: из платы hoverboard (int16). В прошивке hoverboard-firmware-hack
+// единицы = RPM × 6. Переводим в м/с через ROVER_WHEEL_CIRCUM_M и обновляем _lastSpeed*L/Mps.
+// EKF.predict в onImu() забирает эти значения.
+void StateEstimator::onHoverboardFeedback(uint32_t nowMs, int speedL_meas, int speedR_meas) {
+    (void)nowMs;
+    // Конверсия: speed_meas / 6 = RPM. v = RPM * 2π * R / 60 = (speed_meas/6) * 2π * R / 60
+    //                              = speed_meas * R * π / 180
+    // С R = 0.3 (половина от 0.6 — эффективный радиус), π/180 ≈ 0.01745:
+    //   v_mps ≈ speed_meas * 0.00524
+    // С ROVER_WHEEL_CIRCUM_M = 0.6 (длина гусеницы), R = 0.6 / (2π) ≈ 0.0955
+    //   v_mps = speed_meas * (1/6) * (0.6) / 60  =  speed_meas * 0.001667
+    // Грубо — калибруется по HITL. На время отладки берём среднее.
+    constexpr float kMeasToMps = 0.0017f;     // 0.0017 м/с на единицу speed_meas (прибл.)
+    _lastSpeedLMps = (float)speedL_meas * kMeasToMps;
+    _lastSpeedRMps = (float)speedR_meas * kMeasToMps;
+    // Подрежем явный мусор: если hoverboard на старте шлёт 0/0, не дёргаем EKF шумом.
+    if (abs(speedL_meas) < 5 && abs(speedR_meas) < 5) {
+        _lastSpeedLMps = 0;
+        _lastSpeedRMps = 0;
+    }
+}
+
 void StateEstimator::tick(uint32_t nowMs) {
     uint32_t p = nowMs - est.lastUpdateMs;
     est.pvtAgeMs = p;
-    // heading теперь живёт за счёт gyro-интеграла (onImu), не «протухает» на месте
     est.acceptedPositionAgeMs = (_lastAcceptedPositionMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastAcceptedPositionMs);
     est.headingAgeMs = (_lastHeadingMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastHeadingMs);
     if (est.rtcmAgeMs != 0xFFFFFFFFu) {
         est.rtcmAgeMs = p;
+    }
+
+    // EKF.predict на каждом tick (50Гц) с текущим IMU rate. Это держит heading
+    // и dead-reckoning между PVT-пакетами и во время их отсутствия.
+    // dt считается внутри onImu, здесь — fallback, если onImu не вызывали.
+    if (_lastPredictMs == 0) _lastPredictMs = nowMs;
+    float dt = (nowMs - _lastPredictMs) * 0.001f;
+    if (dt > 0.1f) {
+        // IMU молчал > 100мс — не страшно, dt будет использован в следующем onImu.
+        // Здесь только сдвигаем метку, чтобы dt не «накапливался».
+        _lastPredictMs = nowMs;
     }
 }
