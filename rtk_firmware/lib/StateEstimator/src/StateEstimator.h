@@ -85,6 +85,8 @@ private:
     static constexpr float kGpsCourseAlphaActive = 0.30f;
     static constexpr float kGpsHeadingMinMpsActive = 0.03f;
     static constexpr float kGpsHeadingSnapDeg = 45.0f;
+    static constexpr float kImuYawRateDeadbandDps = 0.35f;
+    static constexpr float kImuMaxDeltaDeg = 12.0f;
     // Комплементарный фильтр курса (Sunray-style, Вариант A):
     //   fused = integrate(gyro) ; при движении подтягиваем к GPS-course с этим alpha.
     static constexpr float kGpsCourseAlpha   = 0.05f;   // доля коррекции по GPS-курсу за PVT

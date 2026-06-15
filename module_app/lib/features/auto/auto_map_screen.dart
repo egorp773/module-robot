@@ -50,10 +50,10 @@ class AutoMapScreen extends ConsumerStatefulWidget {
 class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   static const double _draftLineStepMeters = 0.35;
   static const int _maxRouteWaypoints = 254;
-  static const int _maxBoundaryPoints = 24;
+  static const int _maxBoundaryPoints = _maxRouteWaypoints;
   static const int _maxForbiddenPolygons = 16;
-  static const int _maxForbiddenPoints = 24;
-  static const double _maxStartOutsideBoundaryMeters = 0.15;
+  static const int _maxForbiddenPoints = _maxRouteWaypoints;
+  static const double _maxStartOutsideBoundaryMeters = 0.0;
 
   ManualMapState? _mapState;
   bool _isLoading = true;
@@ -63,6 +63,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   double _routeRunTimeS = 0.0;
   bool _routeSent = false;
   bool _routeSending = false;
+  bool _navCommandSending = false;
   int _routeSendProgress = 0;
   String? _routeWorkflowError;
 
@@ -185,13 +186,12 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     return map.copyWith(robot: Offset(local.x, local.y));
   }
 
-  bool _startIsInsideOrNearBoundary(ManualMapState map, Offset start) {
+  bool _startIsInsideBoundary(ManualMapState map, Offset start) {
     for (final zone in map.zones) {
       final points =
           zone.points.where((p) => p.dx.isFinite && p.dy.isFinite).toList();
       if (points.length < 3) continue;
-      if (_pointInPolygon(start, points) ||
-          _distanceToPolygon(start, points) <= _maxStartOutsideBoundaryMeters) {
+      if (_pointInPolygon(start, points)) {
         return true;
       }
     }
@@ -210,27 +210,6 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       j = i;
     }
     return inside;
-  }
-
-  static double _distanceToPolygon(Offset p, List<Offset> poly) {
-    var best = double.infinity;
-    for (var i = 0; i < poly.length; i++) {
-      best = math.min(
-        best,
-        _distanceToSegment(p, poly[i], poly[(i + 1) % poly.length]),
-      );
-    }
-    return best;
-  }
-
-  static double _distanceToSegment(Offset p, Offset a, Offset b) {
-    final ab = b - a;
-    final len2 = ab.dx * ab.dx + ab.dy * ab.dy;
-    if (len2 <= 1e-9) return (p - a).distance;
-    final t = (((p.dx - a.dx) * ab.dx + (p.dy - a.dy) * ab.dy) / len2)
-        .clamp(0.0, 1.0);
-    final q = Offset(a.dx + ab.dx * t, a.dy + ab.dy * t);
-    return (p - q).distance;
   }
 
   static List<Offset> _normalizedPolygon(List<Offset> points) {
@@ -269,7 +248,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           );
       return;
     }
-    if (!_startIsInsideOrNearBoundary(map, currentStart)) {
+    if (!_startIsInsideBoundary(map, currentStart)) {
       ref.read(noticeProvider.notifier).show(
             const NoticeState(
               title: 'Start outside boundary',
@@ -286,7 +265,6 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       borderPasses: 1,
       startOverride: currentStart,
       maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
-      forbiddenMarginMeters: _maxStartOutsideBoundaryMeters,
       debugPrint: true,
     );
     cleaningRoute ??= CleaningRoutePlanner.planRoute(
@@ -296,7 +274,6 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       startOverride: currentStart,
       boundaryMarginMeters: 0.05,
       maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
-      forbiddenMarginMeters: _maxStartOutsideBoundaryMeters,
       debugPrint: true,
     );
 
@@ -367,6 +344,21 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           ref,
           title: 'Не подключено',
           message: 'Подключитесь к роботу перед отправкой маршрута.',
+          kind: NoticeKind.warning,
+        );
+        return;
+      }
+
+      final navState = wifi.navState?.toUpperCase();
+      if (navState == 'RUNNING' ||
+          navState == 'APPROACHING' ||
+          navState == 'PAUSED') {
+        const msg = 'Route upload blocked: navigation is active.';
+        setState(() => _routeWorkflowError = msg);
+        _showNotice(
+          ref,
+          title: 'Navigation active',
+          message: msg,
           kind: NoticeKind.warning,
         );
         return;
@@ -530,7 +522,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     }
   }
 
-  void _startNavigation(BuildContext context, WidgetRef ref) {
+  Future<void> _startNavigation(BuildContext context, WidgetRef ref) async {
     final wifi = ref.read(wifiConnectionProvider);
     if (!wifi.isConnected) {
       _showNotice(
@@ -561,22 +553,115 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       );
       return;
     }
-    ref.read(wifiConnectionProvider.notifier).sendNavStart();
+    if (_navCommandSending) return;
+    setState(() => _navCommandSending = true);
+    try {
+      await ref.read(wifiConnectionProvider.notifier).sendNavStart();
+      if (!mounted) return;
+    } catch (e) {
+      final err = 'NAV_START failed: $e';
+      if (mounted) setState(() => _routeWorkflowError = err);
+      _showNotice(
+        ref,
+        title: 'Start failed',
+        message: err,
+        kind: NoticeKind.danger,
+      );
+      return;
+    } finally {
+      if (mounted) setState(() => _navCommandSending = false);
+    }
     setState(() => _routeWorkflowError = null);
     _showNotice(
       ref,
       title: 'Автономка запущена',
-      message: 'NAV_START sent to ESP32 rover autopilot.',
+      message: 'Rover confirmed NAV_START.',
       kind: NoticeKind.info,
     );
   }
 
-  void _pauseNavigation(WidgetRef ref) {
-    ref.read(wifiConnectionProvider.notifier).sendNavPause();
+  Future<void> _pauseNavigation(WidgetRef ref) async {
+    if (_navCommandSending) return;
+    setState(() => _navCommandSending = true);
+    try {
+      await ref.read(wifiConnectionProvider.notifier).sendNavPause();
+      if (!mounted) return;
+      setState(() => _routeWorkflowError = null);
+      _showNotice(
+        ref,
+        title: 'Paused',
+        message: 'Rover confirmed NAV_PAUSE.',
+        kind: NoticeKind.info,
+      );
+    } catch (e) {
+      final err = 'NAV_PAUSE failed: $e';
+      if (mounted) setState(() => _routeWorkflowError = err);
+      _showNotice(
+        ref,
+        title: 'Pause failed',
+        message: err,
+        kind: NoticeKind.danger,
+      );
+    } finally {
+      if (mounted) setState(() => _navCommandSending = false);
+    }
   }
 
-  void _stopNavigation(WidgetRef ref) {
-    ref.read(wifiConnectionProvider.notifier).sendNavStop();
+  Future<void> _resumeNavigation(WidgetRef ref) async {
+    if (_navCommandSending) return;
+    setState(() => _navCommandSending = true);
+    try {
+      await ref.read(wifiConnectionProvider.notifier).sendNavResume();
+      if (!mounted) return;
+      setState(() => _routeWorkflowError = null);
+      _showNotice(
+        ref,
+        title: 'Resumed',
+        message: 'Rover confirmed NAV_RESUME.',
+        kind: NoticeKind.info,
+      );
+    } catch (e) {
+      final err = 'NAV_RESUME failed: $e';
+      if (mounted) setState(() => _routeWorkflowError = err);
+      _showNotice(
+        ref,
+        title: 'Resume failed',
+        message: err,
+        kind: NoticeKind.danger,
+      );
+    } finally {
+      if (mounted) setState(() => _navCommandSending = false);
+    }
+  }
+
+  Future<void> _stopNavigation(WidgetRef ref) async {
+    if (_navCommandSending) return;
+    setState(() => _navCommandSending = true);
+    try {
+      await ref.read(wifiConnectionProvider.notifier).sendNavStop();
+      if (!mounted) return;
+      setState(() {
+        _routeSent = false;
+        _routeWorkflowError = 'Stopped: send the route again before Start.';
+      });
+      _showNotice(
+        ref,
+        title: 'Stopped',
+        message: 'Rover confirmed NAV_STOP. Route must be sent again.',
+        kind: NoticeKind.info,
+      );
+    } catch (e) {
+      final err = 'NAV_STOP failed: $e';
+      if (mounted) setState(() => _routeWorkflowError = err);
+      _showNotice(
+        ref,
+        title: 'Stop failed',
+        message: err,
+        kind: NoticeKind.danger,
+      );
+    } finally {
+      if (mounted) setState(() => _navCommandSending = false);
+    }
   }
 
   void _showNotice(
@@ -798,10 +883,12 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                             batteryPercent: battery,
                             routeSent: _routeSent,
                             routeSending: _routeSending,
+                            navCommandSending: _navCommandSending,
                             error: _routeWorkflowError,
                             onSendRoute: () => _sendRoute(context, ref),
                             onStart: () => _startNavigation(context, ref),
                             onPause: () => _pauseNavigation(ref),
+                            onResume: () => _resumeNavigation(ref),
                             onStop: () => _stopNavigation(ref),
                           ),
                         ],
@@ -1013,10 +1100,12 @@ class _AutoWorkflowPanel extends StatelessWidget {
   final int? batteryPercent;
   final bool routeSent;
   final bool routeSending;
+  final bool navCommandSending;
   final String? error;
   final VoidCallback onSendRoute;
   final VoidCallback onStart;
   final VoidCallback onPause;
+  final VoidCallback onResume;
   final VoidCallback onStop;
 
   const _AutoWorkflowPanel({
@@ -1029,10 +1118,12 @@ class _AutoWorkflowPanel extends StatelessWidget {
     required this.batteryPercent,
     required this.routeSent,
     required this.routeSending,
+    required this.navCommandSending,
     required this.error,
     required this.onSendRoute,
     required this.onStart,
     required this.onPause,
+    required this.onResume,
     required this.onStop,
   });
 
@@ -1090,12 +1181,34 @@ class _AutoWorkflowPanel extends StatelessWidget {
     final moveLabel = wifi.movementStatus ?? '-';
     final batLabel =
         batteryPercent == null ? 'BAT: -' : 'BAT: $batteryPercent%';
-    final startBlockReason = !wifi.isConnected
-        ? 'not connected'
-        : (!routeSent ? 'route not sent' : _navStartBlockReason(wifi));
-    final startEnabled = startBlockReason == null;
-    final startStatus =
-        startBlockReason == null ? 'Start: ready' : 'Start: blocked';
+    final navUpper = navMode.toUpperCase();
+    final navActive = navUpper == 'RUNNING' ||
+        navUpper == 'APPROACHING' ||
+        navUpper == 'PAUSED';
+    final startActsAsResume = navUpper == 'PAUSED';
+    final canPause = wifi.isConnected &&
+        (navUpper == 'RUNNING' || navUpper == 'APPROACHING');
+    final canResume = wifi.isConnected && startActsAsResume;
+    final canStop = wifi.isConnected &&
+        (navUpper == 'RUNNING' ||
+            navUpper == 'APPROACHING' ||
+            navUpper == 'PAUSED' ||
+            navUpper == 'ERROR');
+    final startBlockReason = startActsAsResume
+        ? (!wifi.isConnected ? 'not connected' : null)
+        : (!wifi.isConnected
+            ? 'not connected'
+            : (!routeSent
+                ? 'route not sent'
+                : (navActive
+                    ? 'navigation already active'
+                    : _navStartBlockReason(wifi))));
+    final startEnabled =
+        (startActsAsResume ? canResume : startBlockReason == null) &&
+            !navCommandSending;
+    final startStatus = startBlockReason == null
+        ? (startActsAsResume ? 'Resume: ready' : 'Start: ready')
+        : (startActsAsResume ? 'Resume: blocked' : 'Start: blocked');
 
     return _GlassCard(
       borderColor: Colors.white.withOpacity(0.14),
@@ -1151,8 +1264,11 @@ class _AutoWorkflowPanel extends StatelessWidget {
                   child: _WorkflowButton(
                     icon: Icons.upload_rounded,
                     label: 'Send route',
-                    enabled:
-                        routePoints > 0 && wifi.isConnected && !routeSending,
+                    enabled: routePoints > 0 &&
+                        wifi.isConnected &&
+                        !routeSending &&
+                        !navCommandSending &&
+                        !navActive,
                     busy: routeSending,
                     onTap: onSendRoute,
                   ),
@@ -1161,9 +1277,9 @@ class _AutoWorkflowPanel extends StatelessWidget {
                 Expanded(
                   child: _WorkflowButton(
                     icon: Icons.play_arrow_rounded,
-                    label: 'Start',
+                    label: startActsAsResume ? 'Resume' : 'Start',
                     enabled: startEnabled,
-                    onTap: onStart,
+                    onTap: startActsAsResume ? onResume : onStart,
                   ),
                 ),
                 SizedBox(width: u(8).clamp(6.0, 8.0)),
@@ -1171,7 +1287,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
                   child: _WorkflowButton(
                     icon: Icons.pause_rounded,
                     label: 'Pause',
-                    enabled: wifi.isConnected,
+                    enabled: canPause && !navCommandSending,
                     onTap: onPause,
                   ),
                 ),
@@ -1180,7 +1296,7 @@ class _AutoWorkflowPanel extends StatelessWidget {
                   child: _WorkflowButton(
                     icon: Icons.stop_rounded,
                     label: 'Stop',
-                    enabled: wifi.isConnected,
+                    enabled: canStop && !navCommandSending,
                     onTap: onStop,
                   ),
                 ),
@@ -1725,7 +1841,7 @@ class _GridPainter extends CustomPainter {
       // This is what makes "the robot is swinging around the target" obvious.
       final wpIndex = wifi?.navWpIndex;
       final navState = wifi?.navState;
-      final activeNav = navState == 'MOVING' || navState == 'APPROACHING';
+      final activeNav = navState == 'RUNNING' || navState == 'APPROACHING';
       if (wpIndex != null &&
           wpIndex >= 0 &&
           wpIndex < route.length &&

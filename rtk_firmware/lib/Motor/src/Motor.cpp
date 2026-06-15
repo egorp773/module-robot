@@ -120,7 +120,6 @@ void Motor::stopImmediately() {
     _lastSetMs = millis();
     _commandGeneration++;
     taskEXIT_CRITICAL(&_mux);
-    if (_serial) sendHover(0, 0);
 }
 
 void Motor::enable(bool en) {

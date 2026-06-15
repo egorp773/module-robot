@@ -80,9 +80,19 @@ void StateEstimator::seedHeadingDeg(float headingDeg) {
 // (см. onPvt). IMU оставлен для будущего tilt-детекта, но в навигацию не вмешивается.
 // Эталон: коммит 5917838 "Use GPS-only heading: remove IMU from navigation".
 void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh) {
-    (void)yawRateDps;
     if (!imuFresh) { _lastImuMs = nowMs; return; }
+    if (!_headingSeeded) { _lastImuMs = nowMs; return; }
+    float dt = (_lastImuMs == 0) ? 0.0f : (nowMs - _lastImuMs) * 0.001f;
     _lastImuMs = nowMs;
+    if (dt <= 0.0f || dt > 0.25f) return;
+    float rate = fabsf(yawRateDps) < kImuYawRateDeadbandDps ? 0.0f : yawRateDps;
+    float delta = rate * dt;
+    if (delta > kImuMaxDeltaDeg) delta = kImuMaxDeltaDeg;
+    if (delta < -kImuMaxDeltaDeg) delta = -kImuMaxDeltaDeg;
+    est.headingFiltDeg = normalizeDeg360(est.headingFiltDeg + delta);
+    est.headingValid = true;
+    _lastHeadingMs = nowMs;
+    est.headingAgeMs = 0;
     // курс НЕ трогаем — он живёт за счёт GPS-курса (onPvt) и замораживается на месте
 }
 
@@ -112,8 +122,9 @@ void StateEstimator::onPvt(uint32_t nowMs,
     else                      est.sol = SOL_INVALID;
 
     // --- outlier rejection: отбрасываем неправдоподобный скачок позиции ---
-    bool accept = true;
-    if (_haveLastFix && est.originSet) {
+    bool reliablePosition = est.sol == SOL_FIXED && est.hAcc <= SAFE_HACC_FIXED_M && fixType >= 3;
+    bool accept = reliablePosition;
+    if (reliablePosition && _haveLastFix && est.originSet) {
         float px, py, nx, ny;
         llaToLocalMeters(_lastFixLat, _lastFixLon, est.originLat, est.originLon, px, py);
         llaToLocalMeters(newLat, newLon, est.originLat, est.originLon, nx, ny);
@@ -122,13 +133,12 @@ void StateEstimator::onPvt(uint32_t nowMs,
         if (dt < 0) dt = 0;
         float allow = kMaxJumpBaseM + kMaxJumpVFactor * est.speedMps * (dt + 0.001f);
         // мягко: на FLOAT/INVALID допускаем больше (он сам шумный)
-        if (est.sol != SOL_FIXED) allow *= 3.0f;
         if (jump > allow) accept = false;
     }
 
+    est.lat = newLat;
+    est.lon = newLon;
     if (accept) {
-        est.lat = newLat;
-        est.lon = newLon;
         _lastFixLat = newLat;
         _lastFixLon = newLon;
         _lastFixMs = nowMs;
@@ -142,7 +152,7 @@ void StateEstimator::onPvt(uint32_t nowMs,
             est.x = lx;
             est.y = ly;
         }
-    } else {
+    } else if (reliablePosition) {
         if (est.rejectedPositionFixes < 0xFFFFu) est.rejectedPositionFixes++;
     }
     // если outlier — позицию НЕ двигаем (dead-reckoning держит прошлую), но fix-метку обновили выше нет

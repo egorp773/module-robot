@@ -16,7 +16,7 @@
 
 // Знак оси yaw-rate BNO085 относительно heading (0..360, по часовой).
 // +1 или -1 — ВЫВЕРИТЬ на железе: повернуть робота по часовой, yawRateDps должен быть > 0.
-#define IMU_YAW_RATE_SIGN  (+1)
+#define IMU_YAW_RATE_SIGN  (-1)
 
 // ---------------- Serial baud ----------------
 #define SERIAL_BAUD       115200
@@ -92,7 +92,7 @@
 #define ROVER_HANDOFF_FRAC    0.10f   // handoff = segLen * this
 #define ROVER_HANDOFF_MAX_M   0.30f
 #define ROVER_HANDOFF_MIN_M   0.08f
-#define ROVER_BOUNDARY_TOLERANCE_M 0.15f
+#define ROVER_BOUNDARY_TOLERANCE_M 0.05f
 #define ROVER_BOUNDARY_SAMPLE_M    0.10f
 #define ROVER_CROSSTRACK_HOLD_M    0.60f
 #define ROVER_STUCK_TIMEOUT_MS     4000u

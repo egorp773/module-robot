@@ -29,6 +29,10 @@ void WsServer::onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         sendText(client, "STATE,CONNECTED");
     } else if (type == WS_EVT_DISCONNECT) {
         if (_client == client) _client = nullptr;
+        stopActuators();
+        _motor->stopImmediately();
+        _route->stop();
+        _navRequested = false;
         // узнаем, остались ли ещё клиенты
         if (server->count() == 0) {
             _connected = false;
@@ -63,6 +67,11 @@ void WsServer::sendAll(const String& text) {
     if (_ws) _ws->textAll(text);
 }
 
+void WsServer::stopActuators() {
+    digitalWrite(PIN_RELAY_ATTACH, LOW);
+    digitalWrite(PIN_RELAY_MOUNT, LOW);
+}
+
 void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
     _lastCmdMs = millis();
     if (line == "PING") {
@@ -72,6 +81,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         return;
     }
     if (line == "STOP") {
+        stopActuators();
         _motor->stopImmediately();
         _route->stop();
         _navRequested = false;
@@ -137,7 +147,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
             }
             if (_route->beginUpload(count, lat, lon)) {
                 _est->setOrigin(lat, lon);
-                sendText(client, "OK");
+                sendText(client, "OK,ROUTE_BEGIN");
             } else {
                 sendText(client, "ERR,ROUTE_BEGIN");
             }
@@ -151,7 +161,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         float x = 0, y = 0;
         if (sscanf(line.c_str(), "ROUTE_WP,%d,%f,%f", &idx, &x, &y) == 3) {
             if (_route->addWaypoint(idx, x, y)) {
-                sendText(client, "OK");
+                sendText(client, "OK,ROUTE_WP," + String(idx));
             } else {
                 sendText(client, "ERR,ROUTE_WP");
             }
@@ -163,7 +173,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
     if (line.startsWith("ROUTE_BOUNDARY_BEGIN,")) {
         int count = 0;
         if (sscanf(line.c_str(), "ROUTE_BOUNDARY_BEGIN,%d", &count) == 1) {
-            sendText(client, _route->beginBoundary(count) ? "OK" : "ERR,ROUTE_BOUNDARY_BEGIN");
+            sendText(client, _route->beginBoundary(count) ? "OK,ROUTE_BOUNDARY_BEGIN" : "ERR,ROUTE_BOUNDARY_BEGIN");
         } else {
             sendText(client, "ERR,ROUTE_BOUNDARY_BEGIN");
         }
@@ -173,14 +183,14 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         int idx = 0;
         float x = 0, y = 0;
         if (sscanf(line.c_str(), "ROUTE_BOUNDARY_PT,%d,%f,%f", &idx, &x, &y) == 3) {
-            sendText(client, _route->addBoundaryPoint(idx, x, y) ? "OK" : "ERR,ROUTE_BOUNDARY_PT");
+            sendText(client, _route->addBoundaryPoint(idx, x, y) ? "OK,ROUTE_BOUNDARY_PT," + String(idx) : "ERR,ROUTE_BOUNDARY_PT");
         } else {
             sendText(client, "ERR,ROUTE_BOUNDARY_PT_FORMAT");
         }
         return;
     }
     if (line == "ROUTE_BOUNDARY_END") {
-        sendText(client, _route->endBoundary() ? "OK" : "ERR,ROUTE_BOUNDARY_END");
+        sendText(client, _route->endBoundary() ? "OK,ROUTE_BOUNDARY_END" : "ERR,ROUTE_BOUNDARY_END");
         return;
     }
     if (line.startsWith("FORBID_BEGIN,")) {
@@ -205,7 +215,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         }
         if (ok && strtok_r(nullptr, ",", &ctx) != nullptr) ok = false;
         if (ok) {
-            sendText(client, _route->beginForbidden(count, counts) ? "OK" : "ERR,FORBID_BEGIN");
+            sendText(client, _route->beginForbidden(count, counts) ? "OK,FORBID_BEGIN" : "ERR,FORBID_BEGIN");
         } else {
             sendText(client, "ERR,FORBID_BEGIN");
         }
@@ -215,14 +225,14 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         int polyIdx = 0, ptIdx = 0;
         float x = 0, y = 0;
         if (sscanf(line.c_str(), "FORBID_PT,%d,%d,%f,%f", &polyIdx, &ptIdx, &x, &y) == 4) {
-            sendText(client, _route->addForbiddenPoint(polyIdx, ptIdx, x, y) ? "OK" : "ERR,FORBID_PT");
+            sendText(client, _route->addForbiddenPoint(polyIdx, ptIdx, x, y) ? "OK,FORBID_PT," + String(polyIdx) + "," + String(ptIdx) : "ERR,FORBID_PT");
         } else {
             sendText(client, "ERR,FORBID_PT_FORMAT");
         }
         return;
     }
     if (line == "FORBID_END") {
-        sendText(client, _route->endForbidden() ? "OK" : "ERR,FORBID_END");
+        sendText(client, _route->endForbidden() ? "OK,FORBID_END" : "ERR,FORBID_END");
         return;
     }
     if (line == "ROUTE_END") {
@@ -235,22 +245,43 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         return;
     }
     if (line == "NAV_START") {
-        if (_route->isReady()) {
+        const auto& e = _est->get();
+        uint32_t now = millis();
+        if (!_route->isReady()) {
+            sendText(client, "ERR,NO_ROUTE");
+        } else if (!e.originSet) {
+            sendText(client, "ERR,NO_ORIGIN");
+        } else if (e.sol != SOL_FIXED) {
+            sendText(client, "ERR,RTK_NOT_FIXED");
+        } else if (e.hAcc > SAFE_HACC_FIXED_M) {
+            sendText(client, "ERR,HACC");
+        } else if (e.pvtAgeMs > SAFE_PVT_AGE_MS || e.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {
+            sendText(client, "ERR,POSITION_STALE");
+        } else if (e.rejectedPositionFixes > 0) {
+            sendText(client, "ERR,GPS_JUMP");
+        } else if (e.headingAgeMs > SAFE_HEADING_AGE_MS) {
+            sendText(client, "ERR,HEADING_STALE");
+        } else if (_imu && _imu->ageMs(now) > SAFE_IMU_AGE_MS) {
+            sendText(client, "ERR,IMU_STALE");
+        } else if (_rtcm && _rtcm->transportAgeMs(now) > SAFE_RTK_AGE_MS) {
+            sendText(client, "ERR,RTCM_STALE");
+        } else if (_motor && !_motor->haveFeedback()) {
+            sendText(client, "ERR,MOTOR_NO_FEEDBACK");
+        } else {
             _route->start();
             _navRequested = true;
-            sendText(client, "OK");
-        } else {
-            sendText(client, "ERR,NO_ROUTE");
+            sendText(client, "OK,NAV_START");
         }
         return;
     }
-    if (line == "NAV_PAUSE")  { _route->pause();  sendText(client, "OK"); return; }
-    if (line == "NAV_RESUME") { _route->resume(); sendText(client, "OK"); return; }
+    if (line == "NAV_PAUSE")  { _route->pause();  sendText(client, "OK,NAV_PAUSE"); return; }
+    if (line == "NAV_RESUME") { _route->resume(); sendText(client, "OK,NAV_RESUME"); return; }
     if (line == "NAV_STOP") {
+        stopActuators();
         _route->stop();
         _navRequested = false;
         _motor->stopImmediately();
-        sendText(client, "OK");
+        sendText(client, "OK,NAV_STOP");
         return;
     }
 

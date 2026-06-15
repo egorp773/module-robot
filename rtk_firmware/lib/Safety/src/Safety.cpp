@@ -22,6 +22,10 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
         set(SAFETY_ESTOP, "nav_cmd_timeout");
         return;
     }
+    if (!in.navRequested) {
+        set(SAFETY_OK, "manual_ok");
+        return;
+    }
     if (in.pvtAgeMs > SAFE_PVT_AGE_MS) {
         set(SAFETY_ESTOP, "pvt_stale");
         return;

@@ -56,7 +56,7 @@ class NavCore {
 public:
     static const int MAX_WAYPOINTS = 254;
     static const int MAX_OBSTACLES = 16;
-    static const int MAX_OBSTACLE_POINTS = 24;
+    static const int MAX_OBSTACLE_POINTS = MAX_WAYPOINTS;
 
     NavCore();
 

@@ -476,8 +476,12 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   int _reconnectAttempt = 0;
 
   Completer<void>? _pongWaiter;
+  Completer<String>? _commandAckWaiter;
+  bool Function(String)? _commandAckMatcher;
   Completer<String>? _routeAckWaiter;
-  static const Duration _routeAckTimeout = Duration(milliseconds: 500);
+  bool Function(String)? _routeAckMatcher;
+  static const Duration _commandAckTimeout = Duration(seconds: 2);
+  static const Duration _routeAckTimeout = _commandAckTimeout;
 
   Uri get _wsUri => Uri.parse("ws://$_host:$_port/ws");
 
@@ -655,7 +659,10 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
   Future<void> _closeSocketOnly() async {
     _pongWaiter = null;
+    _commandAckWaiter = null;
+    _commandAckMatcher = null;
     _routeAckWaiter = null;
+    _routeAckMatcher = null;
     await _sub?.cancel();
     _sub = null;
     try {
@@ -942,16 +949,32 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
 
           // Generic OK/ERR responses from rover (route acks, nav ack, etc.)
           if (msgStr.startsWith("OK")) {
-            if (_routeAckWaiter != null && !_routeAckWaiter!.isCompleted) {
+            if (_commandAckWaiter != null &&
+                !_commandAckWaiter!.isCompleted &&
+                (_commandAckMatcher?.call(msgStr) ?? true)) {
+              _commandAckWaiter!.complete(msgStr);
+              _commandAckWaiter = null;
+              _commandAckMatcher = null;
+            }
+            if (_routeAckWaiter != null &&
+                !_routeAckWaiter!.isCompleted &&
+                (_routeAckMatcher?.call(msgStr) ?? true)) {
               _routeAckWaiter!.complete(msgStr);
               _routeAckWaiter = null;
+              _routeAckMatcher = null;
             }
           }
           if (msgStr.startsWith("ERR,")) {
             _log("× Rover ERR: $msgStr");
+            if (_commandAckWaiter != null && !_commandAckWaiter!.isCompleted) {
+              _commandAckWaiter!.completeError(msgStr);
+              _commandAckWaiter = null;
+              _commandAckMatcher = null;
+            }
             if (_routeAckWaiter != null && !_routeAckWaiter!.isCompleted) {
               _routeAckWaiter!.completeError(msgStr);
               _routeAckWaiter = null;
+              _routeAckMatcher = null;
             }
           }
 
@@ -1198,20 +1221,27 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     sendRaw("AREA_END");
   }
 
-  Future<void> _sendRouteAcked(String line, String label) async {
+  Future<String> _sendAcked(
+    String line,
+    String label,
+    bool Function(String ack) matcher,
+  ) async {
     if (!state.isConnected) {
       throw StateError('not connected');
     }
     for (var attempt = 0; attempt < 3; attempt++) {
       final completer = Completer<String>();
-      _routeAckWaiter = completer;
+      _commandAckWaiter = completer;
+      _commandAckMatcher = matcher;
       sendRaw(line);
       try {
-        await completer.future.timeout(_routeAckTimeout);
-        _routeAckWaiter = null;
-        return;
+        final ack = await completer.future.timeout(_commandAckTimeout);
+        _commandAckWaiter = null;
+        _commandAckMatcher = null;
+        return ack;
       } catch (e) {
-        _routeAckWaiter = null;
+        _commandAckWaiter = null;
+        _commandAckMatcher = null;
         if (attempt < 2) {
           _log("× $label ack timeout, retry ${attempt + 1}/3");
         } else {
@@ -1220,6 +1250,30 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
         }
       }
     }
+    throw StateError('$label ack failed');
+  }
+
+  Future<void> _sendRouteAcked(String line, String label) async {
+    await _sendAcked(line, label, (ack) {
+      if (label == "ROUTE_BOUNDARY_BEGIN") {
+        return ack == "OK,ROUTE_BOUNDARY_BEGIN";
+      }
+      if (label.startsWith("ROUTE_BOUNDARY_PT ")) {
+        final index = label.substring("ROUTE_BOUNDARY_PT ".length);
+        return ack == "OK,ROUTE_BOUNDARY_PT,$index";
+      }
+      if (label == "ROUTE_BOUNDARY_END") {
+        return ack == "OK,ROUTE_BOUNDARY_END";
+      }
+      if (label == "FORBID_BEGIN") return ack == "OK,FORBID_BEGIN";
+      if (label.startsWith("FORBID_PT ")) {
+        final parts = label.substring("FORBID_PT ".length).split('/');
+        return parts.length == 2 &&
+            ack == "OK,FORBID_PT,${parts[0]},${parts[1]}";
+      }
+      if (label == "FORBID_END") return ack == "OK,FORBID_END";
+      return false;
+    });
   }
 
   Future<void> sendRouteBegin(
@@ -1233,6 +1287,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     for (var attempt = 0; attempt < 3; attempt++) {
       final completer = Completer<String>();
       _routeAckWaiter = completer;
+      _routeAckMatcher = (ack) => ack == "OK,ROUTE_BEGIN";
       sendRaw(
         "ROUTE_BEGIN,$count,${originLat.toStringAsFixed(8)},"
         "${originLon.toStringAsFixed(8)}",
@@ -1240,9 +1295,11 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       try {
         await completer.future.timeout(_routeAckTimeout);
         _routeAckWaiter = null;
+        _routeAckMatcher = null;
         return;
       } catch (e) {
         _routeAckWaiter = null;
+        _routeAckMatcher = null;
         if (attempt < 2) {
           _log("× ROUTE_BEGIN ack timeout, retry ${attempt + 1}/3");
         } else {
@@ -1260,15 +1317,18 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     for (var attempt = 0; attempt < 3; attempt++) {
       final completer = Completer<String>();
       _routeAckWaiter = completer;
+      _routeAckMatcher = (ack) => ack == "OK,ROUTE_WP,$index";
       sendRaw(
         "ROUTE_WP,$index,${xMeters.toStringAsFixed(3)},${yMeters.toStringAsFixed(3)}",
       );
       try {
         await completer.future.timeout(_routeAckTimeout);
         _routeAckWaiter = null;
+        _routeAckMatcher = null;
         return;
       } catch (e) {
         _routeAckWaiter = null;
+        _routeAckMatcher = null;
         if (attempt < 2) {
           _log("× ROUTE_WP $index ack timeout, retry ${attempt + 1}/3");
         } else {
@@ -1286,6 +1346,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     for (var attempt = 0; attempt < 3; attempt++) {
       final completer = Completer<String>();
       _routeAckWaiter = completer;
+      _routeAckMatcher = (ack) => ack == "OK,ROUTE,$expectedCount";
       sendRaw("ROUTE_END");
       try {
         final ack = await completer.future.timeout(_routeAckTimeout);
@@ -1293,9 +1354,11 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
           throw StateError("unexpected ROUTE_END ack: $ack");
         }
         _routeAckWaiter = null;
+        _routeAckMatcher = null;
         return;
       } catch (e) {
         _routeAckWaiter = null;
+        _routeAckMatcher = null;
         if (attempt < 2) {
           _log("× ROUTE_END ack timeout, retry ${attempt + 1}/3");
         } else {
@@ -1381,24 +1444,36 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   }
 
   /// Navigation commands
-  void sendNavStart() {
-    if (!state.isConnected) return;
-    sendRaw("NAV_START");
+  Future<void> sendNavStart() async {
+    await _sendAcked(
+      "NAV_START",
+      "NAV_START",
+      (ack) => ack == "OK,NAV_START",
+    );
   }
 
-  void sendNavPause() {
-    if (!state.isConnected) return;
-    sendRaw("NAV_PAUSE");
+  Future<void> sendNavPause() async {
+    await _sendAcked(
+      "NAV_PAUSE",
+      "NAV_PAUSE",
+      (ack) => ack == "OK,NAV_PAUSE",
+    );
   }
 
-  void sendNavResume() {
-    if (!state.isConnected) return;
-    sendRaw("NAV_RESUME");
+  Future<void> sendNavResume() async {
+    await _sendAcked(
+      "NAV_RESUME",
+      "NAV_RESUME",
+      (ack) => ack == "OK,NAV_RESUME",
+    );
   }
 
-  void sendNavStop() {
-    if (!state.isConnected) return;
-    sendRaw("NAV_STOP");
+  Future<void> sendNavStop() async {
+    await _sendAcked(
+      "NAV_STOP",
+      "NAV_STOP",
+      (ack) => ack == "OK,NAV_STOP",
+    );
   }
 
   /// Simple Go-To navigation: sends single target coordinates

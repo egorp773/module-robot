@@ -264,6 +264,11 @@ static void stepFollower() {
         return;
     }
 
+    if (!g_ws.navRequested() || !g_route.isRunning()) {
+        g_motor.stopImmediately();
+        return;
+    }
+
     if (g_safety.allowMotion()) {
         g_motor.setLinearAngularSpeed(baseSpeed, w, true);
     } else {
@@ -353,11 +358,13 @@ void loop() {
     si.routeReady   = g_route.isReady();
     g_safety.tick(now, si, g_est, g_imu);
     if (!g_safety.allowMotion()) {
+        digitalWrite(PIN_RELAY_ATTACH, LOW);
+        digitalWrite(PIN_RELAY_MOUNT, LOW);
         g_motor.stopImmediately();
     }
 
     if (!g_ws.navRequested()) {
-        g_follow.faultReason = nullptr;
+        g_follow.reset();
     }
 
     if (g_ws.navRequested() && g_route.isRunning()) {

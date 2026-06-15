@@ -58,6 +58,7 @@ private:
     void sendImu(AsyncWebSocketClient* client);
     void sendNav(AsyncWebSocketClient* client);
     void sendMotor(AsyncWebSocketClient* client);
+    void stopActuators();
 
     AsyncWebServer* _server = nullptr;
     AsyncWebSocket* _ws = nullptr;
@@ -70,12 +71,12 @@ private:
     Motor* _motor = nullptr;
     Safety* _safety = nullptr;
 
-    bool _connected = false;
-    uint32_t _lastRxMs = 0;
-    uint32_t _lastCmdMs = 0;
+    volatile bool _connected = false;
+    volatile uint32_t _lastRxMs = 0;
+    volatile uint32_t _lastCmdMs = 0;
     uint32_t _lastTelMs = 0;
     uint32_t _lastNavMs = 0;
-    bool _navRequested = false;
+    volatile bool _navRequested = false;
     NavStateOut _lastNav{};
 
     static String makeMotorLine(const Motor& motor);
