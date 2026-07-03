@@ -41,6 +41,14 @@ public:
     // counters / state
     uint32_t lastCmdMs() const { return _lastCmdMs; }
     bool navRequested() const { return _navRequested; }
+    // Выставляется из roverdbg::handleGo() чтобы stepFollower() начал крутиться —
+    // иначе условие в loop() "if (g_ws.navRequested() && g_route.isRunning())"
+    // не сработает и моторы не получат команду.
+    void setNavRequested(bool v) { _navRequested = v; }
+    // Включает/выключает периодическую телеметрию (TEL/GPS/NAV/IMU/MOTOR).
+    // По умолчанию OFF — чтобы терминал не летал при ручной отладке.
+    // LOG,1 — on, LOG,0 — off.
+    void setTelemetryEnabled(bool v) { _telemetryEnabled = v; }
 
     // выдача батареи (вызывается извне)
     void sendBattery(int pct);
@@ -76,7 +84,9 @@ private:
     volatile uint32_t _lastCmdMs = 0;
     uint32_t _lastTelMs = 0;
     uint32_t _lastNavMs = 0;
+    uint32_t _lastPingMs = 0;
     volatile bool _navRequested = false;
+    volatile bool _telemetryEnabled = false;
     NavStateOut _lastNav{};
 
     static String makeMotorLine(const Motor& motor);

@@ -6,6 +6,14 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+const int _maxTelemetryAgeMs = 60000;
+
+int? _parseTelemetryAgeMs(String? raw) {
+  final value = int.tryParse(raw?.trim() ?? '');
+  if (value == null || value < 0 || value > _maxTelemetryAgeMs) return null;
+  return value;
+}
+
 class WifiConnectionState {
   final bool isConnecting;
   final bool isConnected;
@@ -753,14 +761,16 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                     gpsVAccuracy: int.tryParse(parts[10]),
                     gpsSpeedMps: double.tryParse(parts[11]),
                     gpsPDop: double.tryParse(parts[12]),
-                    gpsAgeMs: int.tryParse(parts[13]),
+                    gpsAgeMs: _parseTelemetryAgeMs(parts[13]),
                     gpsReceivedAt: now,
                     rtcmBytes: int.tryParse(parts[14]),
-                    rtcmAgeMs: int.tryParse(parts[15]),
-                    rtcmTransportAgeMs:
-                        parts.length > 19 ? int.tryParse(parts[19]) : null,
-                    rtcmF9pAgeMs:
-                        parts.length > 20 ? int.tryParse(parts[20]) : null,
+                    rtcmAgeMs: _parseTelemetryAgeMs(parts[15]),
+                    rtcmTransportAgeMs: parts.length > 19
+                        ? _parseTelemetryAgeMs(parts[19])
+                        : null,
+                    rtcmF9pAgeMs: parts.length > 20
+                        ? _parseTelemetryAgeMs(parts[20])
+                        : null,
                     rtcmSource: parts.length > 21 && parts[21].trim().isNotEmpty
                         ? parts[21].trim()
                         : null,
@@ -771,7 +781,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                     rtcmLastType:
                         parts.length > 24 ? int.tryParse(parts[24]) : null,
                     imuYaw: imuYaw,
-                    imuAgeMs: int.tryParse(parts[17]),
+                    imuAgeMs: _parseTelemetryAgeMs(parts[17]),
                     imuFresh: parts[18].trim() == '1',
                     imuReceivedAt: imuYaw == null ? null : now,
                   );
@@ -850,7 +860,6 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                 final vAcc = int.tryParse(parts[10]);
                 final speedMps = double.tryParse(parts[11]);
                 final pDop = double.tryParse(parts[12]);
-                final ageMs = int.tryParse(parts[13]);
 
                 if (lat != null && lon != null) {
                   final now = DateTime.now();
@@ -868,7 +877,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                     gpsVAccuracy: vAcc,
                     gpsSpeedMps: speedMps,
                     gpsPDop: pDop,
-                    gpsAgeMs: ageMs,
+                    gpsAgeMs: _parseTelemetryAgeMs(parts[13]),
                     gpsReceivedAt: now,
                   );
                   _maybeLogTelemetrySummary();
@@ -885,14 +894,14 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
               final parts = msgStr.split(",");
               if (parts.length >= 3) {
                 final bytes = int.tryParse(parts[1]);
-                final ageMs = int.tryParse(parts[2]);
+                final ageMs = _parseTelemetryAgeMs(parts[2]);
                 state = state.copyWith(
                   rtcmBytes: bytes,
                   rtcmAgeMs: ageMs,
                   rtcmTransportAgeMs:
-                      parts.length > 3 ? int.tryParse(parts[3]) : null,
+                      parts.length > 3 ? _parseTelemetryAgeMs(parts[3]) : null,
                   rtcmF9pAgeMs:
-                      parts.length > 4 ? int.tryParse(parts[4]) : null,
+                      parts.length > 4 ? _parseTelemetryAgeMs(parts[4]) : null,
                   rtcmSource: parts.length > 5 && parts[5].trim().isNotEmpty
                       ? parts[5].trim()
                       : null,
@@ -917,7 +926,7 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
                 final yaw = double.tryParse(parts[1]);
                 if (yaw != null) {
                   final ageMs =
-                      parts.length >= 3 ? int.tryParse(parts[2]) : null;
+                      parts.length >= 3 ? _parseTelemetryAgeMs(parts[2]) : null;
                   final fresh =
                       parts.length >= 4 ? parts[3].trim() == '1' : true;
                   state = state.copyWith(
@@ -1179,6 +1188,24 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
     } catch (e) {
       _log("× sendRaw error: $e");
       unawaited(_handleConnectionLost("Ошибка отправки: $e"));
+    }
+  }
+
+  /// Send a raw command and return a Future that completes when the line is added
+  /// to the channel sink. Useful for test screens that want to await per-command.
+  Future<void> sendRawFuture(String text, {bool log = true}) async {
+    final ch = _channel;
+    if (ch == null) {
+      _log("× sendRawFuture failed: channel is null");
+      throw StateError('not connected');
+    }
+    try {
+      if (log) _log("→ $text");
+      ch.sink.add(text);
+    } catch (e) {
+      _log("× sendRawFuture error: $e");
+      unawaited(_handleConnectionLost("Ошибка отправки: $e"));
+      rethrow;
     }
   }
 

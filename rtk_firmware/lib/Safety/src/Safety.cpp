@@ -57,7 +57,7 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
             set(SAFETY_HOLD, "position_stale");
             return;
         }
-        if (in.rejectedPositionFixes > 0) {
+        if (in.rejectedPositionFixes > SAFE_REJECTED_POSITION_FIXES_MAX) {
             set(SAFETY_HOLD, "gps_jump");
             return;
         }
@@ -83,7 +83,15 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
                 set(SAFETY_OK, "rtk_fixed");
             }
         } else if (in.sol == SOL_FLOAT) {
-            set(SAFETY_HOLD, "rtk_float_wait_fixed");
+            // FLOAT с hAcc<=4см — вполне достаточно для езды по точкам.
+            // Раньше тут стоял HOLD, но FIXED может не приходить минутами из-за
+            // узких заполнений неба или отражений, а FLOAT уже даёт 2-4см.
+            // Едем в DEGRADED (медленнее, но едем).
+            if (in.hAcc > 0.05f) {
+                set(SAFETY_HOLD, "rtk_float_hacc_gt_5cm");
+            } else {
+                set(SAFETY_DEGRADED, "rtk_float_ok");
+            }
         }
         return;
     }

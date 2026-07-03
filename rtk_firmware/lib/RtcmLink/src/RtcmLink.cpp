@@ -33,7 +33,8 @@ void RtcmLink::loop() {
     }
 
     // Если пакетов давно не было — источник неизвестен
-    if (_lastRxMs == 0 || (now - _lastRxMs) > 5000) {
+    uint32_t ageMs = transportAgeMs(now);
+    if (ageMs == RTCM_AGE_UNKNOWN_MS || ageMs > 5000) {
         _src = RTCM_NONE;
     }
 }

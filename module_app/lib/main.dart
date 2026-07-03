@@ -10,6 +10,7 @@ import 'features/maps/maps_screen.dart';
 import 'features/auto/auto_screen.dart';
 import 'features/auto/auto_map_screen.dart';
 import 'features/gps/gps_debug_screen.dart';
+import 'features/test/test_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -60,6 +61,10 @@ class _RootApp extends ConsumerWidget {
             final mapId = state.pathParameters['mapId']!;
             return AutoMapScreen(mapId: mapId);
           },
+        ),
+        GoRoute(
+          path: '/test',
+          builder: (_, __) => const TestScreen(),
         ),
       ],
     );

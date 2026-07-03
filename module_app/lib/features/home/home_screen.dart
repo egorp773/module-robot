@@ -232,6 +232,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                           _IconGlassButton(
                             size: topIconSize,
                             glyphSize: topIconGlyph,
+                            icon: Icons.science_rounded,
+                            tooltip: 'Test Lab',
+                            iconColor: accentWhite,
+                            onTap: () => context.go('/test'),
+                          ),
+                          SizedBox(width: s(10)),
+                          _IconGlassButton(
+                            size: topIconSize,
+                            glyphSize: topIconGlyph,
                             icon: Icons.tune_rounded,
                             tooltip: 'Настройки',
                             iconColor: accentWhite,

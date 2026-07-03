@@ -69,7 +69,10 @@ public:
 
     // НОВОЕ: подать данные IMU (yaw rate, град/с) — интегрируется для краткосрочного курса.
     // Вызывать каждый tick ДО tick(). dtMs — фактический интервал.
-    void onImu(uint32_t nowMs, float yawRateDps, bool imuFresh);
+    // absYawDeg/absYawValid — абсолютный курс от магнитометра (0..360 CW от севера):
+    // если валиден, подаётся в EKF как measurement update и убирает дрейф/ошибку seed.
+    void onImu(uint32_t nowMs, float yawRateDps, bool imuFresh,
+               float absYawDeg = 0.0f, bool absYawValid = false, float absYawAccRad = 999.0f);
 
     // origin для перевода lat/lon → x/y
     bool setOrigin(double lat, double lon);
@@ -88,7 +91,7 @@ public:
 private:
     Estimate est;
     static constexpr float kGpsCourseAlphaActive = 0.30f;
-    static constexpr float kGpsHeadingMinMpsActive = 0.03f;
+    static constexpr float kGpsHeadingMinMpsActive = 0.30f;  // GPS-course мусор на стоянке
     static constexpr float kGpsHeadingSnapDeg = 45.0f;
     static constexpr float kImuYawRateDeadbandDps = 0.35f;
     static constexpr float kImuMaxDeltaDeg = 12.0f;
@@ -110,6 +113,7 @@ private:
     uint32_t _lastFixMs = 0;
     uint32_t _lastAcceptedPositionMs = 0;
     uint32_t _lastHeadingMs = 0;
+    uint32_t _seededAtMs = 0;       // millis() момента seed'а; в первые 3 сек не верим GPS-course
 
     // EKF
     RtkEkf _ekf;

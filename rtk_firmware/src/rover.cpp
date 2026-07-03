@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include "RtkConfig.h"
+#include "RoverDebug.h"
 #include "StateEstimator.h"
 #include "Imu.h"
 #include "Gnss.h"
@@ -25,6 +26,8 @@ Route           g_route;
 Motor           g_motor;
 Safety          g_safety;
 WsServer        g_ws;
+
+static bool g_logEnabled = true;   // LOG,0 / LOG,1 — гасит периодический лог
 
 // --- waypoint follower (Sunray-style Stanley line tracker) ---
 struct Follower {
@@ -134,23 +137,51 @@ static bool checkFollowerProgress(const Estimate& e, float commandedSpeed) {
     return true;
 }
 
+static bool waitForInitialImuHeading(uint32_t timeoutMs) {
+    uint32_t start = millis();
+    while ((uint32_t)(millis() - start) < timeoutMs) {
+        g_imu.loop();
+        uint32_t now = millis();
+        if (g_imu.fresh() && g_imu.yawAgeMs(now) < SAFE_IMU_AGE_MS) {
+            return true;
+        }
+        delay(10);
+    }
+    return false;
+}
+
 static void connectWiFi() {
+    WiFi.disconnect(true, true);
+    delay(300);
+    WiFi.mode(WIFI_OFF);
+    delay(300);
     WiFi.mode(WIFI_STA);
-    // ВАЖНО: НЕ снижать TX power здесь. 11dBm наводит помехи на UART2 к hoverboard
-    // → плата видит мусор в протоколе → пищит. 11dBm включаем ПОЗЖЕ, после мотора и RTK.
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    WiFi.persistent(false);
+    WiFi.setSleep(false);
     IPAddress ip, gw, sn, dns;
     ip.fromString(ROVER_IP);
     gw.fromString("192.168.31.1");
     sn.fromString("255.255.255.0");
     dns = gw;
     WiFi.config(ip, gw, sn, dns);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    int t = 0;
-    while (WiFi.status() != WL_CONNECTED && t < 30) {
-        serviceMotorFor(500);
-        Serial.print(".");
-        t++;
+    WiFi.setAutoReconnect(true);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+    for (int attempt = 1; attempt <= 3 && WiFi.status() != WL_CONNECTED; ++attempt) {
+        Serial.printf("[ROVER] wifi attempt %d ssid=%s\n", attempt, WIFI_SSID);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        int t = 0;
+        while (WiFi.status() != WL_CONNECTED && t < 20) {
+            serviceMotorFor(500);
+            Serial.print(".");
+            t++;
+        }
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.printf("\n[ROVER] wifi attempt %d failed status=%d\n",
+                          attempt, (int)WiFi.status());
+            WiFi.disconnect(false, false);
+            serviceMotorFor(1000);
+        }
     }
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[ROVER] wifi connected ip=%s\n", WiFi.localIP().toString().c_str());
@@ -385,7 +416,18 @@ void setup() {
     g_imu.begin(PIN_IMU_SDA, PIN_IMU_SCL);
     g_gnss.begin(F9pSerial, GNSS_ROVER);
     g_est.begin();
-    g_est.seedHeadingDeg(ROVER_INITIAL_HEADING_DEG);   // 176° — реальный старт-курс робота
+    if (waitForInitialImuHeading(1500)) {
+        g_est.seedHeadingDeg(g_imu.yawDeg());
+        Serial.printf("[ROVER] heading seed: %.1f° (IMU corrected, raw=%.1f rotOffset=%.1f corr=%.1f mag=%d acc=%.2f)\n",
+                      (double)g_imu.yawDeg(), (double)g_imu.rawYawDeg(),
+                      (double)IMU_ROT_YAW_OFFSET_DEG, (double)IMU_COMPASS_CORRECTION_DEG,
+                      g_imu.yawFromMag() ? 1 : 0,
+                      (double)g_imu.yawAccRad());
+    } else {
+        g_est.seedHeadingDeg(ROVER_INITIAL_HEADING_DEG);
+        Serial.printf("[ROVER] heading seed: %.1f° (fallback, IMU unavailable)\n",
+                      (double)ROVER_INITIAL_HEADING_DEG);
+    }
     g_route.begin();
     g_safety.begin();
 
@@ -399,19 +441,76 @@ void loop() {
     uint32_t now = millis();
     static uint32_t lastBat = 0;
 
+    // Простые текстовые команды из Serial — для отладки без приложения.
+    //   CAL\n   — текущее направление носа = "0°". После этого робот поедет туда,
+    //              куда сейчас смотрит носом, при waypoint (x=0, y=+).
+    //   GO\n    — CAL + загрузить маршрут из 2 точек: (0,0) → (0,3) + стартовать.
+    //              Робот поедет ровно 3 метра туда, куда смотрит носом, и встанет.
+    //              Идеальный тест для проверки heading + моторов без приложения.
+    //   STOP\n  — стоп моторов немедленно.
+    //   LOG,0\n — выключить периодический лог (чтобы терминал не летал).
+    //   LOG,1\n — включить обратно (200мс).
+    if (Serial.available()) {
+        char buf[32];
+        size_t n = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = 0;
+            if (strcmp(buf, "CAL") == 0) {
+                float cur = g_imu.yawDeg();
+                g_est.seedHeadingDeg(0.0f);
+                g_follow.reset();
+                Serial.printf("[CAL] heading reseeded: imuYaw was %.1f → head=0\n",
+                              (double)cur);
+            } else if (strcmp(buf, "GO") == 0) {
+                if (!g_est.get().originSet) {
+                    Serial.println("[GO] refusing: no origin yet (wait for RTK FIX/FLOAT)");
+                } else {
+                    float cur = g_imu.yawDeg();
+                    g_est.seedHeadingDeg(0.0f);
+                    g_follow.reset();
+                    g_route.beginUpload(2, g_est.get().originLat, g_est.get().originLon);
+                    g_route.addWaypoint(0, 0.0f, 0.0f);
+                    g_route.addWaypoint(1, 0.0f, 3.0f);
+                    g_route.beginBoundary(4);
+                    g_route.addBoundaryPoint(0, -2.0f, -2.0f);
+                    g_route.addBoundaryPoint(1,  2.0f, -2.0f);
+                    g_route.addBoundaryPoint(2,  2.0f,  5.0f);
+                    g_route.addBoundaryPoint(3, -2.0f,  5.0f);
+                    g_route.endBoundary();
+                    g_route.beginForbidden(0, nullptr);
+                    g_route.endForbidden();
+                    g_route.endUpload();
+                    g_route.start();
+                    Serial.printf("[GO] CAL+route+start: imuYaw was %.1f → head=0, "
+                                  "route: (0,0) → (0,3), speed=%.2f m/s\n",
+                                  (double)cur, (double)ROVER_MAX_SPEED_MPS);
+                }
+            } else if (strcmp(buf, "STOP") == 0) {
+                g_motor.stopImmediately();
+                Serial.println("[STOP] motors stopped");
+            } else if (strcmp(buf, "IMU_ZERO") == 0) {
+                Serial.println(roverdbg::imuZeroLine());
+            } else if (strcmp(buf, "IMU_DIAG") == 0) {
+                Serial.println(roverdbg::imuDiagLine());
+            } else if (strncmp(buf, "LOG,", 4) == 0) {
+                int v = atoi(buf + 4);
+                g_logEnabled = (v != 0);
+                Serial.printf("[LOG] periodic log %s\n", g_logEnabled ? "ON (200ms)" : "OFF");
+            } else if (buf[0] != 0) {
+                Serial.printf("[?] unknown: '%s' (try CAL / GO / STOP / LOG,0 / LOG,1)\n", buf);
+            }
+        }
+    }
+
     g_imu.loop();
     g_gnss.loop();
     g_rtcm.loop();
     // g_motor.loop() НЕ зовём — поток команд ведёт TX-задача на ядре 0 (startTxTask).
 
-    // WiFi 11dBm включаем ПОЗЖЕ (через 3 сек), когда мотор уже стабильно шлёт — иначе
-    // TX-помехи 11dBm наводят мусор на UART2 к hoverboard и она пищит.
-    static uint32_t g_lowTxAt = 3000;
-    if (g_lowTxAt != 0 && millis() > g_lowTxAt) {
-        WiFi.setTxPower(WIFI_POWER_11dBm);
-        g_lowTxAt = 0;
-        Serial.println("[ROVER] wifi tx power -> 11dBm");
-    }
+    // WiFi TX-power оставляем 19.5 dBm постоянно. Раньше снижали до 11 dBm чтобы не
+    // наводить помехи на UART2 → hoverboard, но с тех пор TX-задача мотора переехала
+    // на ядро 0 и помехи ушли. 11 dBm даёт нестабильную связь → реконнекты WebSocket.
+    // Если hoverboard снова запищит — вернём динамическое снижение, но это не наш кейс.
 
     if (g_gnss.consumeFreshPvt()) {
         g_est.onPvt(now,
@@ -421,7 +520,9 @@ void loop() {
             g_gnss.lastFixType(), g_gnss.lastCarrierSol(), g_gnss.lastDiffSoln(),
             g_gnss.lastNumSv(), g_gnss.lastPDop());
     }
-    g_est.onImu(now, g_imu.yawRateDps(), g_imu.fresh() && g_imu.ageMs(now) < SAFE_IMU_AGE_MS);
+    g_est.onImu(now, g_imu.yawRateDps(), g_imu.fresh() && g_imu.ageMs(now) < SAFE_IMU_AGE_MS,
+                g_imu.yawDeg(), g_imu.yawAgeMs(now) < SAFE_IMU_AGE_MS,
+                g_imu.yawAccRad());
     // Hoverboard feedback → EKF predict. TX-задача на ядре 0 обновляет _fb в Motor;
     // здесь читаем актуальные обороты. Если feedback ещё не пришёл, шлёт 0/0.
     g_est.onHoverboardFeedback(now, g_motor.speedLeftMeas(), g_motor.speedRightMeas());
@@ -430,14 +531,21 @@ void loop() {
     // Auto-origin: если origin ещё не задан, но есть валидный fix — захватываем текущую
     // позицию как origin. Иначе est.x, est.y останутся 0,0 пока пользователь не отправит
     // маршрут, и карта в приложении будет показывать робота в (0,0) — "он в разных точках".
+    // FIXED — идеал, FLOAT с hAcc<=5см тоже достаточно для старта.
     {
         static uint32_t lastAutoOriginLogMs = 0;
-        if (!g_est.get().originSet && g_est.get().sol == SOL_FIXED) {
-            g_est.setOrigin(g_est.get().lat, g_est.get().lon);
-            if (now - lastAutoOriginLogMs > 2000) {
-                Serial.printf("[AUTO-ORIGIN] captured: lat=%.7f lon=%.7f\n",
-                              g_est.get().originLat, g_est.get().originLon);
-                lastAutoOriginLogMs = now;
+        if (!g_est.get().originSet) {
+            const auto& e = g_est.get();
+            bool ok = (e.sol == SOL_FIXED) ||
+                      (e.sol == SOL_FLOAT && e.hAcc <= 0.05f);
+            if (ok) {
+                g_est.setOrigin(e.lat, e.lon);
+                if (now - lastAutoOriginLogMs > 2000) {
+                    Serial.printf("[AUTO-ORIGIN] captured: lat=%.7f lon=%.7f sol=%d hAcc=%.3f\n",
+                                  g_est.get().originLat, g_est.get().originLon,
+                                  (int)e.sol, e.hAcc);
+                    lastAutoOriginLogMs = now;
+                }
             }
         }
     }
@@ -510,21 +618,230 @@ void loop() {
         if (pct >= 0) g_ws.sendBattery(pct);
     }
 
+    // Лог 200мс — видно каждый PVT. Поля подобраны под диагноз "почему не едет":
+    //   sol / hAcc            — RTK фикс и точность
+    //   head / imuYaw / mag   — heading (для проверки знака и стабильности)
+    //   spd / pvtAge / rtcmAge / imuAge — свежесть данных
+    //   wp / dWp / hErr / ct  — что Stanley пытается сделать
+    //   motL / motR / sp / st — что мотор реально получил
+    //   safety / reason       — почему может стоять
+    //   fault                 — был ли fault на текущем WP
     static uint32_t lastLog = 0;
-    if (now - lastLog > 5000) {
+    if (g_logEnabled && now - lastLog > 200) {
         lastLog = now;
         const auto& e = g_est.get();
-        const char* src = (g_rtcm.source() == RTCM_UDP) ? "udp" : "none";
-        Serial.printf("[ROVER] sol=%d sv=%d hAcc=%.3f head=%.1f gpsHead=%.1f yawRate=%.1f imuYaw=%.1f "
-                      "spd=%.2f pvtAge=%u rtcmAge=%lu src=%s imuAge=%u bat=%d "
-                      "motFB=%d motL=%d motR=%d sp=%d st=%d safety=%d reason=%s\n",
-            (int)e.sol, e.numSv, e.hAcc, e.headingFiltDeg, e.headingDeg,
-            g_imu.yawRateDps(), g_imu.yawDeg(), e.speedMps, e.pvtAgeMs,
-            g_rtcm.transportAgeMs(now), src,
-            g_imu.ageMs(now), g_motor.batteryPercent(),
-            g_motor.haveFeedback() ? 1 : 0,
+        Serial.printf("[R] sol=%d hAcc=%.3f head=%.1f imuYaw=%.1f mag=%d acc=%.2f "
+                      "spd=%.2f pvtAge=%u rtcmAge=%lu imuAge=%u "
+                      "wp=%d/%d dWp=%.2f hErr=%.1f ct=%.2f "
+                      "motL=%d motR=%d sp=%d st=%d "
+                      "safety=%d %s fault=%s\n",
+            (int)e.sol, e.hAcc, e.headingFiltDeg,
+            g_imu.yawDeg(), g_imu.yawFromMag() ? 1 : 0, g_imu.yawAccRad(),
+            e.speedMps, e.pvtAgeMs,
+            g_rtcm.transportAgeMs(now),
+            g_imu.ageMs(now),
+            g_follow.wpIdx, g_route.count(),
+            g_follow.distToTarget, g_follow.headingErr, g_follow.crossTrack,
             g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
             g_motor.lastSpeedCmd(), g_motor.lastSteerCmd(),
-            (int)g_safety.level(), g_safety.reason());
+            (int)g_safety.level(), g_safety.reason(),
+            g_follow.faultReason ? g_follow.faultReason : "-");
     }
 }
+
+// =============================================================================
+// roverdbg:: — мосты из WsServer для отладочных команд (CAL / GO / LOG).
+// Чтобы те же команды работали и из Serial Monitor, и из WebSocket-терминала
+// приложения — без этого GO/CAL/LOG от приложения отвечают ERR,UNKNOWN.
+// =============================================================================
+namespace roverdbg {
+
+static bool s_imuZeroed = false;
+static float s0Yaw = 0, s0Raw = 0, s0Game = 0, s0Rot = 0, s0Geo = 0;
+static float s0Gx = 0, s0Gy = 0, s0Gz = 0;
+static float s0Mxy = 0, s0Myx = 0, s0Mxz = 0, s0Mzx = 0, s0Myz = 0, s0Mzy = 0;
+static uint32_t s0CntMag = 0, s0CntGeo = 0, s0CntRot = 0, s0CntGame = 0, s0CntGyro = 0;
+
+static float normDeg360Dbg(float d) {
+    while (d < 0.0f) d += 360.0f;
+    while (d >= 360.0f) d -= 360.0f;
+    return d;
+}
+
+static float pairHeadingDeg(float a, float b) {
+    return normDeg360Dbg(atan2f(b, a) * 180.0f / M_PI);
+}
+
+static void currentMagPairs(float& mxy, float& myx, float& mxz,
+                            float& mzx, float& myz, float& mzy) {
+    float mx = g_imu.magX();
+    float my = g_imu.magY();
+    float mz = g_imu.magZ();
+    mxy = pairHeadingDeg(mx, my);
+    myx = pairHeadingDeg(my, mx);
+    mxz = pairHeadingDeg(mx, mz);
+    mzx = pairHeadingDeg(mz, mx);
+    myz = pairHeadingDeg(my, mz);
+    mzy = pairHeadingDeg(mz, my);
+}
+
+void handleCal() {
+    float cur = g_imu.yawDeg();
+    g_est.seedHeadingDeg(0.0f);
+    g_follow.reset();
+    Serial.printf("[CAL] heading reseeded: imuYaw was %.1f → head=0\n", (double)cur);
+}
+
+bool handleGo() {
+    if (!g_est.get().originSet) {
+        Serial.println("[GO] refusing: no origin yet (wait for RTK FIX/FLOAT)");
+        return false;
+    }
+    // Жёсткий гейт: если IMU не отвечает дольше 500мс — отказываем.
+    // Иначе heading "застрянет" на старом значении, Stanley поведёт не туда,
+    // и робот развернётся при старте. Это страховка от I2C-зависания BNO085.
+    {
+        uint32_t tNow = millis();
+        if (g_imu.ageMs(tNow) > 500u || !g_imu.fresh()) {
+            Serial.printf("[GO] refusing: IMU dead (age=%u fresh=%d)\n",
+                          (unsigned)g_imu.ageMs(tNow), g_imu.fresh() ? 1 : 0);
+            return false;
+        }
+    }
+    // Диагностика перед запуском — что может блокировать движение.
+    const auto& e = g_est.get();
+    uint32_t now = millis();
+    Serial.printf("[GO] precheck: sol=%d hAcc=%.3f imuYaw=%.1f mag=%d acc=%.2f "
+                  "imuAge=%u pvtAge=%u rtcmAge=%lu motFB=%d "
+                  "wsConn=%d navReq=%d safety=%d reason=%s\n",
+                  (int)e.sol, e.hAcc, g_imu.yawDeg(),
+                  g_imu.yawFromMag() ? 1 : 0, g_imu.yawAccRad(),
+                  g_imu.ageMs(now), e.pvtAgeMs,
+                  g_rtcm.transportAgeMs(now),
+                  g_motor.haveFeedback() ? 1 : 0,
+                  g_ws.isConnected() ? 1 : 0,
+                  g_ws.navRequested() ? 1 : 0,
+                  (int)g_safety.level(), g_safety.reason());
+
+    float cur = g_imu.yawDeg();
+    g_est.seedHeadingDeg(0.0f);
+    g_follow.reset();
+    g_route.beginUpload(2, g_est.get().originLat, g_est.get().originLon);
+    g_route.addWaypoint(0, 0.0f, 0.0f);
+    g_route.addWaypoint(1, 0.0f, 3.0f);
+    g_route.beginBoundary(4);
+    g_route.addBoundaryPoint(0, -2.0f, -2.0f);
+    g_route.addBoundaryPoint(1,  2.0f, -2.0f);
+    g_route.addBoundaryPoint(2,  2.0f,  5.0f);
+    g_route.addBoundaryPoint(3, -2.0f,  5.0f);
+    g_route.endBoundary();
+    g_route.beginForbidden(0, nullptr);
+    g_route.endForbidden();
+    g_route.endUpload();
+    g_route.start();
+    Serial.printf("[GO] CAL+route+start: imuYaw was %.1f → head=0, "
+                  "route: (0,0) → (0,3), speed=%.2f m/s\n",
+                  (double)cur, (double)ROVER_MAX_SPEED_MPS);
+    return true;
+}
+
+void setLogEnabled(bool enabled) {
+    g_logEnabled = enabled;
+    Serial.printf("[LOG] periodic log %s\n", enabled ? "ON (200ms)" : "OFF");
+}
+
+String diagLine() {
+    const auto& e = g_est.get();
+    uint32_t now = millis();
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+             "sol=%d hAcc=%.3f imu=%.1f mag=%d acc=%.2f imuAge=%u "
+             "pvtAge=%u rtcmAge=%lu motFB=%d ws=%d safety=%d %s "
+             "cmdL=%d cmdR=%d sp=%d st=%d "
+             "wp=%d/%d dWp=%.2f hErr=%.1f ct=%.2f fault=%s",
+             (int)e.sol, e.hAcc, g_imu.yawDeg(),
+             g_imu.yawFromMag() ? 1 : 0, g_imu.yawAccRad(),
+             g_imu.ageMs(now), e.pvtAgeMs,
+             g_rtcm.transportAgeMs(now),
+             g_motor.haveFeedback() ? 1 : 0,
+             g_ws.isConnected() ? 1 : 0,
+             (int)g_safety.level(), g_safety.reason(),
+             g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
+             g_motor.lastSpeedCmd(), g_motor.lastSteerCmd(),
+             g_follow.wpIdx, g_route.count(),
+             g_follow.distToTarget, g_follow.headingErr, g_follow.crossTrack,
+             g_follow.faultReason ? g_follow.faultReason : "-");
+    return String(buf);
+}
+
+String imuZeroLine() {
+    currentMagPairs(s0Mxy, s0Myx, s0Mxz, s0Mzx, s0Myz, s0Mzy);
+    s0Yaw = g_imu.yawDeg();
+    s0Raw = g_imu.rawYawDeg();
+    s0Game = g_imu.gameYawDeg();
+    s0Rot = g_imu.rotYawDeg();
+    s0Geo = g_imu.geoYawDeg();
+    s0Gx = g_imu.gyroIntXDeg();
+    s0Gy = g_imu.gyroIntYDeg();
+    s0Gz = g_imu.gyroIntZDeg();
+    s0CntMag = g_imu.magCount();
+    s0CntGeo = g_imu.geoCount();
+    s0CntRot = g_imu.rotCount();
+    s0CntGame = g_imu.gameCount();
+    s0CntGyro = g_imu.gyroCount();
+    s_imuZeroed = true;
+    char buf[420];
+    snprintf(buf, sizeof(buf),
+             "IMU_ZERO,yaw=%.1f,raw=%.1f,game=%.1f,rot=%.1f,geo=%.1f,"
+             "mag=%.2f/%.2f/%.2f,gint=%.1f/%.1f/%.1f,cnt=%lu/%lu/%lu/%lu/%lu",
+             s0Yaw, s0Raw, s0Game, s0Rot, s0Geo,
+             g_imu.magX(), g_imu.magY(), g_imu.magZ(), s0Gx, s0Gy, s0Gz,
+             (unsigned long)s0CntMag, (unsigned long)s0CntGeo,
+             (unsigned long)s0CntRot, (unsigned long)s0CntGame,
+             (unsigned long)s0CntGyro);
+    return String(buf);
+}
+
+String imuDiagLine() {
+    if (!s_imuZeroed) {
+        return String("IMU_DIAG,ERR,call IMU_ZERO first");
+    }
+    float mxy, myx, mxz, mzx, myz, mzy;
+    currentMagPairs(mxy, myx, mxz, mzx, myz, mzy);
+    char buf[760];
+    snprintf(buf, sizeof(buf),
+             "IMU_DIAG,"
+             "dYaw=%.1f,dRaw=%.1f,dGame=%.1f,dRot=%.1f,dGeo=%.1f,"
+             "dGx=%.1f,dGy=%.1f,dGz=%.1f,"
+             "dMxy=%.1f,dMyx=%.1f,dMxz=%.1f,dMzx=%.1f,dMyz=%.1f,dMzy=%.1f,"
+             "rate=%.1f/%.1f/%.1f,"
+             "age=%u,cnt=%lu/%lu/%lu/%lu/%lu,"
+             "nowYaw=%.1f,raw=%.1f,game=%.1f,rot=%.1f,geo=%.1f,mag=%.2f/%.2f/%.2f",
+             wrapDeg180Local(g_imu.yawDeg() - s0Yaw),
+             wrapDeg180Local(g_imu.rawYawDeg() - s0Raw),
+             wrapDeg180Local(g_imu.gameYawDeg() - s0Game),
+             wrapDeg180Local(g_imu.rotYawDeg() - s0Rot),
+             wrapDeg180Local(g_imu.geoYawDeg() - s0Geo),
+             g_imu.gyroIntXDeg() - s0Gx,
+             g_imu.gyroIntYDeg() - s0Gy,
+             g_imu.gyroIntZDeg() - s0Gz,
+             wrapDeg180Local(mxy - s0Mxy),
+             wrapDeg180Local(myx - s0Myx),
+             wrapDeg180Local(mxz - s0Mxz),
+             wrapDeg180Local(mzx - s0Mzx),
+             wrapDeg180Local(myz - s0Myz),
+             wrapDeg180Local(mzy - s0Mzy),
+             g_imu.gyroXDps(), g_imu.gyroYDps(), g_imu.gyroZDps(),
+             (unsigned)g_imu.ageMs(millis()),
+             (unsigned long)(g_imu.magCount() - s0CntMag),
+             (unsigned long)(g_imu.geoCount() - s0CntGeo),
+             (unsigned long)(g_imu.rotCount() - s0CntRot),
+             (unsigned long)(g_imu.gameCount() - s0CntGame),
+             (unsigned long)(g_imu.gyroCount() - s0CntGyro),
+             g_imu.yawDeg(), g_imu.rawYawDeg(), g_imu.gameYawDeg(),
+             g_imu.rotYawDeg(), g_imu.geoYawDeg(),
+             g_imu.magX(), g_imu.magY(), g_imu.magZ());
+    return String(buf);
+}
+
+}  // namespace roverdbg

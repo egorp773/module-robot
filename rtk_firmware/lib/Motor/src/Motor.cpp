@@ -88,9 +88,16 @@ void Motor::setManualPercent(int leftPct, int rightPct) {
 
 void Motor::setLinearAngularSpeed(float linearMps, float angularRadps, bool useRamp) {
     (void)useRamp;  // slew всегда применяется в loop()
-    // diff-drive: v_left = v - w*b/2 ; v_right = v + w*b/2  (м/с)
-    float vL = linearMps + angularRadps * _wheelBase * 0.5f;
-    float vR = linearMps - angularRadps * _wheelBase * 0.5f;
+    // On this rover left < right turns the body clockwise. The navigation
+    // heading convention is also clockwise-positive, so positive angularRadps
+    // must command left slower than right.
+    float vL = linearMps - angularRadps * _wheelBase * 0.5f;
+    float vR = linearMps + angularRadps * _wheelBase * 0.5f;
+    if (linearMps > 0.0f && (vL < 0.0f || vR < 0.0f)) {
+        float minWheel = linearMps * 0.15f;
+        if (vL < minWheel) vL = minWheel;
+        if (vR < minWheel) vR = minWheel;
+    }
     // м/с -> проценты: ROVER_MAX_SPEED_MPS соответствует HOVER_MAX_PERCENT
     float scale = (float)ROVER_AUTO_MAX_PERCENT / ROVER_MAX_SPEED_MPS;
     int leftPct  = (int)roundf(vL * scale);

@@ -126,7 +126,8 @@ void RtkEkf::predict(float dt, float v_mps, float omega_radps, float yawRateRadp
 
 bool RtkEkf::updatePosition(float zx, float zy, float cov_xy, bool reliableFix) {
     if (!reliableFix) return false;
-    if (cov_xy <= 0) cov_xy = 0.0004f;   // default 2cm -> var 4e-4 m^2
+    if (cov_xy <= 0) cov_xy = 0.0064f;   // default 8cm -> var 6.4e-3 m^2
+    if (cov_xy < 0.0064f) cov_xy = 0.0064f;
 
     // === Mahalanobis gate ===
     float dx = zx - _x;
@@ -134,10 +135,12 @@ bool RtkEkf::updatePosition(float zx, float zy, float cov_xy, bool reliableFix) 
     float Pxx = _Pcov[0];
     float Pyy = _Pcov[6];
     float Pxy = _Pcov[1];
-    float det = Pxx * Pyy - Pxy * Pxy;
+    float Sg00 = Pxx + cov_xy;
+    float Sg11 = Pyy + cov_xy;
+    float det = Sg00 * Sg11 - Pxy * Pxy;
     if (det <= 1e-12f) return false;
     float invDet = 1.0f / det;
-    float mahal = (Pyy * dx * dx - 2.0f * Pxy * dx * dy + Pxx * dy * dy) * invDet;
+    float mahal = (Sg11 * dx * dx - 2.0f * Pxy * dx * dy + Sg00 * dy * dy) * invDet;
     if (mahal > kMahalanobisGate) return false;   // outlier
 
     // === S = H*P*H^T + R (2x2). R = diag(cov_xy, cov_xy) ===

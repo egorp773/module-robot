@@ -7,6 +7,7 @@
 #include "Gnss.h"
 
 enum RtcmSource : uint8_t { RTCM_NONE = 0, RTCM_UDP = 2 };
+static constexpr uint32_t RTCM_AGE_UNKNOWN_MS = 0xFFFFFFFFu;
 
 class RtcmLink {
 public:
@@ -16,7 +17,7 @@ public:
 
     RtcmSource source() const { return _src; }
     uint32_t transportAgeMs(uint32_t nowMs) const {
-        if (_lastRxMs == 0) return 0xFFFFFFFFu;
+        if (_lastRxMs == 0) return RTCM_AGE_UNKNOWN_MS;
         if (nowMs < _lastRxMs) return 0;
         return nowMs - _lastRxMs;
     }

@@ -3,6 +3,17 @@
 #include "WsServer.h"
 #include "RtkConfig.h"
 
+// Forward declarations из rover.cpp (namespace roverdbg) — нужны, чтобы WsServer
+// мог дёргать отладочные команды (CAL/GO/LOG) из приложения, не включая сам rover.cpp
+// (там циклическая зависимость по глобальным объектам).
+namespace roverdbg {
+    bool handleGo();
+    void setLogEnabled(bool);
+    String diagLine();
+    String imuZeroLine();
+    String imuDiagLine();
+}
+
 void WsServer::begin(StateEstimator& est, Imu& imu, Gnss& gnss, RtcmLink& rtcm,
                      Route& route, Motor& motor, Safety& safety, uint16_t port) {
     _est = &est; _imu = &imu; _gnss = &gnss; _rtcm = &rtcm;
@@ -10,6 +21,10 @@ void WsServer::begin(StateEstimator& est, Imu& imu, Gnss& gnss, RtcmLink& rtcm,
 
     _server = new AsyncWebServer(port);
     _ws = new AsyncWebSocket("/ws");
+
+    // Включаем TCP keepalive на WiFi-уровне (см. connectWiFi), но дополнительно шлём
+    // пинг клиентам вручную каждые 3 сек. Без этого NAT роутера прибивает сессию.
+    // В ESPAsyncWebServer 3.11 нет keepAlivePeriod — пингуем через pingAll() в loop.
 
     _server->on("/ping", HTTP_GET, [](AsyncWebServerRequest* r) { r->send(200, "text/plain", "OK"); });
 
@@ -27,6 +42,8 @@ void WsServer::onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         _client = client;
         _lastRxMs = millis();
         sendText(client, "STATE,CONNECTED");
+        // Подсказка оператору — какие команды есть для отладки.
+        sendText(client, "[HELP] DIAG | IMU_ZERO | IMU_DIAG | CAL | GO | STOP | LOG,0 | LOG,1");
     } else if (type == WS_EVT_DISCONNECT) {
         if (_client == client) _client = nullptr;
         stopActuators();
@@ -74,6 +91,51 @@ void WsServer::stopActuators() {
 
 void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
     _lastCmdMs = millis();
+
+    // === Отладочные команды из приложения (через WebSocket).
+    // Без этого "GO"/"CAL"/"LOG" из приложения падают в ERR,UNKNOWN. ===
+    if (line == "CAL") {
+        if (_imu && _est) {
+            float cur = _imu->yawDeg();
+            _est->seedHeadingDeg(0.0f);
+            sendText(client, String("[CAL] imuYaw was ") + String(cur, 1) + " → head=0");
+        } else {
+            sendText(client, "ERR,CAL_NO_IMU");
+        }
+        return;
+    }
+    if (line == "GO") {
+        if (roverdbg::handleGo()) {
+            // handleGo() только готовит маршрут, но stepFollower() в loop() крутится
+            // только если navRequested==true. Без этого — маршрут запущен, моторы стоят.
+            _navRequested = true;
+            sendText(client, "OK,GO start: " + roverdbg::diagLine());
+        } else {
+            sendText(client, "ERR,GO_NO_ORIGIN: " + roverdbg::diagLine());
+        }
+        return;
+    }
+    if (line == "DIAG") {
+        sendText(client, roverdbg::diagLine());
+        return;
+    }
+    if (line == "IMU_ZERO") {
+        sendText(client, roverdbg::imuZeroLine());
+        return;
+    }
+    if (line == "IMU_DIAG") {
+        sendText(client, roverdbg::imuDiagLine());
+        return;
+    }
+    if (line.startsWith("LOG,")) {
+        int v = atoi(line.c_str() + 4);
+        roverdbg::setLogEnabled(v != 0);
+        // ВАЖНО: телеметрия не трогается здесь. По умолчанию OFF (в h).
+        // Если хочешь видеть TEL/NAV/IMU — отдельная кнопка LOG,1.
+        sendText(client, String("[LOG] ") + (v ? "ON" : "OFF"));
+        return;
+    }
+
     if (line == "PING") {
         sendText(client, "PONG");
         sendTel(client);
@@ -81,9 +143,8 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         return;
     }
     if (line == "STOP") {
-        stopActuators();
-        _motor->stopImmediately();
-        _route->stop();
+        if (_motor) _motor->stopImmediately();
+        if (_route) _route->stop();
         _navRequested = false;
         sendText(client, "OK STOP");
         return;
@@ -257,7 +318,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
             sendText(client, "ERR,HACC");
         } else if (e.pvtAgeMs > SAFE_PVT_AGE_MS || e.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {
             sendText(client, "ERR,POSITION_STALE");
-        } else if (e.rejectedPositionFixes > 0) {
+        } else if (e.rejectedPositionFixes > SAFE_REJECTED_POSITION_FIXES_MAX) {
             sendText(client, "ERR,GPS_JUMP");
         } else if (!e.headingValid || e.headingAgeMs > SAFE_HEADING_AGE_MS) {
             sendText(client, "ERR,HEADING_STALE");
@@ -299,27 +360,44 @@ static const char* rtcmSourceText(RtcmSource source) {
     return "none";
 }
 
+static long telemetryAgeMs(uint32_t ageMs) {
+    constexpr uint32_t kMaxTelemetryAgeMs = 60000u;
+    if (ageMs == RTCM_AGE_UNKNOWN_MS || ageMs > kMaxTelemetryAgeMs) return -1L;
+    return (long)ageMs;
+}
+
+static long rtcmTransportAgeForTelemetry(const RtcmLink* rtcm, uint32_t nowMs) {
+    if (!rtcm || rtcm->source() == RTCM_NONE) return -1L;
+    return telemetryAgeMs(rtcm->transportAgeMs(nowMs));
+}
+
+static long gnssRtcmAgeForTelemetry(const Gnss* gnss, uint32_t nowMs) {
+    if (!gnss || gnss->rtcm().lastRxMs == 0) return -1L;
+    uint32_t ageMs = (nowMs < gnss->rtcm().lastRxMs) ? 0u : nowMs - gnss->rtcm().lastRxMs;
+    return telemetryAgeMs(ageMs);
+}
+
 void WsServer::sendTel(AsyncWebSocketClient* client) {
     if (!_est) return;
     const auto& e = _est->get();
     uint32_t now = millis();
     char buf[360];
     int n = snprintf(buf, sizeof(buf),
-        "TEL,%.7f,%.7f,%.2f,%.1f,%d,%s,%d,%d,%d,%d,%.3f,%.2f,%u,%u,%u,%.2f,%u,%d,%u,%u,%s,%u,%u,%u",
+        "TEL,%.7f,%.7f,%.2f,%.1f,%d,%s,%d,%d,%d,%d,%.3f,%.2f,%u,%lu,%ld,%.2f,%lu,%d,%ld,%ld,%s,%lu,%lu,%lu",
         e.lat, e.lon, e.alt, e.headingFiltDeg, e.fixType, carrierText(e.sol), e.diff ? 1 : 0,
         e.numSv, (int)(e.hAcc*1000), (int)(e.vAcc*1000), e.speedMps, e.pDop,
         e.pvtAgeMs,
-        _rtcm ? _rtcm->bytes() : 0u,
-        _rtcm ? _rtcm->transportAgeMs(now) : 0xFFFFFFFFu,
+        (unsigned long)(_rtcm ? _rtcm->bytes() : 0u),
+        rtcmTransportAgeForTelemetry(_rtcm, now),
         _imu ? _imu->yawDeg() : 0.0f,
-        _imu ? _imu->ageMs(now) : 0xFFFFFFFFu,
+        (unsigned long)(_imu ? _imu->ageMs(now) : RTCM_AGE_UNKNOWN_MS),
         _imu && _imu->fresh() ? 1 : 0,
-        _rtcm ? _rtcm->transportAgeMs(now) : 0xFFFFFFFFu,
-        _gnss ? _gnss->pvtAgeMs(now) : 0xFFFFFFFFu,
+        rtcmTransportAgeForTelemetry(_rtcm, now),
+        gnssRtcmAgeForTelemetry(_gnss, now),
         rtcmSourceText(_rtcm ? _rtcm->source() : RTCM_NONE),
-        _gnss ? _gnss->rtcm().msgCount : 0u,
-        _gnss ? _gnss->rtcm().crcFail  : 0u,
-        _gnss ? _gnss->rtcm().lastType : 0u);
+        (unsigned long)(_gnss ? _gnss->rtcm().msgCount : 0u),
+        (unsigned long)(_gnss ? _gnss->rtcm().crcFail  : 0u),
+        (unsigned long)(_gnss ? _gnss->rtcm().lastType : 0u));
     if (n > 0) sendText(client, String(buf));
 }
 
@@ -348,14 +426,17 @@ void WsServer::sendGpsDbg(AsyncWebSocketClient* client) {
 
 void WsServer::sendRtcm(AsyncWebSocketClient* client) {
     if (!_rtcm || !_gnss) return;
+    uint32_t now = millis();
     char buf[200];
     snprintf(buf, sizeof(buf),
-        "RTCM,%u,%u,%u,%u,%s,%u,%u,%u",
-        _rtcm->bytes(), _rtcm->transportAgeMs(millis()),
-        _rtcm->transportAgeMs(millis()),
-        _gnss->pvtAgeMs(millis()),
+        "RTCM,%lu,%ld,%ld,%ld,%s,%lu,%lu,%lu",
+        (unsigned long)_rtcm->bytes(), rtcmTransportAgeForTelemetry(_rtcm, now),
+        rtcmTransportAgeForTelemetry(_rtcm, now),
+        gnssRtcmAgeForTelemetry(_gnss, now),
         rtcmSourceText(_rtcm->source()),
-        _rtcm->packets(), _gnss->rtcm().crcFail, _gnss->rtcm().lastType);
+        (unsigned long)_rtcm->packets(),
+        (unsigned long)_gnss->rtcm().crcFail,
+        (unsigned long)_gnss->rtcm().lastType);
     sendText(client, buf);
 }
 
@@ -417,21 +498,21 @@ void WsServer::markTelemetryTick() {
         const auto& e = _est->get();
         char buf[360];
         int n = snprintf(buf, sizeof(buf),
-            "TEL,%.7f,%.7f,%.2f,%.1f,%d,%s,%d,%d,%d,%d,%.3f,%.2f,%u,%u,%u,%.2f,%u,%d,%u,%u,%s,%u,%u,%u",
+            "TEL,%.7f,%.7f,%.2f,%.1f,%d,%s,%d,%d,%d,%d,%.3f,%.2f,%u,%lu,%ld,%.2f,%lu,%d,%ld,%ld,%s,%lu,%lu,%lu",
             e.lat, e.lon, e.alt, e.headingFiltDeg, e.fixType, carrierText(e.sol), e.diff ? 1 : 0,
             e.numSv, (int)(e.hAcc*1000), (int)(e.vAcc*1000), e.speedMps, e.pDop,
             e.pvtAgeMs,
-            _rtcm ? _rtcm->bytes() : 0u,
-            _rtcm ? _rtcm->transportAgeMs(now) : 0xFFFFFFFFu,
+            (unsigned long)(_rtcm ? _rtcm->bytes() : 0u),
+            rtcmTransportAgeForTelemetry(_rtcm, now),
             _imu ? _imu->yawDeg() : 0.0f,
-            _imu ? _imu->ageMs(now) : 0xFFFFFFFFu,
+            (unsigned long)(_imu ? _imu->ageMs(now) : RTCM_AGE_UNKNOWN_MS),
             _imu && _imu->fresh() ? 1 : 0,
-            _rtcm ? _rtcm->transportAgeMs(now) : 0xFFFFFFFFu,
-            _gnss ? _gnss->pvtAgeMs(now) : 0xFFFFFFFFu,
+            rtcmTransportAgeForTelemetry(_rtcm, now),
+            gnssRtcmAgeForTelemetry(_gnss, now),
             rtcmSourceText(_rtcm ? _rtcm->source() : RTCM_NONE),
-            _gnss ? _gnss->rtcm().msgCount : 0u,
-            _gnss ? _gnss->rtcm().crcFail  : 0u,
-            _gnss ? _gnss->rtcm().lastType : 0u);
+            (unsigned long)(_gnss ? _gnss->rtcm().msgCount : 0u),
+            (unsigned long)(_gnss ? _gnss->rtcm().crcFail  : 0u),
+            (unsigned long)(_gnss ? _gnss->rtcm().lastType : 0u));
         if (n > 0) sendText(_client, String(buf));
     }
     {
@@ -448,12 +529,14 @@ void WsServer::markTelemetryTick() {
     if (_rtcm && _gnss) {
         char buf[200];
         snprintf(buf, sizeof(buf),
-            "RTCM,%u,%u,%u,%u,%s,%u,%u,%u",
-            _rtcm->bytes(), _rtcm->transportAgeMs(now),
-            _rtcm->transportAgeMs(now),
-            _gnss->pvtAgeMs(now),
+            "RTCM,%lu,%ld,%ld,%ld,%s,%lu,%lu,%lu",
+            (unsigned long)_rtcm->bytes(), rtcmTransportAgeForTelemetry(_rtcm, now),
+            rtcmTransportAgeForTelemetry(_rtcm, now),
+            gnssRtcmAgeForTelemetry(_gnss, now),
             rtcmSourceText(_rtcm->source()),
-            _rtcm->packets(), _gnss->rtcm().crcFail, _gnss->rtcm().lastType);
+            (unsigned long)_rtcm->packets(),
+            (unsigned long)_gnss->rtcm().crcFail,
+            (unsigned long)_gnss->rtcm().lastType);
         sendText(_client, buf);
     }
     if (_imu) {
@@ -487,7 +570,16 @@ void WsServer::markTelemetryTick() {
 }
 
 void WsServer::loop() {
-    if (_ws) _ws->cleanupClients();
+    if (!_ws) return;
+    // Manual WS ping каждые 3 сек. Без этого лужи NAT-сессии через 1-3 минуты рвутся
+    // со стороны роутера (Xiaomi агрессивный idle-timeout), и приложение получает
+    // реконнект каждые 1-2 мин.
+    uint32_t now = millis();
+    if (now - _lastPingMs >= 3000) {
+        _lastPingMs = now;
+        _ws->pingAll();
+    }
+    _ws->cleanupClients();
 }
 
 void WsServer::sendBattery(int pct) {

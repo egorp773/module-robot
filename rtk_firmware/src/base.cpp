@@ -149,7 +149,7 @@ static void waitSurveyIn() {
         uint8_t siv = g_gnss.ubx().getSIV();   // спутников в решении — диагностика приёма базы
         Serial.printf("[BASE] survey ok=%d active=%d valid=%d dur=%lu acc=%.3f m siv=%u\n",
                       ok ? 1 : 0, active ? 1 : 0, valid ? 1 : 0, dur, acc, siv);
-        if (ok && valid) {
+        if (valid) {
             Serial.println("[BASE] survey valid, RTCM 1005 should be available");
             enableBaseRtcmMessages();
             return;
@@ -179,20 +179,37 @@ static void waitSurveyIn() {
 }
 
 static void connectWiFi() {
+    WiFi.disconnect(true, true);
+    delay(300);
+    WiFi.mode(WIFI_OFF);
+    delay(300);
     WiFi.mode(WIFI_STA);
-    WiFi.setTxPower(WIFI_POWER_11dBm);
+    WiFi.persistent(false);
+    WiFi.setSleep(false);
     IPAddress ip, gw, sn, dns;
     ip.fromString(BASE_IP);
     gw.fromString("192.168.31.1");
     sn.fromString("255.255.255.0");
     dns = gw;
     WiFi.config(ip, gw, sn, dns);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    int t = 0;
-    while (WiFi.status() != WL_CONNECTED && t < 30) {
-        delay(500);
-        Serial.print(".");
-        t++;
+    WiFi.setAutoReconnect(true);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+    for (int attempt = 1; attempt <= 3 && WiFi.status() != WL_CONNECTED; ++attempt) {
+        Serial.printf("[BASE] wifi attempt %d ssid=%s\n", attempt, WIFI_SSID);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        int t = 0;
+        while (WiFi.status() != WL_CONNECTED && t < 20) {
+            delay(500);
+            Serial.print(".");
+            t++;
+        }
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.printf("\n[BASE] wifi attempt %d failed status=%d\n",
+                          attempt, (int)WiFi.status());
+            WiFi.disconnect(false, false);
+            delay(1000);
+        }
     }
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[BASE] wifi connected ip=%s\n", WiFi.localIP().toString().c_str());
@@ -209,8 +226,8 @@ void setup() {
     if (!g_gnss.begin(F9pSerial, GNSS_BASE)) {
         Serial.println("[BASE] F9P NOT FOUND");
     }
-    waitSurveyIn();
     connectWiFi();
+    waitSurveyIn();
     g_udp.begin(RTCM_UDP_PORT);
     Serial.println("[BASE] ready");
 }

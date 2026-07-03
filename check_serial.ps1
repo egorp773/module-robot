@@ -1,25 +1,18 @@
-# Close any existing serial ports
-$proc = Get-Process | Where-Object { $_.MainWindowTitle -like "*COM4*" }
-if ($proc) {
-    Write-Host "Closing existing COM4 connection..."
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+# reset_and_read.ps1 - reset ESP32 (DTR toggle) + read 30s boot+steady
+$port = New-Object System.IO.Ports.SerialPort COM3,115200,None,8,One
+$port.Open()
+$port.DtrEnable = $true
+Start-Sleep -Milliseconds 100
+$port.DtrEnable = $false
+Start-Sleep -Milliseconds 100
+$port.ReadTimeout = 500
+$start = Get-Date
+$end = $start.AddSeconds(30)
+while ((Get-Date) -lt $end) {
+  try {
+    $line = $port.ReadLine()
+    if ($line) { Write-Output $line }
+  } catch [System.TimeoutException] {
+  }
 }
-
-$p = New-Object System.IO.Ports.SerialPort 'COM4',115200
-$p.Open()
-Write-Host "Port opened, waiting 8 seconds..."
-Start-Sleep -Seconds 8
-$bytes = $p.BytesToRead
-Write-Host "Bytes available: $bytes"
-if ($bytes -gt 0) {
-    $data = $p.ReadExisting()
-    Write-Host "=== ROVER OUTPUT ==="
-    Write-Host $data
-    if ($data -match "Guru Meditation") {
-        Write-Host "`n!!! CRASH DETECTED !!!"
-    }
-} else {
-    Write-Host "No data received"
-}
-$p.Close()
+$port.Close()

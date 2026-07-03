@@ -23,7 +23,7 @@
 #define F9P_BAUD          38400    // F9P дефолт — важно для cold start
 
 // ---------------- Networking ----------------
-#define WIFI_SSID         "Xiaomi_6A92"
+#define WIFI_SSID         "Xiaomi_D465"
 #define WIFI_PASS         "17762646"
 #define ROVER_IP          "192.168.31.222"
 #define BASE_IP           "192.168.31.207"
@@ -40,8 +40,8 @@
 #define BASE_SURVEY_ACC_M   1.0f
 #define BASE_SURVEY_MIN_S   300
 #define BASE_SURVEY_FALLBACK_ACC_M 25.0f
-#define BASE_SURVEY_FALLBACK_MIN_S 60
-#define BASE_SURVEY_FALLBACK_AFTER_S 300
+#define BASE_SURVEY_FALLBACK_MIN_S 30
+#define BASE_SURVEY_FALLBACK_AFTER_S 30
 #define BASE_TCP_RX_TIMEOUT_MS 4000
 
 // ---------------- Hoverboard motor protocol (эталон: sound.ino, рабочий) ----------------
@@ -65,21 +65,35 @@
 #define ROVER_WHEEL_CIRCUM_M 0.6f
 #define ROVER_HOVER_MEAS_TO_RPM  6.0f   // speed_meas / 6 ≈ RPM (зависит от прошивки hoverboard)
 #define ROVER_MAX_PWM       70
-#define ROVER_INPUT_DIV     2
+#define ROVER_INPUT_DIV     6
 #define ROVER_CMD_TIMEOUT_MS 400
-// Скорость автономки = ручной 16%. Расчёт: ручной M,16 → /ROVER_INPUT_DIV(2) = 8% →
-// pctToHover(8,8) = 8*2*300/(2*70) = команда платы 34/300. Чтобы автономка на полном ходу
-// давала ту же команду 34, нужно leftPct=8 при baseSpeed=ROVER_MAX_SPEED_MPS:
-//   scale = ROVER_AUTO_MAX_PERCENT / ROVER_MAX_SPEED_MPS = 8 / 0.25 = 32
-//   baseSpeed 0.25 * 32 = 8 → pctToHover(8,8) = 34. Совпадает с ручной 16%.
-#define ROVER_AUTO_MAX_PERCENT 8
-#define ROVER_MAX_SPEED_MPS  0.25f
+// Safety-first tuning while calibrating: manual M is divided by 6, autonomous
+// output is capped at 6%. Speed in m/s is only a controller scale label here;
+// real speed must be calibrated from RTK position over longer runs.
+#define ROVER_AUTO_MAX_PERCENT 6
+#define ROVER_MAX_SPEED_MPS  0.08f
 // FLOAT едет с той же скоростью что и FIXED (на FLOAT hAcc уже ~2см, безопасно) —
 // чтобы автономка ехала одинаково как ручной 16% независимо от RTK-режима.
-#define ROVER_FLOAT_SPEED    0.25f
-#define ROVER_DEGRADED_SPEED 0.07f
-#define ROVER_HOLD_SPEED     0.03f
-#define ROVER_INITIAL_HEADING_DEG 176.0f  // физ. старт-курс робота (выставлен на улице)
+#define ROVER_FLOAT_SPEED    0.08f
+#define ROVER_DEGRADED_SPEED 0.04f
+#define ROVER_HOLD_SPEED     0.02f
+// Hoverboard-keepalive: если idle (нет команд) дольше этого времени —
+// шлём 3% команды на 2 сек чтобы плата не уходила в сон.
+#define ROVER_KEEPALIVE_IDLE_MS    180000u   // 3 минуты
+#define ROVER_KEEPALIVE_PULSE_PCT  3
+#define ROVER_KEEPALIVE_PULSE_MS   2000u
+#define ROVER_INITIAL_HEADING_DEG 124.0f  // fallback, если IMU не дала heading при старте
+// IMU yaw calibration: 17.06.2026, magnetic-field raw heading.
+// При реальном heading ~259° calibrated magnetometer raw≈102°.
+// Формула heading = offset - raw: offset = 259 + 102 = 361° == 1°.
+#define IMU_YAW_OFFSET_DEG   1.0f
+// RotationVector yaw на этом монтаже убывает при повороте робота по часовой.
+// Heading для навигации: normalize(IMU_ROT_YAW_OFFSET_DEG - rotYaw).
+// 90° сохраняет текущую грубую абсолютную ориентацию после перехода с raw mag.
+#define IMU_ROT_YAW_OFFSET_DEG 172.0f
+// 2026-07-03 field correction: BNO085 published 230.6 deg while the rover nose
+// was physically about 180 deg (south). Publish compass-like yaw = yaw - 50.6.
+#define IMU_COMPASS_CORRECTION_DEG 50.6f
 #define ROVER_ARRIVAL_RADIUS 0.10f
 #define ROVER_ARRIVAL_CONFIRM_S 1.5f
 // Lookahead для Stanley: целевая точка берётся НА СЕГМЕНТЕ на расстоянии lookahead
@@ -89,8 +103,8 @@
 // Stanley controller (Sunray: STANLEY_CONTROL_P=3.0, K=1.0):
 //   w = k_heading*headingErr_rad + atan(k_crosstrack*ct / (k_soft + |v|))
 // Усиления увеличены vs старой версии (0.55 / 0.08) — старые были насыщены clamp.
-#define ROVER_K_HEADING       2.20f
-#define ROVER_K_CROSSTRACK    0.80f
+#define ROVER_K_HEADING       1.00f
+#define ROVER_K_CROSSTRACK    0.25f
 #define ROVER_STANLEY_SOFT_SPEED 0.30f
 #define ROVER_TURN_THRESH_DEG 25.0f
 #define ROVER_ROTATE_SPEED_RADPS 0.40f
@@ -131,6 +145,7 @@
 #define SAFE_HEADING_AGE_MS 1500
 #define SAFE_IMU_AGE_MS     200
 #define SAFE_NAV_TIMEOUT_MS 8000
+#define SAFE_REJECTED_POSITION_FIXES_MAX 5
 #define SAFE_HACC_FIXED_M  0.02f
 #define SAFE_HACC_FLOAT_M  0.02f
 #define SAFE_HACC_HOLD_M   1.00f
