@@ -125,10 +125,15 @@ bool Imu::begin(uint8_t sdaPin, uint8_t sclPin) {
         return false;
     }
 
-    _bno.enableReport(SH2_ROTATION_VECTOR, 10000);
-    _bno.enableReport(SH2_GEOMAGNETIC_ROTATION_VECTOR, 10000);
-    _bno.enableReport(SH2_GAME_ROTATION_VECTOR, 10000);
-    _bno.enableReport(SH2_GYROSCOPE_CALIBRATED, 20000);
+    // Push the BNO08x as fast as the sensor allows so the rover loop
+    // can pull fresh yaw / gyro every tick. Rotation vector and gyro at
+    // ~200 Hz; geomagnetic rotation vector and magnetometer stay at 50
+    // Hz (those sensor engines are slower on the BNO08x and don't need
+    // 200 Hz anyway).
+    _bno.enableReport(SH2_ROTATION_VECTOR, 5000);
+    _bno.enableReport(SH2_GEOMAGNETIC_ROTATION_VECTOR, 20000);
+    _bno.enableReport(SH2_GAME_ROTATION_VECTOR, 5000);
+    _bno.enableReport(SH2_GYROSCOPE_CALIBRATED, 5000);
     _bno.enableReport(SH2_MAGNETIC_FIELD_CALIBRATED, 20000);
 
     if (sh2_setCalConfig(SH2_CAL_ACCEL | SH2_CAL_GYRO | SH2_CAL_MAG) != SH2_OK) {
@@ -265,127 +270,129 @@ void Imu::loop() {
     if (!_running) return;
 
     uint32_t nowMs = millis();
-    if (!_bno.getSensorEvent(&_val)) {
-        updateHeadingState(nowMs);
-        return;
-    }
-
-    switch (_val.sensorId) {
-        case SH2_MAGNETIC_FIELD_CALIBRATED: {
-            float mx = _val.un.magneticField.x;
-            float my = _val.un.magneticField.y;
-            float mz = _val.un.magneticField.z;
-            rememberMagNorm(mx, my, mz);
-            _magCount++;
-            break;
-        }
-        case SH2_GEOMAGNETIC_ROTATION_VECTOR: {
-            _geoCount++;
-            _lastGeoYawMs = nowMs;
-            float yaw = quatYawDeg(
-                _val.un.geoMagRotationVector.i,
-                _val.un.geoMagRotationVector.j,
-                _val.un.geoMagRotationVector.k,
-                _val.un.geoMagRotationVector.real);
-            _geoYawDeg = yaw;
-            const float accRad = _val.un.geoMagRotationVector.accuracy;
-            const float robotYaw = headingFromSourceYaw(yaw);
-            const bool recentGoodRotation =
-                _lastGoodRotYawMs != 0 &&
-                (nowMs - _lastGoodRotYawMs) <= (SAFE_IMU_AGE_MS * 2u);
-            if (accRad <= IMU_ABS_YAW_MAX_ACC_RAD && !recentGoodRotation) {
-                _lastGoodGeoYawMs = nowMs;
-                updateAbsoluteCandidate(ImuYawSource::GEOMAGNETIC_ROTATION_VECTOR, yaw, robotYaw, accRad, nowMs);
-            } else if (!recentGoodRotation && _yawSource == ImuYawSource::GEOMAGNETIC_ROTATION_VECTOR) {
-                _yawSource = ImuYawSource::GEOMAGNETIC_ROTATION_VECTOR;
-                _sourceYawDeg = yaw;
-                _rawYawDeg = yaw;
-                _baseYawDeg = robotYaw;
-                recomputeFinalYaw();
-                _yawAccRad = accRad;
-                _has = true;
-                _lastMs = nowMs;
-                _lastYawMs = nowMs;
-                _headingState = ImuHeadingState::IMU_ABSOLUTE_UNCALIBRATED;
+    // Drain the entire BNO08x event queue each tick. The sensor pushes
+    // SH2 events on its own cadence (100 Hz rotation vector, 50 Hz
+    // gyro/mag); if we read only one per loop tick we accumulate
+    // backpressure and `_lastYawMs` can stay frozen for hundreds of ms,
+    // tripping the SAFE_IMU_AGE_MS gate even though the sensor is alive.
+    int budget = 32;  // hard cap per tick so we never starve other loop work
+    while (budget-- > 0 && _bno.getSensorEvent(&_val)) {
+        switch (_val.sensorId) {
+            case SH2_MAGNETIC_FIELD_CALIBRATED: {
+                float mx = _val.un.magneticField.x;
+                float my = _val.un.magneticField.y;
+                float mz = _val.un.magneticField.z;
+                rememberMagNorm(mx, my, mz);
+                _magCount++;
+                break;
             }
-            break;
-        }
-        case SH2_ROTATION_VECTOR: {
-            _rotCount++;
-            _lastRotYawMs = nowMs;
-            float yaw = quatYawDeg(
-                _val.un.rotationVector.i,
-                _val.un.rotationVector.j,
-                _val.un.rotationVector.k,
-                _val.un.rotationVector.real);
-            _rotYawDeg = yaw;
-            const float accRad = _val.un.rotationVector.accuracy;
-            const float robotYaw = headingFromSourceYaw(yaw);
-            if (accRad <= IMU_ABS_YAW_MAX_ACC_RAD) {
-                _lastGoodRotYawMs = nowMs;
-                updateAbsoluteCandidate(ImuYawSource::ROTATION_VECTOR, yaw, robotYaw, accRad, nowMs);
-            } else if (_yawSource == ImuYawSource::ROTATION_VECTOR ||
-                       _lastGoodGeoYawMs == 0 ||
-                       (nowMs - _lastGoodGeoYawMs) > (SAFE_IMU_AGE_MS * 2u)) {
-                _yawSource = ImuYawSource::ROTATION_VECTOR;
-                _sourceYawDeg = yaw;
-                _rawYawDeg = yaw;
-                _baseYawDeg = robotYaw;
-                recomputeFinalYaw();
-                _yawAccRad = accRad;
-                _has = true;
-                _lastMs = nowMs;
-                _lastYawMs = nowMs;
-                _headingState = ImuHeadingState::IMU_ABSOLUTE_UNCALIBRATED;
-            }
-            break;
-        }
-        case SH2_GAME_ROTATION_VECTOR: {
-            _gameCount++;
-            float yaw = quatYawDeg(
-                _val.un.gameRotationVector.i,
-                _val.un.gameRotationVector.j,
-                _val.un.gameRotationVector.k,
-                _val.un.gameRotationVector.real);
-            _gameYawDeg = yaw;
-            _has = true;
-            _lastMs = nowMs;
-            if (_yawSource == ImuYawSource::NONE ||
-                _headingState == ImuHeadingState::IMU_NO_DATA ||
-                _headingState == ImuHeadingState::IMU_RELATIVE_ONLY) {
-                _yawSource = ImuYawSource::GAME_ROTATION_VECTOR;
-                _sourceYawDeg = yaw;
-                _rawYawDeg = yaw;
-                _baseYawDeg = headingFromSourceYaw(yaw);
-                recomputeFinalYaw();
-                _yawAccRad = 999.0f;
-                _lastYawMs = nowMs;
-                _headingState = ImuHeadingState::IMU_RELATIVE_ONLY;
-            }
-            break;
-        }
-        case SH2_GYROSCOPE_CALIBRATED: {
-            _gyroCount++;
-            _gyroXDps = _val.un.gyroscope.x * 180.0f / M_PI;
-            _gyroYDps = _val.un.gyroscope.y * 180.0f / M_PI;
-            _gyroZDps = _val.un.gyroscope.z * 180.0f / M_PI;
-            if (_lastGyroMs != 0) {
-                const float dt = (nowMs - _lastGyroMs) * 0.001f;
-                if (dt > 0.0f && dt < 0.2f) {
-                    _gyroIntXDeg += _gyroXDps * dt;
-                    _gyroIntYDeg += _gyroYDps * dt;
-                    _gyroIntZDeg += _gyroZDps * dt;
+            case SH2_GEOMAGNETIC_ROTATION_VECTOR: {
+                _geoCount++;
+                _lastGeoYawMs = nowMs;
+                float yaw = quatYawDeg(
+                    _val.un.geoMagRotationVector.i,
+                    _val.un.geoMagRotationVector.j,
+                    _val.un.geoMagRotationVector.k,
+                    _val.un.geoMagRotationVector.real);
+                _geoYawDeg = yaw;
+                const float accRad = _val.un.geoMagRotationVector.accuracy;
+                const float robotYaw = headingFromSourceYaw(yaw);
+                const bool recentGoodRotation =
+                    _lastGoodRotYawMs != 0 &&
+                    (nowMs - _lastGoodRotYawMs) <= (SAFE_IMU_AGE_MS * 2u);
+                if (accRad <= IMU_ABS_YAW_MAX_ACC_RAD && !recentGoodRotation) {
+                    _lastGoodGeoYawMs = nowMs;
+                    updateAbsoluteCandidate(ImuYawSource::GEOMAGNETIC_ROTATION_VECTOR, yaw, robotYaw, accRad, nowMs);
+                } else if (!recentGoodRotation && _yawSource == ImuYawSource::GEOMAGNETIC_ROTATION_VECTOR) {
+                    _yawSource = ImuYawSource::GEOMAGNETIC_ROTATION_VECTOR;
+                    _sourceYawDeg = yaw;
+                    _rawYawDeg = yaw;
+                    _baseYawDeg = robotYaw;
+                    recomputeFinalYaw();
+                    _yawAccRad = accRad;
+                    _has = true;
+                    _lastMs = nowMs;
+                    _lastYawMs = nowMs;
+                    _headingState = ImuHeadingState::IMU_ABSOLUTE_UNCALIBRATED;
                 }
+                break;
             }
-            _lastGyroMs = nowMs;
-            _yawRateDps = _gyroZDps * (float)IMU_YAW_RATE_SIGN;
-            _lastMs = nowMs;
-            break;
+            case SH2_ROTATION_VECTOR: {
+                _rotCount++;
+                _lastRotYawMs = nowMs;
+                float yaw = quatYawDeg(
+                    _val.un.rotationVector.i,
+                    _val.un.rotationVector.j,
+                    _val.un.rotationVector.k,
+                    _val.un.rotationVector.real);
+                _rotYawDeg = yaw;
+                const float accRad = _val.un.rotationVector.accuracy;
+                const float robotYaw = headingFromSourceYaw(yaw);
+                if (accRad <= IMU_ABS_YAW_MAX_ACC_RAD) {
+                    _lastGoodRotYawMs = nowMs;
+                    updateAbsoluteCandidate(ImuYawSource::ROTATION_VECTOR, yaw, robotYaw, accRad, nowMs);
+                } else if (_yawSource == ImuYawSource::ROTATION_VECTOR ||
+                           _lastGoodGeoYawMs == 0 ||
+                           (nowMs - _lastGoodGeoYawMs) > (SAFE_IMU_AGE_MS * 2u)) {
+                    _yawSource = ImuYawSource::ROTATION_VECTOR;
+                    _sourceYawDeg = yaw;
+                    _rawYawDeg = yaw;
+                    _baseYawDeg = robotYaw;
+                    recomputeFinalYaw();
+                    _yawAccRad = accRad;
+                    _has = true;
+                    _lastMs = nowMs;
+                    _lastYawMs = nowMs;
+                    _headingState = ImuHeadingState::IMU_ABSOLUTE_UNCALIBRATED;
+                }
+                break;
+            }
+            case SH2_GAME_ROTATION_VECTOR: {
+                _gameCount++;
+                float yaw = quatYawDeg(
+                    _val.un.gameRotationVector.i,
+                    _val.un.gameRotationVector.j,
+                    _val.un.gameRotationVector.k,
+                    _val.un.gameRotationVector.real);
+                _gameYawDeg = yaw;
+                _has = true;
+                _lastMs = nowMs;
+                if (_yawSource == ImuYawSource::NONE ||
+                    _headingState == ImuHeadingState::IMU_NO_DATA ||
+                    _headingState == ImuHeadingState::IMU_RELATIVE_ONLY) {
+                    _yawSource = ImuYawSource::GAME_ROTATION_VECTOR;
+                    _sourceYawDeg = yaw;
+                    _rawYawDeg = yaw;
+                    _baseYawDeg = headingFromSourceYaw(yaw);
+                    recomputeFinalYaw();
+                    _yawAccRad = 999.0f;
+                    _lastYawMs = nowMs;
+                    _headingState = ImuHeadingState::IMU_RELATIVE_ONLY;
+                }
+                break;
+            }
+            case SH2_GYROSCOPE_CALIBRATED: {
+                _gyroCount++;
+                _gyroXDps = _val.un.gyroscope.x * 180.0f / M_PI;
+                _gyroYDps = _val.un.gyroscope.y * 180.0f / M_PI;
+                _gyroZDps = _val.un.gyroscope.z * 180.0f / M_PI;
+                if (_lastGyroMs != 0) {
+                    const float dt = (nowMs - _lastGyroMs) * 0.001f;
+                    if (dt > 0.0f && dt < 0.2f) {
+                        _gyroIntXDeg += _gyroXDps * dt;
+                        _gyroIntYDeg += _gyroYDps * dt;
+                        _gyroIntZDeg += _gyroZDps * dt;
+                    }
+                }
+                _lastGyroMs = nowMs;
+                _yawRateDps = _gyroZDps * (float)IMU_YAW_RATE_SIGN;
+                _lastMs = nowMs;
+                break;
+            }
+            default:
+                break;
         }
-        default:
-            break;
     }
-
     updateHeadingState(nowMs);
 }
 

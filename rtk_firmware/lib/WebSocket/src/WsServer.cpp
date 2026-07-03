@@ -74,6 +74,26 @@ void WsServer::sendAll(const String& text) {
     if (_ws) _ws->textAll(text);
 }
 
+bool WsServer::trySendTelemetryText(AsyncWebSocketClient* client, const String& text) {
+    if (!client) return false;
+    if (client->status() != WS_CONNECTED) {
+        _wsTelemetryDropped++;
+        _lastWsDropMs = millis();
+        return false;
+    }
+    if (client->queueIsFull()) {
+        // Quietly drop telemetry. We do not log per-drop to avoid
+        // flooding the Serial monitor when the client is slow; the
+        // counter is the only persistent record.
+        _wsTelemetryDropped++;
+        _lastWsDropMs = millis();
+        return false;
+    }
+    client->text(text);
+    _wsTelemetrySent++;
+    return true;
+}
+
 void WsServer::stopActuators() {
     digitalWrite(PIN_RELAY_ATTACH, LOW);
     digitalWrite(PIN_RELAY_MOUNT, LOW);
@@ -580,7 +600,7 @@ void WsServer::markTelemetryTick() {
             (unsigned long)(_gnss ? _gnss->rtcm().msgCount : 0u),
             (unsigned long)(_gnss ? _gnss->rtcm().crcFail  : 0u),
             (unsigned long)(_gnss ? _gnss->rtcm().lastType : 0u));
-        if (n > 0) sendText(_client, String(buf));
+        if (n > 0) trySendTelemetryText(_client, String(buf));
     }
     {
         const auto& e = _est->get();
@@ -591,7 +611,7 @@ void WsServer::markTelemetryTick() {
             carrierText(e.sol),
             e.diff ? 1 : 0, e.numSv,
             (int)(e.hAcc*1000), (int)(e.vAcc*1000), e.speedMps, e.pDop, e.pvtAgeMs);
-        sendText(_client, buf);
+        trySendTelemetryText(_client, buf);
     }
     if (_rtcm && _gnss) {
         char buf[200];
@@ -604,16 +624,16 @@ void WsServer::markTelemetryTick() {
             (unsigned long)_rtcm->packets(),
             (unsigned long)_gnss->rtcm().crcFail,
             (unsigned long)_gnss->rtcm().lastType);
-        sendText(_client, buf);
+        trySendTelemetryText(_client, buf);
     }
     if (_imu) {
         char buf[80];
         snprintf(buf, sizeof(buf), "IMU,%.2f,%u,%d",
             _imu->yawDeg(), _imu->ageMs(now), _imu->fresh() ? 1 : 0);
-        sendText(_client, buf);
+        trySendTelemetryText(_client, buf);
     }
     if (_motor) {
-        sendText(_client, makeMotorLine(*_motor));
+        trySendTelemetryText(_client, makeMotorLine(*_motor));
     }
     if (now - _lastNavMs >= NAV_PERIOD_MS) {
         const char* st = "IDLE";
@@ -631,7 +651,7 @@ void WsServer::markTelemetryTick() {
             _lastNav.headingErr, _lastNav.crossTrack,
             _lastNav.lastLeftPwm, _lastNav.lastRightPwm,
             _lastNav.errorReason ? _lastNav.errorReason : "");
-        sendText(_client, buf);
+        trySendTelemetryText(_client, buf);
         _lastNavMs = now;
     }
 }

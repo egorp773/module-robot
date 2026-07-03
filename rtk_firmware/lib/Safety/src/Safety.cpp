@@ -40,7 +40,11 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
             return;
         }
     }
-    if (in.pvtAgeMs > SAFE_PVT_AGE_MS) {
+    // PVT staleness threshold is per-tick (in.maxPvtAgeMs) so the caller
+    // can relax it for AUTO_ALIGN_HEADING_BY_RTK while keeping the strict
+    // SAFE_PVT_AGE_MS for normal navigation.
+    const uint32_t maxPvt = in.maxPvtAgeMs == 0 ? SAFE_PVT_AGE_MS : in.maxPvtAgeMs;
+    if (in.pvtAgeMs > maxPvt) {
         set(SAFETY_ESTOP, "pvt_stale");
         return;
     }

@@ -90,5 +90,26 @@ private:
     volatile bool _telemetryEnabled = false;
     NavStateOut _lastNav{};
 
+    // WS telemetry backpressure counters. Drop counts are accumulated
+    // here, not by AsyncWebServer (which only logs the standard
+    // `_queueMessage(): Too many messages queued` warning). Exposed
+    // via wsTelemetrySent/Dropped accessors below.
+    uint32_t _wsTelemetrySent = 0;
+    uint32_t _wsTelemetryDropped = 0;
+    uint32_t _lastWsDropMs = 0;
+
+    // Try to enqueue a telemetry frame for the connected client.
+    // Returns true if the message was accepted, false if it was dropped
+    // because the client queue is full or the client is not connected.
+    // Control responses must use sendText() directly so they are never
+    // dropped.
+    bool trySendTelemetryText(AsyncWebSocketClient* client, const String& text);
+
     static String makeMotorLine(const Motor& motor);
+
+public:
+    // Read-only counters for diagnostics.
+    uint32_t wsTelemetrySent() const { return _wsTelemetrySent; }
+    uint32_t wsTelemetryDropped() const { return _wsTelemetryDropped; }
+    uint32_t lastWsDropMs() const { return _lastWsDropMs; }
 };

@@ -38,6 +38,21 @@ public:
         if (_lastYawMs == 0) return 0xFFFFFFFFu;
         return (nowMs >= _lastYawMs) ? (nowMs - _lastYawMs) : 0;
     }
+    // Per-source ages. The single yawAgeMs() reflects whichever sample
+    // currently drives headingFiltDeg; these split out the components
+    // so the operator can see which sub-system is stale.
+    uint32_t absYawAgeMs(uint32_t nowMs) const {
+        if (_lastGoodRotYawMs == 0) return 0xFFFFFFFFu;
+        return (nowMs >= _lastGoodRotYawMs) ? (nowMs - _lastGoodRotYawMs) : 0;
+    }
+    uint32_t relYawAgeMs(uint32_t nowMs) const {
+        if (_lastRelYawMs == 0) return 0xFFFFFFFFu;
+        return (nowMs >= _lastRelYawMs) ? (nowMs - _lastRelYawMs) : 0;
+    }
+    uint32_t gyroAgeMs(uint32_t nowMs) const {
+        if (_lastGyroMs == 0) return 0xFFFFFFFFu;
+        return (nowMs >= _lastGyroMs) ? (nowMs - _lastGyroMs) : 0;
+    }
     uint32_t ageMs(uint32_t nowMs) const {
         if (!_has) return 0xFFFFFFFFu;
         return (nowMs >= _lastMs) ? (nowMs - _lastMs) : 0;
@@ -185,6 +200,7 @@ private:
     uint32_t _lastGyroMs = 0;
     uint32_t _lastRotYawMs = 0;
     uint32_t _lastGeoYawMs = 0;
+    uint32_t _lastRelYawMs = 0;          // game rotation vector / relative yaw
     uint32_t _lastGoodRotYawMs = 0;
     uint32_t _lastGoodGeoYawMs = 0;
     uint32_t _absCandidateSinceMs = 0;

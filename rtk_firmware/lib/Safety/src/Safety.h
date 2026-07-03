@@ -24,6 +24,12 @@ struct SafetyInput {
     float hAcc = 999;
     uint32_t pvtAgeMs = 0xFFFFFFFFu;
     uint32_t rtcmAgeMs = 0xFFFFFFFFu;
+    // PVT staleness threshold the caller wants enforced this tick.
+    // Defaults to SAFE_PVT_AGE_MS for normal navigation. Auto-alignment
+    // sets a looser value (ALIGN_MAX_PVT_AGE_MS) so a single PVT jitter
+    // past 1 s does not abort the run. RTCM is still gated by
+    // SAFE_RTK_AGE_MS.
+    uint32_t maxPvtAgeMs = 0;
     uint32_t acceptedPositionAgeMs = 0xFFFFFFFFu;
     uint32_t headingAgeMs = 0xFFFFFFFFu;
     uint16_t rejectedPositionFixes = 0;

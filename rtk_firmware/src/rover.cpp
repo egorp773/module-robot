@@ -56,6 +56,12 @@ enum class HeadingSource : uint8_t {
     IMU_ABSOLUTE,
     IMU_MANUAL,
     RTK_MOTION_ALIGNED,
+    // Heading seeded from RTK motion alignment, then continuously
+    // tracked by integrating the BNO085 gyro through the StateEstimator.
+    // `headingDeg` reflects the live estimator heading (rotates with
+    // the rover); `lastAlignHeading` keeps the original RTK-only value
+    // for diagnostics.
+    RTK_MOTION_ALIGNED_PLUS_IMU,
 };
 static const char* headingSourceName(HeadingSource s) {
     switch (s) {
@@ -63,6 +69,7 @@ static const char* headingSourceName(HeadingSource s) {
         case HeadingSource::IMU_ABSOLUTE: return "IMU_ABSOLUTE";
         case HeadingSource::IMU_MANUAL: return "IMU_MANUAL";
         case HeadingSource::RTK_MOTION_ALIGNED: return "RTK_MOTION_ALIGNED";
+        case HeadingSource::RTK_MOTION_ALIGNED_PLUS_IMU: return "RTK_MOTION_ALIGNED_PLUS_IMU";
     }
     return "NONE";
 }
@@ -80,6 +87,68 @@ struct HeadingMgr {
     float lastAlignHAcc = 0.0f;
     const char* lastAlignError = nullptr;
 } g_heading;
+
+// --------------------------------------------------------------------
+// Serial-initiated motion registry
+// --------------------------------------------------------------------
+//
+// Both AUTO_ALIGN_HEADING_BY_RTK (when issued from Serial) and the
+// GO_FORWARD / GO_NORTH test commands need motors to spin even without a
+// connected WebSocket client. We collect them in one struct and expose
+// `active` to Safety::tick() via SafetyInput.serialDebugMotion.
+//
+// The flag clears automatically when:
+//   - the originating test finishes (alignment OK/ERR, follower arrival)
+//   - STOP is received
+//   - safety falls into ESTOP or HOLD
+//   - a per-source hard timeout (10 s for GO_*; the alignment has its own)
+enum class SerialMotionSource : uint8_t {
+    NONE = 0,
+    AUTO_ALIGN,
+    GO_FORWARD,
+    GO_NORTH,
+};
+
+static const char* serialMotionSourceName(SerialMotionSource s) {
+    switch (s) {
+        case SerialMotionSource::AUTO_ALIGN: return "AUTO_ALIGN";
+        case SerialMotionSource::GO_FORWARD: return "GO_FORWARD";
+        case SerialMotionSource::GO_NORTH:  return "GO_NORTH";
+        default: return "NONE";
+    }
+}
+
+struct SerialMotion {
+    bool active = false;
+    SerialMotionSource source = SerialMotionSource::NONE;
+    uint32_t startedAtMs = 0;
+    uint32_t timeoutMs = 0;
+} g_serialMotion;
+
+// Per-source hard timeouts. AUTO_ALIGN has its own ALIGN_TIMEOUT_MS;
+// GO_* commands get a 10 second ceiling because they typically
+// cover ~0.5 m at 0.18 m/s ≈ 3 s of motion, plus some startup slack.
+static constexpr uint32_t SERIAL_GO_TIMEOUT_MS = 10000u;
+
+static void serialMotionBegin(SerialMotionSource src, uint32_t timeoutMs) {
+    g_serialMotion.active = true;
+    g_serialMotion.source = src;
+    g_serialMotion.startedAtMs = millis();
+    g_serialMotion.timeoutMs = timeoutMs;
+    Serial.printf("[SERIAL-MOTION] begin source=%s timeoutMs=%u\n",
+                  serialMotionSourceName(src), (unsigned)timeoutMs);
+}
+
+static void serialMotionEnd(const char* reason) {
+    if (!g_serialMotion.active && g_serialMotion.source == SerialMotionSource::NONE) return;
+    Serial.printf("[SERIAL-MOTION] end source=%s reason=%s\n",
+                  serialMotionSourceName(g_serialMotion.source),
+                  reason ? reason : "-");
+    g_serialMotion.active = false;
+    g_serialMotion.source = SerialMotionSource::NONE;
+    g_serialMotion.startedAtMs = 0;
+    g_serialMotion.timeoutMs = 0;
+}
 
 // --- waypoint follower v2: simple first-route controller ---
 struct Follower {
@@ -127,6 +196,37 @@ struct Follower {
         lastFaultWp = -1;
     }
 } g_follow;
+
+// Called once per loop() from rover.cpp. Clears the serialDebugMotion
+// override when the test drive completes (arrival / safety fault /
+// alignment finish / hard timeout).
+static void serialMotionTick() {
+    if (!g_serialMotion.active) return;
+    const uint32_t now = millis();
+    if (g_safety.level() == SAFETY_ESTOP || g_safety.level() == SAFETY_HOLD) {
+        serialMotionEnd("safety");
+        return;
+    }
+    if (g_follow.arrived) {
+        serialMotionEnd("arrived");
+        return;
+    }
+    if (g_serialMotion.source == SerialMotionSource::AUTO_ALIGN &&
+        g_heading.alignState != AlignState::RUNNING) {
+        // Alignment finished (OK or ERR). The alignment state machine
+        // already stops the motors; we just need to drop the
+        // serialDebugMotion override so ws_disconnected re-engages.
+        serialMotionEnd("align_finished");
+        return;
+    }
+    if (g_serialMotion.timeoutMs != 0 &&
+        (now - g_serialMotion.startedAtMs) > g_serialMotion.timeoutMs) {
+        serialMotionEnd("timeout");
+        // also stop the motors to be safe
+        g_motor.stopImmediately();
+        return;
+    }
+}
 
 static float clampf(float v, float lo, float hi) {
     if (v < lo) return lo;
@@ -301,6 +401,13 @@ static bool startGoRoute(const char* tag, float distanceM, bool forwardFromHeadi
     g_route.endUpload();
     g_route.start();
     g_ws.requestDebugNavigation();
+    // Mark this as a serial-initiated motion so ws_disconnected does
+    // not stop the test drive. Cleared by handleStopLine or by
+    // serialMotionTick on arrival/safety/timeout.
+    serialMotionBegin(strcmp(tag, "GO_NORTH") == 0
+                          ? SerialMotionSource::GO_NORTH
+                          : SerialMotionSource::GO_FORWARD,
+                      SERIAL_GO_TIMEOUT_MS);
     Serial.printf("[%s] distance=%.2f heading=%.1f start=(%.2f,%.2f) "
                   "target=(%.2f,%.2f) origin=(%.8f,%.8f) speed=%.2f\n",
                   tag, (double)distanceM, (double)headingDeg,
@@ -523,10 +630,16 @@ static constexpr float ALIGN_MIN_DIST_HARD     = 0.75f;
 // Soft tolerance: 0.10 m is the project's nominal FIXED gate; for alignment
 // we are OK with up to 0.10 m before we even start.
 static constexpr float ALIGN_START_MAX_HACC    = 0.10f;
-// Per-sample variance inside a start/end window. 0.05 m = 50 mm — a real
-// RTK jitter of 0.02 m (2 cm) easily fits; a 0.20 m RMS jitter indicates
-// multipath / mode flip / unhealthy solution.
-static constexpr float ALIGN_JITTER_MAX_M      = 0.05f;
+// Looser PVT staleness threshold for alignment. The rover may sample
+// PVT at 1 Hz with ~1.1 s inter-arrival jitter; the navigation gate
+// (SAFE_PVT_AGE_MS = 1000) is too tight for alignment and was killing
+// otherwise healthy runs.
+static constexpr uint32_t ALIGN_MAX_PVT_AGE_MS = 2500u;
+// Per-sample variance inside the stationary start/end window. 0.07 m
+// RMS is the upper bound; a real FIXED RTK at 1.4 cm horizontal accuracy
+// typically shows 0.01..0.03 m RMS over a 0.5 s window. Bigger than
+// 0.07 m indicates multipath / mode flip / unhealthy solution.
+static constexpr float ALIGN_JITTER_MAX_M      = 0.07f;
 // Sample-window size for the mean. 5 at ~10 Hz PVT ≈ 0.5 s of data.
 static constexpr int   ALIGN_START_WINDOW       = 5;
 static constexpr int   ALIGN_END_WINDOW         = 5;
@@ -544,43 +657,52 @@ struct AlignSample {
     uint32_t tMs;
 };
 
-// Start and end windows are kept as fixed-size arrays rather than a
-// single ring buffer so:
-//   - the FIRST 10 valid PVT samples are remembered verbatim regardless
-//     of how long the alignment takes;
-//   - the LAST 10 valid PVT samples are remembered verbatim;
-//   - final heading = atan2(mean(end) - mean(start)) is immune to
-//     2 cm RTK jitter and to long-alignment ring-buffer wrap.
-// We additionally keep a longer sample log for segment-heading stability
-// analysis; that buffer is only used to compute the stddev guard and is
-// permitted to wrap.
+// Phase machine for the alignment run. The previous version mixed
+// stationary and moving samples into the same "start/end" window which
+// spuriously counted real robot motion as RTK jitter and aborted
+// otherwise healthy runs. The new version keeps three separate windows:
+//
+//   1. startSamples — filled ONLY during START_SETTLE, while the rover
+//      is stationary. Their RMS radius is the genuine RTK jitter.
+//   2. movingSamples — ring of the most recent N samples taken during
+//      DRIVE. Used purely for progress / segment-stability debug; never
+//      counted toward jitter.
+//   3. endSamples — filled ONLY during END_SETTLE, after the rover has
+//      stopped moving. Their RMS radius is the genuine end-of-run jitter.
+//
+// Final heading = atan2(mean(end) - mean(start)) over stationary-only
+// windows, immune to motion displacement and to long alignments.
+enum class AlignPhase : uint8_t {
+    START_SETTLE = 0,
+    DRIVE,
+    END_SETTLE,
+};
+
 static constexpr int   ALIGN_WINDOW_CAP        = 10;
-static constexpr int   ALIGN_SAMPLE_CAP        = 96;  // for stddev only
+static constexpr int   ALIGN_MOVING_CAP        = 32;
 
 struct AlignRun {
     bool active = false;
+    AlignPhase phase = AlignPhase::START_SETTLE;
+    uint32_t phaseStartedAtMs = 0;
     uint32_t startedAtMs = 0;
-    // Single-sample legacy fields kept for abort/error log lines.
-    float startX = 0;
-    float startY = 0;
-    float endX = 0;
-    float endY = 0;
-    float startHAcc = 0;
 
-    // First ALIGN_WINDOW_CAP valid samples (chronological).
+    // Phase 1: stationary start window.
     AlignSample startSamples[ALIGN_WINDOW_CAP];
     int   startSampleCount = 0;
+    bool  startLogged = false;
 
-    // Last ALIGN_WINDOW_CAP valid samples (ring of the most recent N).
+    // Phase 2: moving debug ring (most recent N during DRIVE).
+    AlignSample movingSamples[ALIGN_MOVING_CAP];
+    int   movingSampleCount = 0;
+    int   movingSampleHead  = 0;
+    int   driveSampleCount = 0;  // total PVT samples seen during DRIVE
+
+    // Phase 3: stationary end window.
     AlignSample endSamples[ALIGN_WINDOW_CAP];
-    int   endSampleCount = 0;     // grows up to ALIGN_WINDOW_CAP
-    int   endSampleHead  = 0;     // ring write ptr [0, ALIGN_WINDOW_CAP)
-
-    // Full chronological ring buffer used only for segment-heading
-    // stddev calculation. May wrap on long alignments.
-    AlignSample samples[ALIGN_SAMPLE_CAP];
-    int   sampleCount = 0;
-    int   sampleHead = 0;
+    int   endSampleCount = 0;
+    int   endSampleHead  = 0;
+    bool  endLogged = false;
 
     // De-dup of PVT updates. We track pvtAgeMs every loop tick and push
     // a new sample only when pvtAgeMs decreased since the previous tick,
@@ -603,7 +725,7 @@ static bool rtkAcceptableForAlign(const Estimate& e) {
     const bool rtkOk =
         (e.sol == SOL_FIXED && e.hAcc <= ALIGN_START_MAX_HACC) ||
         (e.sol == SOL_FLOAT && e.hAcc <= 0.05f);
-    return rtkOk && e.lat != 0.0f && e.lon != 0.0f && e.pvtAgeMs <= SAFE_PVT_AGE_MS;
+    return rtkOk && e.lat != 0.0f && e.lon != 0.0f && e.pvtAgeMs <= ALIGN_MAX_PVT_AGE_MS;
 }
 
 // Begin a new alignment run. Returns true if we transitioned to RUNNING and
@@ -640,16 +762,23 @@ static bool autoAlignHeadingBegin(bool fromWebSocket) {
     g_align.abortedByRtk = false;
     g_align.fromWebSocket = fromWebSocket;
     g_align.startedAtMs = millis();
-    g_align.startX = e.x;
-    g_align.startY = e.y;
-    g_align.startHAcc = e.hAcc;
-    g_align.endX = e.x;
-    g_align.endY = e.y;
+    if (!fromWebSocket) {
+        // Allow motors to spin without a connected WebSocket client.
+        // The flag is cleared inside serialMotionTick (alignment finish
+        // -> abort/end handles it via `g_align.active = false`, and the
+        // tick uses g_align.active as one of the auto-clear signals).
+        serialMotionBegin(SerialMotionSource::AUTO_ALIGN, ALIGN_TIMEOUT_MS + 1000u);
+    }
+    g_align.phase = AlignPhase::START_SETTLE;
+    g_align.phaseStartedAtMs = millis();
     g_align.startSampleCount = 0;
+    g_align.startLogged = false;
+    g_align.movingSampleCount = 0;
+    g_align.movingSampleHead = 0;
+    g_align.driveSampleCount = 0;
     g_align.endSampleCount = 0;
     g_align.endSampleHead = 0;
-    g_align.sampleCount = 0;
-    g_align.sampleHead = 0;
+    g_align.endLogged = false;
     g_align.lastSeenPvtAgeMs = 0xFFFFFFFFu;
     g_align.samplePushCount = 0;
     g_heading.alignStartedAtMs = g_align.startedAtMs;
@@ -687,12 +816,12 @@ static int alignEndSampleIndex(int logicalIdx) {
     return i;
 }
 
-static int alignFullSampleIndex(int logicalIdx) {
-    // Chronological index in the full log buffer; oldest entry is at
-    // (sampleHead - sampleCount) mod ALIGN_SAMPLE_CAP.
-    const int oldest = (g_align.sampleHead - g_align.sampleCount);
-    int i = (oldest + logicalIdx) % ALIGN_SAMPLE_CAP;
-    if (i < 0) i += ALIGN_SAMPLE_CAP;
+static int alignMovingIndex(int logicalIdx) {
+    // Chronological index in the DRIVE ring buffer; oldest entry at
+    // (movingSampleHead - movingSampleCount) mod ALIGN_MOVING_CAP.
+    const int oldest = (g_align.movingSampleHead - g_align.movingSampleCount);
+    int i = (oldest + logicalIdx) % ALIGN_MOVING_CAP;
+    if (i < 0) i += ALIGN_MOVING_CAP;
     return i;
 }
 
@@ -723,9 +852,10 @@ static void alignEndMean(float& outX, float& outY, float& outHAcc, int& outN) {
     outX *= inv; outY *= inv; outHAcc *= inv;
 }
 
-// RMS radius of the start/end sample window around its mean. Real motion
-// has tiny radius because the samples are tightly bunched; jitter blow-up
-// shows up as a large radius.
+// RMS radius of a stationary window around its mean. Real FIXED RTK
+// at ~1.4 cm horizontal accuracy shows 0.01..0.03 m RMS over a 0.5 s
+// stationary window. Anything > ALIGN_JITTER_MAX_M means multipath /
+// mode flip / unhealthy solution and we abort.
 static float alignStartRmsRadius() {
     const int n = g_align.startSampleCount;
     if (n <= 0) return 0;
@@ -764,11 +894,11 @@ static float alignEndRmsRadius() {
     return sqrtf(s / (float)n);
 }
 
-// Standard deviation (degrees) of segment headings between anchors in the
-// full sample log spaced at least ALIGN_SEG_MIN_DIST_M apart. Returns -1
-// when not enough data. Uses circular stddev so wrap-around at 360° is OK.
+// Standard deviation (degrees) of segment headings between DRIVE samples
+// spaced at least ALIGN_SEG_MIN_DIST_M apart. Returns -1 when not enough
+// data. Uses circular stddev so wrap-around at 360° is OK.
 static float alignSegmentHeadingStdDeg() {
-    const int n = g_align.sampleCount;
+    const int n = g_align.movingSampleCount;
     if (n < 4) return -1.0f;
     const int stride = n / 4;
     if (stride < 2) return -1.0f;
@@ -776,10 +906,10 @@ static float alignSegmentHeadingStdDeg() {
     int hcount = 0;
     for (int a = 0; a + stride < n && hcount < 16; a += stride) {
         const int b = a + stride;
-        const int idxA = alignFullSampleIndex(a);
-        const int idxB = alignFullSampleIndex(b);
-        const float dx = g_align.samples[idxB].x - g_align.samples[idxA].x;
-        const float dy = g_align.samples[idxB].y - g_align.samples[idxA].y;
+        const int idxA = alignMovingIndex(a);
+        const int idxB = alignMovingIndex(b);
+        const float dx = g_align.movingSamples[idxB].x - g_align.movingSamples[idxA].x;
+        const float dy = g_align.movingSamples[idxB].y - g_align.movingSamples[idxA].y;
         if (sqrtf(dx * dx + dy * dy) < ALIGN_SEG_MIN_DIST_M) continue;
         headings[hcount++] = ImuMath::rtkForwardHeadingDeg(dx, dy);
     }
@@ -795,44 +925,98 @@ static float alignSegmentHeadingStdDeg() {
     return acosf(R) * 180.0f / (float)M_PI;
 }
 
-// Push a fresh PVT sample into all three buffers. Caller is responsible
-// for ensuring this is a NEW PVT, not a duplicate loop tick — see the
+// Push a fresh PVT sample into the window that matches the current
+// phase. START_SETTLE fills startSamples, DRIVE fills the moving debug
+// ring, END_SETTLE fills endSamples. Caller is responsible for ensuring
+// this is a NEW PVT, not a duplicate loop tick — see the
 // `lastSeenPvtAgeMs` de-dup in stepAlign().
 static void alignPushSample(float x, float y, float hAcc, uint32_t tMs) {
-    // Start window: append until full, then stop. The first valid PVT is
-    // the anchor for the whole run regardless of duration.
-    if (g_align.startSampleCount < ALIGN_WINDOW_CAP) {
-        g_align.startSamples[g_align.startSampleCount] = {x, y, hAcc, tMs};
-        g_align.startSampleCount++;
+    switch (g_align.phase) {
+        case AlignPhase::START_SETTLE: {
+            if (g_align.startSampleCount < ALIGN_WINDOW_CAP) {
+                g_align.startSamples[g_align.startSampleCount] = {x, y, hAcc, tMs};
+                g_align.startSampleCount++;
+            }
+            if (!g_align.startLogged && g_align.startSampleCount >= ALIGN_WINDOW_CAP) {
+                g_align.startLogged = true;
+                Serial.printf("[ALIGN-RTK] start window filled n=%d jitter=%.3f\n",
+                              g_align.startSampleCount,
+                              (double)alignStartRmsRadius());
+            }
+            break;
+        }
+        case AlignPhase::DRIVE: {
+            const int slot = g_align.movingSampleHead % ALIGN_MOVING_CAP;
+            g_align.movingSamples[slot] = {x, y, hAcc, tMs};
+            g_align.movingSampleHead = (g_align.movingSampleHead + 1) % ALIGN_MOVING_CAP;
+            if (g_align.movingSampleCount < ALIGN_MOVING_CAP) {
+                g_align.movingSampleCount++;
+            }
+            g_align.driveSampleCount++;
+            break;
+        }
+        case AlignPhase::END_SETTLE: {
+            const int slot = g_align.endSampleHead % ALIGN_WINDOW_CAP;
+            g_align.endSamples[slot] = {x, y, hAcc, tMs};
+            g_align.endSampleHead = (g_align.endSampleHead + 1) % ALIGN_WINDOW_CAP;
+            if (g_align.endSampleCount < ALIGN_WINDOW_CAP) {
+                g_align.endSampleCount++;
+            }
+            if (!g_align.endLogged && g_align.endSampleCount >= ALIGN_WINDOW_CAP) {
+                g_align.endLogged = true;
+                Serial.printf("[ALIGN-RTK] end window filled n=%d jitter=%.3f\n",
+                              g_align.endSampleCount,
+                              (double)alignEndRmsRadius());
+            }
+            break;
+        }
     }
-    // End window: ring of the most recent ALIGN_WINDOW_CAP samples.
-    {
-        const int slot = g_align.endSampleHead % ALIGN_WINDOW_CAP;
-        g_align.endSamples[slot] = {x, y, hAcc, tMs};
-        g_align.endSampleHead = (g_align.endSampleHead + 1) % ALIGN_WINDOW_CAP;
-        if (g_align.endSampleCount < ALIGN_WINDOW_CAP) g_align.endSampleCount++;
-    }
-    // Full chronological log (allowed to wrap) for stddev analysis.
-    {
-        const int slot = g_align.sampleHead % ALIGN_SAMPLE_CAP;
-        g_align.samples[slot] = {x, y, hAcc, tMs};
-        g_align.sampleHead = (g_align.sampleHead + 1) % ALIGN_SAMPLE_CAP;
-        if (g_align.sampleCount < ALIGN_SAMPLE_CAP) g_align.sampleCount++;
-    }
-    // Legacy mirror for abort/error log lines.
-    if (g_align.startSampleCount == 1) {
-        g_align.startX = x; g_align.startY = y; g_align.startHAcc = hAcc;
-    }
-    g_align.endX = x; g_align.endY = y;
-
     // Per-sample debug line — fires once per fresh PVT, not once per
     // loop tick. Useful when diagnosing "samples = 1, timeout" without
     // having to enable the [NAVV2] stream.
     g_align.samplePushCount++;
-    Serial.printf("[ALIGN-RTK] sample pushed n=%u age=%u x=%.3f y=%.3f hAcc=%.3f\n",
+    Serial.printf("[ALIGN-RTK] sample pushed phase=%d n=%u age=%u x=%.3f y=%.3f hAcc=%.3f\n",
+                  (int)g_align.phase,
                   (unsigned)g_align.samplePushCount,
                   (unsigned)g_align.lastSeenPvtAgeMs,
                   (double)x, (double)y, (double)hAcc);
+}
+
+// Helper: derive mean+jitter of the start window without leaving phase
+// START_SETTLE. Used for the early-jitter reject inside START_SETTLE.
+static void alignStartCheck(float& outX, float& outY, float& outHAcc,
+                            float& outJitter, int& outN) {
+    alignStartMean(outX, outY, outHAcc, outN);
+    outJitter = alignStartRmsRadius();
+}
+
+static void alignEndCheck(float& outX, float& outY, float& outHAcc,
+                          float& outJitter, int& outN) {
+    alignEndMean(outX, outY, outHAcc, outN);
+    outJitter = alignEndRmsRadius();
+}
+
+// Phase-aware abort helper used by stepAlign and the loop-time safety
+// check. Caller has already filled g_heading.lastAlignError with `err`.
+static void alignAbort(const char* err, const Estimate& e, uint32_t nowMs) {
+    g_align.active = false;
+    g_motor.stopImmediately();
+    g_heading.alignState = AlignState::ERR;
+    g_heading.lastAlignError = err;
+    g_heading.lastAlignHAcc = e.hAcc;
+    Serial.printf("[ALIGN-RTK] abort: %s reason=%s level=%d "
+                  "pvtAge=%u maxPvtAge=%u hAcc=%.3f rtkStatus=%d rtcmAge=%u phase=%d\n",
+                  err,
+                  g_safety.reason(),
+                  (int)g_safety.level(),
+                  (unsigned)e.pvtAgeMs,
+                  (unsigned)ALIGN_MAX_PVT_AGE_MS,
+                  (double)e.hAcc,
+                  (int)e.sol,
+                  (unsigned)g_rtcm.transportAgeMs(nowMs),
+                  (int)g_align.phase);
+    Serial.printf("AUTO_ALIGN_HEADING_BY_RTK,ERR,%s,%s\n",
+                  err, g_safety.reason());
 }
 
 // Finalize the run, fill g_heading.lastAlign* and either mark OK or ERR.
@@ -840,58 +1024,37 @@ static void alignPushSample(float x, float y, float hAcc, uint32_t tMs) {
 static bool alignFinalize(const Estimate& e, uint32_t now, uint32_t elapsedMs,
                           const char*& errOut) {
     errOut = nullptr;
-    // Need at least 5 samples in each window — same threshold as before,
-    // hardcoded to the spec value (ALIGN_START_WINDOW / ALIGN_END_WINDOW
-    // are 5 by default but we cap to min 5 here for safety).
-    const int minRequired = (ALIGN_WINDOW_CAP / 2) > 5 ? (ALIGN_WINDOW_CAP / 2) : 5;
+    const int minRequired = 5;
     if (g_align.startSampleCount < minRequired || g_align.endSampleCount < minRequired) {
         g_heading.lastAlignError = "not_enough_samples";
-        g_heading.alignState = AlignState::ERR;
         g_heading.lastAlignDist = 0; g_heading.lastAlignDx = 0; g_heading.lastAlignDy = 0;
-        g_heading.lastAlignHAcc = e.hAcc;
-        Serial.printf("[ALIGN-RTK] abort: not_enough_samples startN=%d endN=%d\n",
-                      g_align.startSampleCount, g_align.endSampleCount);
+        alignAbort("not_enough_samples", e, now);
         errOut = "not_enough_samples";
         return false;
     }
 
     float sx = 0, sy = 0, ex = 0, ey = 0, shAcc = 0, ehAcc = 0;
+    float jitStart = 0, jitEnd = 0;
     int startN = 0, endN = 0;
-    alignStartMean(sx, sy, shAcc, startN);
-    alignEndMean(ex, ey, ehAcc, endN);
-
-    const float jitStart = alignStartRmsRadius();
-    const float jitEnd   = alignEndRmsRadius();
-    if (jitStart > ALIGN_JITTER_MAX_M || jitEnd > ALIGN_JITTER_MAX_M) {
-        g_heading.lastAlignError = "rtk_jitter_too_high";
-        g_heading.alignState = AlignState::ERR;
-        g_heading.lastAlignDist = 0; g_heading.lastAlignDx = 0; g_heading.lastAlignDy = 0;
-        g_heading.lastAlignHAcc = (shAcc + ehAcc) * 0.5f;
-        Serial.printf("[ALIGN-RTK] abort: rtk_jitter_too_high jitterStart=%.3f jitterEnd=%.3f\n",
-                      (double)jitStart, (double)jitEnd);
-        errOut = "rtk_jitter_too_high";
-        return false;
-    }
+    alignStartCheck(sx, sy, shAcc, jitStart, startN);
+    alignEndCheck(ex, ey, ehAcc, jitEnd, endN);
 
     const float dx = ex - sx;
     const float dy = ey - sy;
     const float dist = sqrtf(dx * dx + dy * dy);
     if (dist < ALIGN_MIN_DIST_HARD) {
         g_heading.lastAlignError = "not_enough_motion";
-        g_heading.alignState = AlignState::ERR;
         g_heading.lastAlignDist = dist; g_heading.lastAlignDx = dx; g_heading.lastAlignDy = dy;
         g_heading.lastAlignHAcc = (shAcc + ehAcc) * 0.5f;
-        Serial.printf("[ALIGN-RTK] abort: not_enough_motion dist=%.3f\n", (double)dist);
+        alignAbort("not_enough_motion", e, now);
         errOut = "not_enough_motion";
         return false;
     }
     if (dist < ALIGN_MIN_TRAVEL_M) {
-        // timeout path; live dist check above catches shorter travel mid-run.
         g_heading.lastAlignError = "not_enough_motion";
-        g_heading.alignState = AlignState::ERR;
         g_heading.lastAlignDist = dist; g_heading.lastAlignDx = dx; g_heading.lastAlignDy = dy;
         g_heading.lastAlignHAcc = (shAcc + ehAcc) * 0.5f;
-        Serial.printf("[ALIGN-RTK] abort: not_enough_motion dist=%.3f\n", (double)dist);
+        alignAbort("not_enough_motion", e, now);
         errOut = "not_enough_motion";
         return false;
     }
@@ -899,10 +1062,9 @@ static bool alignFinalize(const Estimate& e, uint32_t now, uint32_t elapsedMs,
     const float stdDev = alignSegmentHeadingStdDeg();
     if (stdDev >= 0.0f && stdDev > ALIGN_HEADING_STD_MAX_DEG) {
         g_heading.lastAlignError = "unstable_heading";
-        g_heading.alignState = AlignState::ERR;
         g_heading.lastAlignDist = dist; g_heading.lastAlignDx = dx; g_heading.lastAlignDy = dy;
         g_heading.lastAlignHAcc = (shAcc + ehAcc) * 0.5f;
-        Serial.printf("[ALIGN-RTK] abort: unstable_heading stdDev=%.1f\n", (double)stdDev);
+        alignAbort("unstable_heading", e, now);
         errOut = "unstable_heading";
         return false;
     }
@@ -915,21 +1077,25 @@ static bool alignFinalize(const Estimate& e, uint32_t now, uint32_t elapsedMs,
     g_heading.lastAlignHAcc = (shAcc + ehAcc) * 0.5f;
     g_heading.lastAlignError = nullptr;
     g_heading.alignState = AlignState::OK;
-    g_heading.source = HeadingSource::RTK_MOTION_ALIGNED;
+    // Promote to "PLUS_IMU": the RTK motion gave us an absolute heading
+    // baseline, and from now on we let the BNO085 gyro / estimator
+    // track rotation. HeadingMgr.headingDeg is updated each tick from
+    // the live estimator (see loop() plumbing) so the operator-facing
+    // heading rotates with the chassis.
+    g_heading.source = HeadingSource::RTK_MOTION_ALIGNED_PLUS_IMU;
     g_heading.headingDeg = headingDeg;
     g_heading.trusted = true;
     g_heading.trustedAtMs = now;
     g_est.seedHeadingDeg(headingDeg, ImuYawSource::ROTATION_VECTOR);
     g_align.abortedByStop = false;
 
-    Serial.printf("[ALIGN-RTK] samples=%d startMean=(%.3f,%.3f) endMean=(%.3f,%.3f) "
-                  "dist=%.3f hAccMean=%.3f jitterStart=%.3f jitterEnd=%.3f "
-                  "stdDevSeg=%.1f method=windowed_start_end\n",
-                  g_align.sampleCount,
+    Serial.printf("[ALIGN-RTK] startMean=(%.3f,%.3f) endMean=(%.3f,%.3f) "
+                  "dist=%.3f dx=%.3f dy=%.3f hAccMean=%.3f "
+                  "jitterStart=%.3f jitterEnd=%.3f method=stationary_start_end\n",
                   (double)sx, (double)sy, (double)ex, (double)ey,
-                  (double)dist, (double)((shAcc + ehAcc) * 0.5f),
-                  (double)jitStart, (double)jitEnd,
-                  stdDev < 0 ? -1.0 : (double)stdDev);
+                  (double)dist, (double)dx, (double)dy,
+                  (double)((shAcc + ehAcc) * 0.5f),
+                  (double)jitStart, (double)jitEnd);
     Serial.printf("[ALIGN-RTK] OK heading=%.1f elapsed=%u\n",
                   (double)headingDeg, (unsigned)elapsedMs);
     return true;
@@ -946,32 +1112,28 @@ static void stepAlign(bool& stopMotorsOut, const char*& errOut) {
     const auto& e = g_est.get();
     const uint32_t now = millis();
 
-    // RTK lost/stale → abort.
+    // RTK lost/stale → abort, from any phase.
     if (!rtkAcceptableForAlign(e)) {
         g_align.abortedByRtk = true;
-        g_align.active = false;
-        g_heading.lastAlignError = "rtk_lost";
-        g_heading.alignState = AlignState::ERR;
-        g_heading.lastAlignDist = 0;
-        g_heading.lastAlignDx = 0;
-        g_heading.lastAlignDy = 0;
-        g_heading.lastAlignHAcc = e.hAcc;
+        alignAbort("rtk_lost", e, now);
         stopMotorsOut = true;
         errOut = "rtk_lost";
-        Serial.printf("[ALIGN-RTK] abort: rtk_lost hAcc=%.3f\n", (double)e.hAcc);
         return;
     }
 
-    // Hard timeout guard.
+    // Hard overall timeout. We let finalize() decide the error string,
+    // so a timeout that left us short of motion is logged as
+    // `not_enough_motion` rather than `timeout`.
     const uint32_t elapsed = now - g_align.startedAtMs;
     if (elapsed > ALIGN_TIMEOUT_MS) {
         g_align.active = false;
-        bool ok = alignFinalize(e, now, elapsed, errOut);
-        if (!ok && g_heading.lastAlignError == nullptr) {
-            g_heading.lastAlignError = "timeout";
-            g_heading.alignState = AlignState::ERR;
+        if (!alignFinalize(e, now, elapsed, errOut)) {
+            // alignFinalize already logged + set state.
             Serial.println("[ALIGN-RTK] abort: timeout");
-            errOut = "timeout";
+            if (g_heading.lastAlignError == nullptr) {
+                g_heading.lastAlignError = "timeout";
+            }
+            errOut = g_heading.lastAlignError ? g_heading.lastAlignError : "timeout";
         }
         stopMotorsOut = true;
         return;
@@ -983,52 +1145,98 @@ static void stepAlign(bool& stopMotorsOut, const char*& errOut) {
     // a new PVT; on subsequent loop ticks it grows monotonically. We
     // record `lastSeenPvtAgeMs` EVERY loop (regardless of whether we push)
     // so that "fresh PVT" = "pvtAgeMs dropped since we last observed it"
-    // is detected even on the second and subsequent PVTs of the run. The
-    // previous bug was that lastSamplePvtAgeMs was updated only on push,
-    // so a single age=0 read followed by age=20..40..60 ticks would freeze
-    // the gate at age=0 and miss the next PVT (which also reads age=0).
+    // is detected even on the second and subsequent PVTs of the run.
     const uint32_t age = e.pvtAgeMs;
     bool newPvt = false;
     if (g_align.lastSeenPvtAgeMs == 0xFFFFFFFFu) {
-        // Very first tick of the run: accept regardless of age. If the
-        // operator happens to be lucky and PVT is exactly fresh, we get
-        // one sample; otherwise we wait for the next edge.
+        // Very first tick of the run: accept regardless of age.
         newPvt = true;
     } else if (age < g_align.lastSeenPvtAgeMs) {
-        // Edge: pvtAgeMs dropped. Always update lastSeen BEFORE deciding
-        // whether to push, so subsequent ticks see the new baseline.
         newPvt = true;
     }
     g_align.lastSeenPvtAgeMs = age;
 
     if (!newPvt) {
-        // No new PVT this tick — keep driving forward but skip sample.
-        g_motor.setLinearAngularSpeed(ALIGN_FORWARD_MPS, 0.0f, true);
+        // No new PVT this tick — keep the motor primed but skip sample.
+        if (g_align.phase == AlignPhase::DRIVE) {
+            g_motor.setLinearAngularSpeed(ALIGN_FORWARD_MPS, 0.0f, true);
+        }
         return;
     }
     alignPushSample(e.x, e.y, e.hAcc, now);
 
-    // Quick early-stop heuristic using the windowed means (cheap: 5 + 5
-    // additions). Real heading is computed in finalize().
-    float sx = 0, sy = 0, ex = 0, ey = 0, sh = 0, eh = 0;
-    int startN = 0, endN = 0;
-    alignStartMean(sx, sy, sh, startN);
-    alignEndMean(ex, ey, eh, endN);
-    const float dxQ = ex - sx;
-    const float dyQ = ey - sy;
-    const float distQ = sqrtf(dxQ * dxQ + dyQ * dyQ);
-
-    if (distQ >= ALIGN_MAX_DIST_M &&
-        startN >= ALIGN_START_WINDOW && endN >= ALIGN_END_WINDOW) {
-        g_align.active = false;
-        alignFinalize(e, now, elapsed, errOut);
-        stopMotorsOut = true;
-        return;
+    // Phase transitions and per-phase behaviour.
+    switch (g_align.phase) {
+        case AlignPhase::START_SETTLE: {
+            if (g_align.startSampleCount >= ALIGN_WINDOW_CAP) {
+                float sx = 0, sy = 0, shAcc = 0, jit = 0;
+                int n = 0;
+                alignStartCheck(sx, sy, shAcc, jit, n);
+                if (jit > ALIGN_JITTER_MAX_M) {
+                    alignAbort("rtk_jitter_too_high", e, now);
+                    stopMotorsOut = true;
+                    errOut = "rtk_jitter_too_high";
+                    return;
+                }
+                Serial.printf("[ALIGN-RTK] phase=START_SETTLE done jitter=%.3f -> DRIVE\n",
+                              (double)jit);
+                g_align.phase = AlignPhase::DRIVE;
+                g_align.phaseStartedAtMs = now;
+                Serial.println("[ALIGN-RTK] phase=DRIVE");
+            }
+            // Stay stationary: don't drive the motor while collecting
+            // the start window.
+            return;
+        }
+        case AlignPhase::DRIVE: {
+            // Check distance from the start window mean. We have at
+            // least ALIGN_WINDOW_CAP stationary start samples so the
+            // mean is meaningful.
+            float sx = 0, sy = 0, shAcc = 0, jit = 0;
+            int n = 0;
+            alignStartCheck(sx, sy, shAcc, jit, n);
+            const float dx = e.x - sx;
+            const float dy = e.y - sy;
+            const float dist = sqrtf(dx * dx + dy * dy);
+            if (dist >= ALIGN_MAX_DIST_M) {
+                Serial.printf("[ALIGN-RTK] phase=DRIVE dist=%.3f -> END_SETTLE\n",
+                              (double)dist);
+                g_align.phase = AlignPhase::END_SETTLE;
+                g_align.phaseStartedAtMs = now;
+                g_align.endSampleCount = 0;
+                g_align.endSampleHead = 0;
+                g_align.endLogged = false;
+                Serial.println("[ALIGN-RTK] phase=END_SETTLE");
+                // Stop the motors immediately; the END_SETTLE window is
+                // stationary.
+                g_motor.stopImmediately();
+                stopMotorsOut = true;
+                return;
+            }
+            g_motor.setLinearAngularSpeed(ALIGN_FORWARD_MPS, 0.0f, true);
+            return;
+        }
+        case AlignPhase::END_SETTLE: {
+            if (g_align.endSampleCount >= ALIGN_WINDOW_CAP) {
+                float ex = 0, ey = 0, ehAcc = 0, jit = 0;
+                int n = 0;
+                alignEndCheck(ex, ey, ehAcc, jit, n);
+                if (jit > ALIGN_JITTER_MAX_M) {
+                    alignAbort("rtk_jitter_too_high", e, now);
+                    stopMotorsOut = true;
+                    errOut = "rtk_jitter_too_high";
+                    return;
+                }
+                Serial.printf("[ALIGN-RTK] phase=END_SETTLE done jitter=%.3f -> FINALIZE\n",
+                              (double)jit);
+                alignFinalize(e, now, elapsed, errOut);
+                stopMotorsOut = true;
+                return;
+            }
+            // Stay stationary while the end window fills.
+            return;
+        }
     }
-
-    // Drive forward at low speed. Bypass the follower because we want
-    // straight-line motion, angular=0; ALIGN runs even with navRequested=false.
-    g_motor.setLinearAngularSpeed(ALIGN_FORWARD_MPS, 0.0f, true);
 }
 
 static void clearHeadingTrust() {
@@ -1193,46 +1401,31 @@ void loop() {
     g_est.onHoverboardFeedback(now, g_motor.speedLeftMeas(), g_motor.speedRightMeas());
     g_est.tick(now);
 
-    // RTK motion alignment state machine. While running it writes motor
-    // commands directly (bypassing the follower) and consumes the loop.
-    // Kill conditions:
-    //   - safety ESTOP / HOLD (always)
-    //   - STOP (any source, the explicit STOP command sets navRequested=false)
-    //   - WebSocket disconnect, but ONLY if the alignment was started from
-    //     the WebSocket side. Serial-issued alignment is allowed to run
-    //     without a connected WS so the operator can debug via Serial
-    //     Monitor alone.
-    if (g_heading.alignState == AlignState::RUNNING) {
-        bool stopMotors = false;
-        const char* alignErr = nullptr;
-        // The Serial STOP handler in loop() flips navRequested via the
-        // STOP branch above; we treat any "STOP requested but still
-        // running" as a kill.
-        if (!g_ws.navRequested() && g_align.fromWebSocket) {
-            stopMotors = true;
-            alignErr = "ws_disconnected";
-        } else if (g_safety.level() == SAFETY_ESTOP || g_safety.level() == SAFETY_HOLD) {
-            stopMotors = true;
-            alignErr = "safety";
-        }
-        if (stopMotors) {
-            g_align.active = false;
-            g_motor.stopImmediately();
-            g_heading.lastAlignError = alignErr;
-            g_heading.alignState = AlignState::ERR;
-            g_heading.lastAlignDist = 0;
-            g_heading.lastAlignDx = 0;
-            g_heading.lastAlignDy = 0;
-            g_heading.lastAlignHAcc = g_est.get().hAcc;
-            Serial.printf("[ALIGN-RTK] abort: %s\n", alignErr);
-        } else {
-            stepAlign(stopMotors, alignErr);
-            if (stopMotors) g_motor.stopImmediately();
+    // Refresh the operator-facing trusted heading from the live
+    // estimator whenever we are in the RTK_MOTION_ALIGNED_PLUS_IMU mode.
+    // BNO085 gyro integration keeps `headingFiltDeg` rotating with the
+    // chassis after the one-shot RTK seed, so we mirror it into
+    // g_heading.headingDeg each tick. `trustedAtMs` is bumped so the
+    // freshness metric reflects real life rather than the alignment
+    // moment. `lastAlignHeading` keeps the original RTK seed for
+    // diagnostics (HEADING_STATUS field).
+    if (g_heading.trusted &&
+        g_heading.source == HeadingSource::RTK_MOTION_ALIGNED_PLUS_IMU) {
+        const auto& eLive = g_est.get();
+        if (eLive.headingValid) {
+            g_heading.headingDeg = eLive.headingFiltDeg;
+            g_heading.trustedAtMs = now;
         }
     }
 
-    // Operational origin is supplied by ROUTE_BEGIN from the saved map.
-    // Current-position auto-origin exists only inside explicit GO_* test commands.
+    // === Safety tick BEFORE the alignment block ===
+    //
+    // Order matters: the alignment kill-switches read g_safety.level(),
+    // and Serial AUTO_ALIGN_HEADING_BY_RTK relies on safety clearing
+    // `ws_disconnected` via serialDebugMotion. We must run safety.tick()
+    // first so the alignment block sees the up-to-date level. Otherwise
+    // a fresh Serial AUTO_ALIGN would inherit the previous tick's
+    // ESTOP `ws_disconnected` and abort immediately as `safety`.
 
     SafetyInput si;
     si.wsConnected  = g_ws.isConnected();
@@ -1251,18 +1444,30 @@ void loop() {
     si.originLocked = g_est.get().originSet;
     si.routeReady   = g_route.isReady();
 
-    // Serial-issued AUTO_ALIGN_HEADING_BY_RTK only. WebSocket-issued
-    // alignment must NOT flip this flag — otherwise ws_disconnected
-    // would no longer abort a WS-side run. See Safety::tick() for the
-    // matching gate.
-    si.serialDebugMotion =
+    // Serial-issued motion override. We consider a session
+    // "serial motion" when ANY of:
+    //   - Serial AUTO_ALIGN is running (and not from WebSocket)
+    //   - a Serial GO_FORWARD / GO_NORTH test command is active
+    // When true, ws_disconnected is downgraded to OK in Safety::tick().
+    // WebSocket-issued alignment is excluded so the WS link still
+    // gates its own runs.
+    const bool serialAlignActive =
         g_align.active &&
         g_heading.alignState == AlignState::RUNNING &&
         !g_align.fromWebSocket;
+    si.serialDebugMotion = serialAlignActive || g_serialMotion.active;
+
+    // Relaxed PVT staleness threshold while alignment is running (in
+    // either Serial or WebSocket mode). Normal navigation keeps the
+    // strict SAFE_PVT_AGE_MS so a stale estimator never silently drives.
+    const bool alignmentRunning = (g_align.active &&
+        g_heading.alignState == AlignState::RUNNING);
+    si.maxPvtAgeMs = alignmentRunning
+        ? ALIGN_MAX_PVT_AGE_MS
+        : SAFE_PVT_AGE_MS;
 
     // Heading trust gate. Accept any of:
-    //   - BNO085 absolute yaw OK (computed below via canUseAbsoluteYawForNav
-    //     inside Safety; here we just pre-declare it for the safer fallback)
+    //   - BNO085 absolute yaw OK (computed via canUseAbsoluteYawForNav)
     //   - manual trust flag set by IMU_TRUST_CURRENT_HEADING_ONCE
     //   - RTK-motion alignment completed this boot AND estimator heading
     //     is still fresh
@@ -1278,15 +1483,67 @@ void loop() {
                 g_imu.yawAgeMs(now),
                 SAFE_IMU_AGE_MS);
         const bool manualTrust = g_imu.manualYawTrusted();
+        // RTK-motion aligned heading is treated as trusted when the
+        // estimator heading is still fresh — both RTK_MOTION_ALIGNED
+        // (one-shot, only valid before any chassis rotation) and
+        // RTK_MOTION_ALIGNED_PLUS_IMU (live, with BNO085 gyro
+        // integration through the estimator).
         const bool rtkAlignFresh =
             g_heading.trusted &&
-            g_heading.source == HeadingSource::RTK_MOTION_ALIGNED &&
+            (g_heading.source == HeadingSource::RTK_MOTION_ALIGNED ||
+             g_heading.source == HeadingSource::RTK_MOTION_ALIGNED_PLUS_IMU) &&
             e.headingValid &&
             e.headingAgeMs <= SAFE_HEADING_AGE_MS;
         si.headingTrustedForNav = imuAbsOk || manualTrust || rtkAlignFresh;
-        si.headingUsesImu       = imuAbsOk || manualTrust;
+        // `headingUsesImu` is true only when navigation depends on
+        // BNO085 being live right now. RTK_MOTION_ALIGNED_PLUS_IMU
+        // also depends on BNO085 (for gyro integration), so it counts.
+        si.headingUsesImu       = imuAbsOk || manualTrust ||
+                                  (g_heading.trusted &&
+                                   g_heading.source == HeadingSource::RTK_MOTION_ALIGNED_PLUS_IMU);
     }
     g_safety.tick(now, si, g_est, g_imu);
+
+    // RTK motion alignment state machine. Runs AFTER Safety::tick so
+    // it sees the up-to-date level — in particular, serialDebugMotion
+    // has already cleared the previous ws_disconnected ESTOP before this
+    // block decides whether to drive.
+    //
+    // Kill conditions:
+    //   - safety ESTOP / HOLD (always, except ws_disconnected when
+    //     alignment was started from Serial — that case is allowed to
+    //     keep driving under serialDebugMotion, and Safety::tick()
+    //     already downgraded it to OK before we got here)
+    //   - STOP (any source, the explicit STOP command sets
+    //     navRequested=false). WebSocket-issued alignment also aborts
+    //     here on WS disconnect.
+    if (g_heading.alignState == AlignState::RUNNING) {
+        bool stopMotors = false;
+        const char* alignErr = nullptr;
+        // WebSocket-issued alignment: drop the run if the WS link
+        // dropped (navRequested was cleared by WS_DISCONNECT).
+        if (!g_ws.navRequested() && g_align.fromWebSocket) {
+            stopMotors = true;
+            alignErr = "ws_disconnected";
+        } else if (g_safety.level() == SAFETY_ESTOP || g_safety.level() == SAFETY_HOLD) {
+            // Any non-cleared safety fault kills the run. Note that
+            // ws_disconnected has already been downgraded to OK by
+            // Safety::tick() when serialDebugMotion=true, so this
+            // branch will not trigger on a Serial alignment.
+            stopMotors = true;
+            alignErr = "safety";
+        }
+        if (stopMotors) {
+            const uint32_t nowAbort = millis();
+            alignAbort(alignErr, g_est.get(), nowAbort);
+        } else {
+            stepAlign(stopMotors, alignErr);
+            if (stopMotors) g_motor.stopImmediately();
+        }
+    }
+
+    // Operational origin is supplied by ROUTE_BEGIN from the saved map.
+    // Current-position auto-origin exists only inside explicit GO_* test commands.
     if (!g_safety.allowMotion()) {
         digitalWrite(PIN_RELAY_ATTACH, LOW);
         digitalWrite(PIN_RELAY_MOUNT, LOW);
@@ -1304,6 +1561,10 @@ void loop() {
         }
         stepFollower();
     }
+
+    // Auto-clear the serialDebugMotion override once the test drive
+    // completes (arrival / safety fault / timeout / STOP).
+    serialMotionTick();
 
     NavStateOut nso;
     if (g_follow.faultReason != nullptr) {
@@ -1370,7 +1631,9 @@ void loop() {
                       "safety=%d reason=%s fault=%s "
                       "manualYawTrusted=%d manualYawTrustedHeading=%.1f "
                       "headingTrusted=%d headingSource=%s headingDeg=%.1f "
-                      "alignState=%s lastAlignHeading=%.1f lastAlignDist=%.3f\n",
+                      "alignState=%s lastAlignHeading=%.1f lastAlignDist=%.3f "
+                      "wsTelSent=%u wsTelDropped=%u "
+                      "serialMotion=%d serialMotionSource=%s wsConn=%d safety=%d reason=%s\n",
             (unsigned long)now, e.lat, e.lon, e.x, e.y,
             g_imu.yawDeg(), g_imu.rawYawDeg(), (int)g_imu.headingState(), (int)g_imu.yawSource(), g_imu.yawAbsoluteValid() ? 1 : 0,
             g_imu.yawFromMag() ? 1 : 0, g_imu.magNorm(),
@@ -1392,7 +1655,14 @@ void loop() {
             (double)g_heading.headingDeg,
             alignStateName(g_heading.alignState),
             (double)g_heading.lastAlignHeading,
-            (double)g_heading.lastAlignDist);
+            (double)g_heading.lastAlignDist,
+            (unsigned)g_ws.wsTelemetrySent(),
+            (unsigned)g_ws.wsTelemetryDropped(),
+            g_serialMotion.active ? 1 : 0,
+            serialMotionSourceName(g_serialMotion.source),
+            g_ws.isConnected() ? 1 : 0,
+            (int)g_safety.level(),
+            g_safety.reason());
     }
 }
 
@@ -1524,39 +1794,63 @@ bool handleGo() {
 }
 
 static bool goPrecheck() {
-    // Жёсткий гейт: если IMU не отвечает дольше 500мс — отказываем.
-    // Иначе heading "застрянет" на старом значении, Stanley поведёт не туда,
-    // и робот развернётся при старте. Это страховка от I2C-зависания BNO085.
+    // Heading gate. We accept a run when ANY of:
+    //   - BNO085 absolute yaw OK (preferred path, calls
+    //     canUseAbsoluteYawForNav below)
+    //   - IMU_TRUST_CURRENT_HEADING_ONCE was issued this boot
+    //   - RTK motion alignment succeeded this boot and the estimator
+    //     is still tracking the heading (RTK_MOTION_ALIGNED or
+    //     RTK_MOTION_ALIGNED_PLUS_IMU)
+    // The "IMU dead" hard-gate that used to live here is gone: the BNO085
+    // is allowed to be stale when we are running on RTK-aligned heading,
+    // because the failure mode it protected against (heading frozen at
+    // a stale value, Stanley turning the rover the wrong way) is no
+    // longer relevant — RTK alignment already gave us an absolute
+    // heading, and the BNO085 only contributes relative yaw on top.
     uint32_t tNow = millis();
-    if (g_imu.ageMs(tNow) > SAFE_IMU_AGE_MS || !g_imu.fresh()) {
-        Serial.printf("[GO] refusing: IMU dead (age=%u fresh=%d)\n",
-                      (unsigned)g_imu.ageMs(tNow), g_imu.fresh() ? 1 : 0);
-        return false;
-    }
-    if (!ImuMath::canUseAbsoluteYawForNav(
+    const bool imuAbsOk = ImuMath::canUseAbsoluteYawForNav(
             g_imu.headingState(),
             g_imu.yawAbsoluteValid(),
             g_imu.yawAccRad(),
             g_imu.yawAgeMs(tNow),
-            SAFE_IMU_AGE_MS)) {
-        // IMU absolute yaw is the *preferred* source, but it's no longer
-        // mandatory. We accept the run when ANY of:
-        //   - IMU has reached ABSOLUTE_OK (preferred path)
-        //   - IMU_TRUST_CURRENT_HEADING_ONCE was issued this boot
-        //   - RTK motion alignment succeeded this boot
-        // In the latter two cases we log a WARNING so the operator can
-        // see what is being trusted.
-        if (g_heading.trusted && g_heading.source == HeadingSource::RTK_MOTION_ALIGNED) {
-            Serial.println("[NAV] WARNING using RTK-motion-aligned heading; BNO absolute yaw is not valid");
-        } else if (g_imu.manualYawTrusted()) {
-            Serial.println("[NAV] WARNING using manually trusted IMU heading; BNO absolute yaw is not valid");
+            SAFE_IMU_AGE_MS);
+    const bool manualTrust = g_imu.manualYawTrusted();
+    const auto& eGate = g_est.get();
+    const bool rtkAlignFresh =
+        g_heading.trusted &&
+        (g_heading.source == HeadingSource::RTK_MOTION_ALIGNED ||
+         g_heading.source == HeadingSource::RTK_MOTION_ALIGNED_PLUS_IMU) &&
+        eGate.headingValid &&
+        eGate.headingAgeMs <= SAFE_HEADING_AGE_MS;
+
+    if (!imuAbsOk && !manualTrust && !rtkAlignFresh) {
+        // Pick the most informative refusal reason.
+        if (eGate.headingValid && eGate.headingAgeMs > SAFE_HEADING_AGE_MS) {
+            Serial.printf("[GO] refusing: heading_stale ageMs=%u\n",
+                          (unsigned)eGate.headingAgeMs);
+        } else if (g_imu.ageMs(tNow) > SAFE_IMU_AGE_MS) {
+            // Relative IMU path stale — distinct from the legacy
+            // "IMU dead" wording because here we only care that
+            // nothing else can rescue us. The estimator is allowed
+            // to keep gyro integration via the gyro path for short
+            // windows without BNO085 packet updates.
+            Serial.printf("[GO] refusing: relative_imu_stale ageMs=%u\n",
+                          (unsigned)g_imu.ageMs(tNow));
         } else {
             Serial.printf("[GO] refusing: absolute yaw unavailable state=%d source=%d acc=%.2f\n",
                           (int)g_imu.headingState(), (int)g_imu.yawSource(), g_imu.yawAccRad());
-            return false;
+        }
+        return false;
+    }
+    if (!imuAbsOk && (manualTrust || rtkAlignFresh)) {
+        // Informative warning — we are starting without BNO085 absolute.
+        if (rtkAlignFresh) {
+            Serial.println("[NAV] WARNING using RTK-aligned heading (BNO085 absolute not required)");
+        } else if (manualTrust) {
+            Serial.println("[NAV] WARNING using manually trusted IMU heading; BNO absolute yaw is not valid");
         }
     }
-    if (!g_est.get().headingValid) {
+    if (!eGate.headingValid) {
         Serial.println("[GO] refusing: estimator heading is not seeded");
         return false;
     }
@@ -1980,7 +2274,18 @@ String autoAlignHeadingByRtkLineWs() {
 // HEADING_STATUS: one-line dump of heading source / trust / align state.
 String headingStatusLine() {
     const auto& e = g_est.get();
-    char buf[320];
+    // headingAgeMs reflects the live freshness of the heading we are
+    // actually using. For RTK_MOTION_ALIGNED_PLUS_IMU that's the
+    // estimator age; for legacy one-shot RTK it falls back to
+    // (now - trustedAtMs).
+    uint32_t headingAgeMsOut = 0;
+    if (g_heading.source == HeadingSource::RTK_MOTION_ALIGNED_PLUS_IMU ||
+        g_heading.source == HeadingSource::RTK_MOTION_ALIGNED) {
+        headingAgeMsOut = e.headingValid ? e.headingAgeMs : 0;
+    } else if (g_heading.trustedAtMs != 0) {
+        headingAgeMsOut = millis() - g_heading.trustedAtMs;
+    }
+    char buf[384];
     snprintf(buf, sizeof(buf),
              "HEADING_STATUS,headingTrusted=%d,headingSource=%s,headingDeg=%.1f,"
              "headingAgeMs=%u,"
@@ -1993,7 +2298,7 @@ String headingStatusLine() {
              g_heading.trusted ? 1 : 0,
              headingSourceName(g_heading.source),
              (double)g_heading.headingDeg,
-             g_heading.trustedAtMs == 0 ? 0u : (millis() - g_heading.trustedAtMs),
+             (unsigned)headingAgeMsOut,
              alignStateName(g_heading.alignState),
              (unsigned long)g_heading.alignStartedAtMs,
              (double)g_heading.lastAlignHeading,
@@ -2111,6 +2416,11 @@ String handleStopLine() {
     }
     g_route.stop();
     g_motor.stopImmediately();
+    // Clear the serialDebugMotion override so ws_disconnected can
+    // once again become ESTOP for any following session.
+    if (g_serialMotion.active) {
+        serialMotionEnd("stopped");
+    }
     Serial.println("[STOP] motors stopped");
     return String("OK STOP");
 }
