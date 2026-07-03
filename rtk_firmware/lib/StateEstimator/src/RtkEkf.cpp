@@ -96,7 +96,8 @@ void RtkEkf::predict(float dt, float v_mps, float omega_radps, float yawRateRadp
     matSet(F, 5, 1, 2, -v_mps * sh * dt);   // dy/dh
     matSet(F, 5, 0, 3,  sh * dt);           // dx/dv
     matSet(F, 5, 1, 3,  ch * dt);           // dy/dv
-    matSet(F, 5, 2, 4,  dt);                // dh/dw
+    // Heading is propagated from the external IMU yawRate measurement above,
+    // not from state _w. Do not create a fictitious heading/omega covariance.
 
     // === Process noise Q (diagonal) ===
     float Q[25] = {0};
@@ -160,6 +161,10 @@ bool RtkEkf::updatePosition(float zx, float zy, float cov_xy, bool reliableFix) 
         K[i*2 + 0] = _Pcov[i*5 + 0] * Sinv00 + _Pcov[i*5 + 1] * Sinv01;
         K[i*2 + 1] = _Pcov[i*5 + 0] * Sinv01 + _Pcov[i*5 + 1] * Sinv11;
     }
+    // For the first low-speed routes, GNSS position must not act as an
+    // implicit course sensor through EKF cross-covariance. BNO085 owns heading.
+    K[2*2 + 0] = 0.0f;
+    K[2*2 + 1] = 0.0f;
 
     // === x' = x + K * y ===
     for (int i = 0; i < 5; i++) {
@@ -234,13 +239,11 @@ bool RtkEkf::updateHeading(float headingRad, float cov_rad2, bool reliable) {
     if (_h >  3.14159265f) _h -= 6.28318530f;
     if (_h < -3.14159265f) _h += 6.28318530f;
 
-    // P' = (I - K*H) * P. H = [0 0 1 0 0]
+    // P' = (I - K*H) * P. H = [0 0 1 0 0].
     float newP[25];
     for (int i = 0; i < 5; i++) {
         for (int j = 0; j < 5; j++) {
-            float v = (j == 2) ? K[i] : 0.0f;
-            float orig = (i == j) ? 1.0f : 0.0f;
-            newP[i*5+j] = (orig - v) * _Pcov[i*5+j];
+            newP[i*5+j] = _Pcov[i*5+j] - K[i] * _Pcov[2*5+j];
         }
     }
     for (int i = 0; i < 25; i++) _Pcov[i] = newP[i];

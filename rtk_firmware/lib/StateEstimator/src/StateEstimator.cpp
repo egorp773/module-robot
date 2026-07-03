@@ -1,9 +1,10 @@
 // StateEstimator.cpp - Sunray-style GPS+IMU heading fusion (Вариант A). MIT.
-// Курс = интеграл gyro (краткосрочно) + коррекция по GPS-course при движении.
+// Курс = интеграл gyro (краткосрочно) + абсолютный yaw от IMU.
 // Позиция = RTK local meters (формула проекции идентична приложению gps_projection.dart).
 
 #include "StateEstimator.h"
 #include "RtkConfig.h"
+#include "NavMath.h"
 
 void StateEstimator::begin() {
     est = Estimate{};
@@ -26,14 +27,10 @@ void StateEstimator::begin() {
 }
 
 float StateEstimator::normalizeDeg360(float d) {
-    while (d < 0)    d += 360.0f;
-    while (d >= 360) d -= 360.0f;
-    return d;
+    return NavMath::normalizeDeg360(d);
 }
 float StateEstimator::wrapDeg180(float d) {
-    while (d >  180.0f) d -= 360.0f;
-    while (d < -180.0f) d += 360.0f;
-    return d;
+    return NavMath::wrapDeg180(d);
 }
 
 void StateEstimator::llaToLocalMeters(double lat, double lon,
@@ -41,15 +38,7 @@ void StateEstimator::llaToLocalMeters(double lat, double lon,
                                      float &x, float &y) {
     // Формула ИДЕНТИЧНА приложению (gps_display_math.dart) — drift < 7см на 30м поля.
     // 6φ и 5φ члены дают <0.001% drift на площади 1км², оставлены для совпадения с app.
-    double phi = originLat * M_PI / 180.0;
-    double mPerDegLat = 111132.92 - 559.82 * cos(2*phi) + 1.175 * cos(4*phi)
-                        - 0.0023 * cos(6*phi);
-    double mPerDegLon = 111412.84 * cos(phi) - 93.5 * cos(3*phi)
-                        + 0.118 * cos(5*phi);
-    double north = (lat - originLat) * mPerDegLat;
-    double east  = (lon - originLon) * mPerDegLon;
-    x = (float)east;    // x = East
-    y = (float)north;   // y = North
+    NavMath::llaToLocalMeters(lat, lon, originLat, originLon, x, y);
 }
 
 bool StateEstimator::setOrigin(double lat, double lon) {
@@ -91,8 +80,8 @@ void StateEstimator::seedHeadingDeg(float headingDeg) {
 }
 
 // --- IMU: gyro rate (deg/s → rad/s) подаётся в EKF.predict() для heading ---
-// Heading FUSION (EKF): GPS motion heading + IMU gyro. GPS heading подтягивает
-// медленный дрейф гироскопа; gyro держит heading между PVT-пакетами и на стоянке.
+// Heading FUSION (EKF): IMU gyro prediction + absolute IMU yaw correction.
+// GPS course-over-ground fusion is temporarily disabled in onPvt().
 // Kalman корректно работает даже когда PVT запаздывает — heading не «прыгает».
 void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh,
                            float absYawDeg, bool absYawValid, float absYawAccRad) {
@@ -101,25 +90,38 @@ void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh,
     float yawRateRadps = yawRateDps * 0.01745329f;   // deg/s → rad/s
     _lastYawRateRadps = yawRateRadps;
 
-    // dt в секундах; первое обращение — dt=0, predict не идёт.
-    if (_lastPredictMs == 0) { _lastPredictMs = nowMs; return; }
-    float dt = (nowMs - _lastPredictMs) * 0.001f;
-    _lastPredictMs = nowMs;
-    if (dt <= 0) return;
-    if (dt > 0.5f) dt = 0.5f;
+    float dt = 0.0f;
+    if (_lastPredictMs == 0) {
+        _lastPredictMs = nowMs;
+    } else {
+        dt = (nowMs - _lastPredictMs) * 0.001f;
+        _lastPredictMs = nowMs;
+        if (dt > 0.5f) dt = 0.5f;
+    }
 
-    // Скорости берём последние измеренные (или 0, если ещё не было feedback).
-    float v_mps = 0.5f * (_lastSpeedLMps + _lastSpeedRMps);
-    float omega_radps = (_lastSpeedRMps - _lastSpeedLMps) / max(ROVER_WHEELBASE_M, 0.01f);
-    _ekf.predict(dt, v_mps, omega_radps, yawRateRadps);
+    if (dt > 0.0f) {
+        // Скорости берём последние измеренные (или 0, если ещё не было feedback).
+        float v_mps = 0.5f * (_lastSpeedLMps + _lastSpeedRMps);
+        float omega_radps = (_lastSpeedRMps - _lastSpeedLMps) / max(ROVER_WHEELBASE_M, 0.01f);
+        _ekf.predict(dt, v_mps, omega_radps, yawRateRadps);
+    }
 
-    // КЛЮЧЕВОЕ: подмешать АБСОЛЮТНЫЙ heading от магнитометра в EKF.
-    // Без этого heading = seed + интеграл(gyro): ошибка seed (напр. 60°) и дрейф
-    // гироскопа НИКОГДА не исправляются → head уплывает, робот виляет (cross_track).
-    // Magnetic yaw стабилен (cal=1, шум ±5°), даём ему малый R (большое доверие).
-    (void)absYawDeg;
-    (void)absYawValid;
-    (void)absYawAccRad;
+    if (_headingSeeded && absYawValid) {
+        float yawRad = normalizeDeg360(absYawDeg) * 0.01745329f;
+        float covRad2 = absYawAccRad * absYawAccRad;
+        if (covRad2 < 0.0004f) covRad2 = 0.0004f;  // ~1.1 deg minimum
+        if (covRad2 > 2.0f) covRad2 = 2.0f;
+        _ekf.updateHeading(yawRad, covRad2, true);
+    }
+
+    if (_headingSeeded) {
+        float hDeg = _ekf.heading() * 57.2957795f;
+        hDeg = normalizeDeg360(hDeg);
+        est.headingFiltDeg = hDeg;
+        est.headingValid = true;
+        est.headingAgeMs = 0;
+        _lastHeadingMs = nowMs;
+    }
 }
 
 void StateEstimator::onPvt(uint32_t nowMs,
@@ -148,7 +150,10 @@ void StateEstimator::onPvt(uint32_t nowMs,
     else                      est.sol = SOL_INVALID;
 
     // --- outlier rejection: отбрасываем неправдоподобный скачок позиции ---
-    bool reliablePosition = est.sol == SOL_FIXED && est.hAcc <= SAFE_HACC_FIXED_M && fixType >= 3;
+    bool reliablePosition =
+        fixType >= 3 &&
+        ((est.sol == SOL_FIXED && est.hAcc <= SAFE_HACC_FIXED_M) ||
+         (est.sol == SOL_FLOAT && est.hAcc <= 0.05f));
     bool accept = reliablePosition;
     if (reliablePosition && _haveLastFix && est.originSet) {
         float px, py, nx, ny;
@@ -195,45 +200,30 @@ void StateEstimator::onPvt(uint32_t nowMs,
     }
     // если outlier — позицию НЕ двигаем (dead-reckoning держит прошлую), но fix-метку обновили выше нет
 
-    // --- Курс: fusion EKF (GPS motion heading + IMU gyro) ---
-    // При движении (speed > порог) GPS heading меряется надёжно — подаём в EKF.updateHeading.
-    // ВНИМАНИЕ: GPS heading (headMot) ВЫКЛЮЧЕН из EKF update.
-    // Причины: в логах 2026-06-16 GPS-course показывал 330.9° при реальном heading 124°
-    // (расхождение 207°). U-blox headMot — это course-over-ground, вычисленный из
-    // последовательных position fixes; на нашей скорости 0.25 м/с (за 200мс пакет
-    // робот проезжает 5 см) — это просто шум, а при стоянке — мусор от дрейфа.
-    // heading живёт за счёт EKF.predict() от IMU gyro. seedHeadingDeg() ставит
-    // начальное значение. SET_HEADING,X сбрасывает при необходимости.
+    // --- Курс: raw GPS course only for telemetry ---
+    // U-blox headMot is course-over-ground. At rover speed it is often dominated
+    // by RTK position jitter, so it must not correct EKF heading for now.
     est.headingDeg = (float)headMot_deg_e5 * 1e-5f;   // сырой GPS-курс только для ТЕЛЕМЕТРИИ
     est.headingDeg = normalizeDeg360(est.headingDeg);
 
-    // Heading fusion: GPS-course подмешиваем в EKF ТОЛЬКО при большой скорости
-    // (чтобы база допплера была длинной и heading надёжным).
-    // При v < 0.7 m/s headMot вырождается в шум и ломает heading — оставляем IMU gyro.
-    // При v ≥ 0.7 m/s подаём в EKF.updateHeading с большой covariance (1.0 рад^2 ≈ 57°).
-    if (_headingSeeded && gSpeed_mmps >= 200 && fixType >= 3 && carrierSol >= 2) {
-        float gpsHeadDeg = (float)headMot_deg_e5 * 1e-5f;
-        gpsHeadDeg = normalizeDeg360(gpsHeadDeg);
-        float gpsHeadRad = gpsHeadDeg * 0.01745329f;
-        float cov_rad2 = 1.0f; // большая — пусть EKF сам решает сколько верить (доверяет gyro в основном)
-        _ekf.updateHeading(gpsHeadRad, cov_rad2, true);
-    }
+    // GPS course-over-ground fusion is intentionally disabled for now.
+    // At low rover speed headMot is dominated by RTK position jitter; heading is
+    // corrected from IMU absolute yaw in onImu().
 
-    // Каждый PVT — обновляем headingFiltDeg из EKF (если heading уже засеян).
+    // PVT may publish the current EKF value, but must not make an IMU-derived
+    // heading look fresh. GPS course fusion is disabled.
     if (_headingSeeded) {
         float hDeg = _ekf.heading() * 57.2957795f;
         hDeg = normalizeDeg360(hDeg);
         est.headingFiltDeg = hDeg;
         est.headingValid = true;
-        est.headingAgeMs = 0;
-        _lastHeadingMs = nowMs;
     }
 
     est.lastUpdateMs = nowMs;
 }
 
 void StateEstimator::onRtcmInfo(uint32_t nowMs, int lastType, int msgCount, int crcFail) {
-    (void)lastType; (void)msgCount; (void)crcFail;
+    (void)nowMs; (void)lastType; (void)msgCount; (void)crcFail;
     est.rtcmAgeMs = 0;
 }
 

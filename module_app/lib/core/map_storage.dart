@@ -37,6 +37,8 @@ class MapStorage {
         'id': map.mapId,
         'name': mapName,
         'coordinateType': map.coordinateType ?? 'cell',
+        if (map.refLat != null) 'mapOriginLat': map.refLat,
+        if (map.refLon != null) 'mapOriginLon': map.refLon,
         if (map.refLat != null) 'refLat': map.refLat,
         if (map.refLon != null) 'refLon': map.refLon,
         if (map.perimeter != null)
@@ -83,6 +85,8 @@ class MapStorage {
       'id': DateTime.now().millisecondsSinceEpoch.toString(),
       'name': mapName,
       'coordinateType': map.coordinateType ?? 'cell',
+      if (map.refLat != null) 'mapOriginLat': map.refLat,
+      if (map.refLon != null) 'mapOriginLon': map.refLon,
       if (map.refLat != null) 'refLat': map.refLat,
       if (map.refLon != null) 'refLon': map.refLon,
       if (map.perimeter != null)
@@ -182,8 +186,12 @@ class MapStorage {
 
     // Parse GPS data
     final coordinateType = json['coordinateType'] as String? ?? 'cell';
-    final refLat = json['refLat'] as double?;
-    final refLon = json['refLon'] as double?;
+    // mapOrigin* are the canonical persistent GPS anchor. ref* remain as a
+    // backward-compatible alias for maps saved by older app versions.
+    final refLat =
+        ((json['mapOriginLat'] ?? json['refLat']) as num?)?.toDouble();
+    final refLon =
+        ((json['mapOriginLon'] ?? json['refLon']) as num?)?.toDouble();
 
     List<(double, double)>? perimeter;
     if (json['perimeter'] != null) {

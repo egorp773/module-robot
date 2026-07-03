@@ -8,6 +8,15 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 const int _maxTelemetryAgeMs = 60000;
 
+String buildRouteBeginCommand(
+  int count, {
+  required double mapOriginLat,
+  required double mapOriginLon,
+}) {
+  return "ROUTE_BEGIN,$count,${mapOriginLat.toStringAsFixed(8)},"
+      "${mapOriginLon.toStringAsFixed(8)}";
+}
+
 int? _parseTelemetryAgeMs(String? raw) {
   final value = int.tryParse(raw?.trim() ?? '');
   if (value == null || value < 0 || value > _maxTelemetryAgeMs) return null;
@@ -1329,10 +1338,11 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       final completer = Completer<String>();
       _routeAckWaiter = completer;
       _routeAckMatcher = (ack) => ack == "OK,ROUTE_BEGIN";
-      sendRaw(
-        "ROUTE_BEGIN,$count,${originLat.toStringAsFixed(8)},"
-        "${originLon.toStringAsFixed(8)}",
-      );
+      sendRaw(buildRouteBeginCommand(
+        count,
+        mapOriginLat: originLat,
+        mapOriginLon: originLon,
+      ));
       try {
         await completer.future.timeout(_routeAckTimeout);
         _routeAckWaiter = null;

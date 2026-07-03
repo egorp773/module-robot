@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "NavigationCore.h"
+#include "NavMath.h"
 
 #include <algorithm>
 #include <cmath>
@@ -246,6 +247,60 @@ TEST(NavigationCore, HoldsWithImuDriftAtPointOneDegreePerSecond) {
 
   EXPECT_TRUE(result.arrived);
   EXPECT_LT(result.finalErrorM, 0.25f);
+}
+
+TEST(NavMath, CompassConventionAndTargetHeadings) {
+  EXPECT_NEAR(NavMath::targetHeadingDeg(0.0f, 3.0f), 0.0f, 1e-5f);
+  EXPECT_NEAR(NavMath::targetHeadingDeg(3.0f, 0.0f), 90.0f, 1e-5f);
+
+  float dx = 0.0f;
+  float dy = 0.0f;
+  NavMath::forwardOffset(1.0f, 0.0f, dx, dy);
+  EXPECT_NEAR(dx, 0.0f, 1e-5f);
+  EXPECT_NEAR(dy, 1.0f, 1e-5f);
+  NavMath::forwardOffset(1.0f, 90.0f, dx, dy);
+  EXPECT_NEAR(dx, 1.0f, 1e-5f);
+  EXPECT_NEAR(dy, 0.0f, 1e-5f);
+}
+
+TEST(NavMath, Wrap180UsesShortestTurnAcrossBoundary) {
+  EXPECT_NEAR(NavMath::wrapDeg180(190.0f), -170.0f, 1e-5f);
+  EXPECT_NEAR(NavMath::wrapDeg180(-190.0f), 170.0f, 1e-5f);
+  EXPECT_NEAR(NavMath::wrapDeg180(10.0f - 350.0f), 20.0f, 1e-5f);
+  EXPECT_NEAR(NavMath::wrapDeg180(350.0f - 10.0f), -20.0f, 1e-5f);
+}
+
+TEST(NavMath, ProjectionMatchesAppFixtureAndDoesNotDependOnRobotStart) {
+  constexpr double originLat = 55.751244;
+  constexpr double originLon = 37.618423;
+  constexpr double pointLat = 55.751344;
+  constexpr double pointLon = 37.618523;
+
+  float routeX = 0.0f;
+  float routeY = 0.0f;
+  NavMath::llaToLocalMeters(
+      pointLat, pointLon, originLat, originLon, routeX, routeY);
+  // Same constants/formula are asserted in module_app gps tests.
+  EXPECT_NEAR(routeX, 6.2793f, 0.01f);
+  EXPECT_NEAR(routeY, 11.132f, 0.01f);
+
+  float robotAX = 0.0f;
+  float robotAY = 0.0f;
+  float robotBX = 0.0f;
+  float robotBY = 0.0f;
+  NavMath::llaToLocalMeters(
+      55.751250, 37.618430, originLat, originLon, robotAX, robotAY);
+  NavMath::llaToLocalMeters(
+      55.751300, 37.618480, originLat, originLon, robotBX, robotBY);
+  EXPECT_NE(robotAX, robotBX);
+  EXPECT_NE(robotAY, robotBY);
+
+  float routeXAgain = 0.0f;
+  float routeYAgain = 0.0f;
+  NavMath::llaToLocalMeters(
+      pointLat, pointLon, originLat, originLon, routeXAgain, routeYAgain);
+  EXPECT_FLOAT_EQ(routeX, routeXAgain);
+  EXPECT_FLOAT_EQ(routeY, routeYAgain);
 }
 
 int main(int argc, char** argv) {

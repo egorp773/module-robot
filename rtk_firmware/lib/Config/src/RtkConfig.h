@@ -67,14 +67,14 @@
 #define ROVER_MAX_PWM       70
 #define ROVER_INPUT_DIV     6
 #define ROVER_CMD_TIMEOUT_MS 400
-// Safety-first tuning while calibrating: manual M is divided by 6, autonomous
-// output is capped at 6%. Speed in m/s is only a controller scale label here;
-// real speed must be calibrated from RTK position over longer runs.
-#define ROVER_AUTO_MAX_PERCENT 6
-#define ROVER_MAX_SPEED_MPS  0.08f
+// M,55,55 is divided by ROVER_INPUT_DIV and produces about 9% at the motor
+// layer. Field testing established that as the normal straight-drive command.
+// Autonomous 0.18 m/s therefore maps to ~9%; the hard 0.25 m/s cap maps to 12%.
+#define ROVER_AUTO_MAX_PERCENT 12
+#define ROVER_MAX_SPEED_MPS  0.25f
 // FLOAT едет с той же скоростью что и FIXED (на FLOAT hAcc уже ~2см, безопасно) —
 // чтобы автономка ехала одинаково как ручной 16% независимо от RTK-режима.
-#define ROVER_FLOAT_SPEED    0.08f
+#define ROVER_FLOAT_SPEED    0.15f
 #define ROVER_DEGRADED_SPEED 0.04f
 #define ROVER_HOLD_SPEED     0.02f
 // Hoverboard-keepalive: если idle (нет команд) дольше этого времени —
@@ -131,6 +131,18 @@
 // Recovery: после 3 fault подряд в одном WP — замедляемся до degraded и пробуем
 // переиграть waypoint, а не финишируем маршрут.
 #define ROVER_FAULT_RECOVERY_COUNT 3
+
+// nav-v2-simple: deliberately small waypoint controller for first field routes.
+#define ROVER_V2_ARRIVAL_RADIUS_M          0.35f
+#define ROVER_V2_TURN_IN_PLACE_DEG         20.0f
+#define ROVER_V2_TURN_RADPS                 0.95f
+#define ROVER_V2_FORWARD_MPS                0.18f
+#define ROVER_V2_HEADING_KP_RADPS_PER_DEG   0.018f
+#define ROVER_V2_MAX_CORRECTION_RADPS       0.35f
+#define ROVER_V2_TURN_WATCHDOG_MS            2000u
+#define ROVER_V2_TURN_MIN_DELTA_DEG          5.0f
+#define ROVER_V2_TURN_MIN_ERROR_IMPROVE_DEG  3.0f
+#define ROVER_GO_DEFAULT_DISTANCE_M         1.0f
 
 // ---------------- Telemetry period ----------------
 #define TEL_PERIOD_MS       200

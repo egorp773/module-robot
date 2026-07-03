@@ -12,11 +12,13 @@ class GpsProjection {
   GpsProjection({required this.refLat, required this.refLon}) {
     // Meters per degree of latitude (constant)
     mPerDegLat = 111132.92 - 559.82 * math.cos(2 * refLat * math.pi / 180) +
-                 1.175 * math.cos(4 * refLat * math.pi / 180);
+                 1.175 * math.cos(4 * refLat * math.pi / 180) -
+                 0.0023 * math.cos(6 * refLat * math.pi / 180);
 
     // Meters per degree of longitude (depends on latitude)
     mPerDegLon = 111412.84 * math.cos(refLat * math.pi / 180) -
-                 93.5 * math.cos(3 * refLat * math.pi / 180);
+                 93.5 * math.cos(3 * refLat * math.pi / 180) +
+                 0.118 * math.cos(5 * refLat * math.pi / 180);
   }
 
   /// Convert GPS coordinates to local meters

@@ -154,6 +154,13 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     if (map.coordinateType == 'gps') {
       if (map.refLat == null || map.refLon == null) return null;
       if (wifi.gpsLat == null || wifi.gpsLon == null) return null;
+      if (wifi.gpsCarrier?.toLowerCase() != 'fixed' ||
+          wifi.gpsAccuracy == null ||
+          wifi.gpsAccuracy! > 20 ||
+          wifi.gpsAgeMs == null ||
+          wifi.gpsAgeMs! > 1000) {
+        return null;
+      }
       final geometry = GpsDisplayGeometry(
         originLat: map.refLat!,
         originLon: map.refLon!,
@@ -386,6 +393,33 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           title: 'Маршрут не GPS',
           message: msg,
           kind: NoticeKind.danger,
+        );
+        return;
+      }
+
+      final currentStart = _currentRobotStart(map, wifi);
+      if (currentStart == null) {
+        const msg =
+            'Route upload blocked: current RTK FIXED position is stale or hAcc is above 20 mm.';
+        setState(() => _routeWorkflowError = msg);
+        _showNotice(
+          ref,
+          title: 'RTK position is not ready',
+          message: msg,
+          kind: NoticeKind.danger,
+        );
+        return;
+      }
+      if (_route.isNotEmpty &&
+          (currentStart - _route.first).distance > 0.50) {
+        const msg =
+            'Robot moved more than 0.50 m after route build. Rebuild the route before upload.';
+        setState(() => _routeWorkflowError = msg);
+        _showNotice(
+          ref,
+          title: 'Route start is stale',
+          message: msg,
+          kind: NoticeKind.warning,
         );
         return;
       }

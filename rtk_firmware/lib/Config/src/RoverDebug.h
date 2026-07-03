@@ -13,6 +13,8 @@ void handleCal();
 // GO: CAL + маршрут (0,0) → (0,3) с boundary 4×4 вокруг + старт.
 // Возвращает true если маршрут сформирован и запущен.
 bool handleGo();
+bool handleGoForward(float distanceM);
+bool handleGoNorth(float distanceM);
 
 // LOG,0 / LOG,1: гасит/включает периодический лог в rover.cpp.
 void setLogEnabled(bool enabled);

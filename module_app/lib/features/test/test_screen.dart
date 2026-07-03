@@ -140,6 +140,33 @@ class _TestScreenState extends ConsumerState<TestScreen> {
 
   // --- DRIVE ---
 
+  Future<void> _sendTestSafetyGeometry(
+    WifiConnectionNotifier wifi,
+    List<List<double>> points,
+  ) async {
+    final minX = points.map((p) => p[0]).reduce(math.min) - 0.75;
+    final maxX = points.map((p) => p[0]).reduce(math.max) + 0.75;
+    final minY = points.map((p) => p[1]).reduce(math.min) - 0.75;
+    final maxY = points.map((p) => p[1]).reduce(math.max) + 0.75;
+    final boundary = <List<double>>[
+      [minX, minY],
+      [maxX, minY],
+      [maxX, maxY],
+      [minX, maxY],
+    ];
+    await wifi.sendRouteBoundaryBegin(boundary.length);
+    for (var i = 0; i < boundary.length; i++) {
+      await wifi.sendRouteBoundaryPoint(
+        i,
+        boundary[i][0],
+        boundary[i][1],
+      );
+    }
+    await wifi.sendRouteBoundaryEnd();
+    await wifi.sendForbiddenBeginAck(0, const <int>[]);
+    await wifi.sendForbiddenEndAck();
+  }
+
   Future<void> _driveTo({required double meters, required double compassDeg, String key = "drive"}) async {
     final w = ref.read(wifiConnectionProvider.notifier);
     final s = ref.read(wifiConnectionProvider);
@@ -154,6 +181,7 @@ class _TestScreenState extends ConsumerState<TestScreen> {
       await w.sendRouteBegin(2, originLat: _originLat!, originLon: _originLon!);
       await w.sendRoutePoint(0, 0, 0);
       await w.sendRoutePoint(1, dx, dy);
+      await _sendTestSafetyGeometry(w, <List<double>>[[0, 0], [dx, dy]]);
       await w.sendRouteEnd(2);
       await w.sendNavStart();
       _setResult(key, "еду ${meters.toStringAsFixed(2)}м на ${compassDeg.toStringAsFixed(0)}° — замерь рулеткой");
@@ -181,6 +209,10 @@ class _TestScreenState extends ConsumerState<TestScreen> {
       await w.sendRoutePoint(1, dx, dy);
       await w.sendRoutePoint(2, 0, 0);
       await w.sendRoutePoint(3, 0.001, 0.001);
+      await _sendTestSafetyGeometry(
+        w,
+        <List<double>>[[0, 0], [dx, dy], [0.001, 0.001]],
+      );
       await w.sendRouteEnd(4);
       await w.sendNavStart();
       _setResult(key, "еду ${meters.toStringAsFixed(2)}м ${compassDeg.toStringAsFixed(0)}° + назад — замерь Δx Δy рулеткой");
@@ -209,6 +241,7 @@ class _TestScreenState extends ConsumerState<TestScreen> {
       for (var i = 0; i < count; i++) {
         await w.sendRoutePoint(i, pts[i][0], pts[i][1]);
       }
+      await _sendTestSafetyGeometry(w, pts);
       await w.sendRouteEnd(count);
       await w.sendNavStart();
       _setResult(key, "perim ${L}×${W}м${andBack ? " + возврат" : ""} — замерь");

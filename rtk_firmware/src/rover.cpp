@@ -12,6 +12,7 @@
 #include "Motor.h"
 #include "Safety.h"
 #include "WsServer.h"
+#include "NavMath.h"
 #include <WiFi.h>
 
 // --- global objects ---
@@ -29,7 +30,7 @@ WsServer        g_ws;
 
 static bool g_logEnabled = true;   // LOG,0 / LOG,1 — гасит периодический лог
 
-// --- waypoint follower (Sunray-style Stanley line tracker) ---
+// --- waypoint follower v2: simple first-route controller ---
 struct Follower {
     int   wpIdx = 0;
     bool  running = false;
@@ -39,6 +40,9 @@ struct Follower {
     float headingErr = 0;
     float crossTrack = 0;
     float distToTarget = 0;
+    float targetX = 0;
+    float targetY = 0;
+    float targetHeadingDeg = 0;
     bool  arrived = false;
     uint32_t arrivedSinceMs = 0;
     const char* faultReason = nullptr;
@@ -46,6 +50,11 @@ struct Follower {
     float progressX = 0;
     float progressY = 0;
     uint32_t progressSinceMs = 0;
+    bool  turnWatchActive = false;
+    float turnWatchHeadingDeg = 0;
+    float turnWatchAbsErrorDeg = 0;
+    float turnWatchCommandSign = 0;
+    uint32_t turnWatchSinceMs = 0;
     // Recovery counter: сколько fault подряд в одном WP без прогресса. После порога —
     // не финишируем маршрут, а переключаемся в degraded-режим и пробуем снова.
     int   faultCount = 0;
@@ -54,11 +63,15 @@ struct Follower {
     void reset() {
         wpIdx = 0; running = false; paused = false;
         linearMps = angularRadps = headingErr = crossTrack = distToTarget = 0;
+        targetX = targetY = targetHeadingDeg = 0;
         arrived = false; arrivedSinceMs = 0;
         faultReason = nullptr;
         progressInit = false;
         progressX = progressY = 0;
         progressSinceMs = 0;
+        turnWatchActive = false;
+        turnWatchHeadingDeg = turnWatchAbsErrorDeg = turnWatchCommandSign = 0;
+        turnWatchSinceMs = 0;
         faultCount = 0;
         lastFaultWp = -1;
     }
@@ -71,9 +84,7 @@ static float clampf(float v, float lo, float hi) {
 }
 
 static float wrapDeg180Local(float d) {
-    while (d >  180.0f) d -= 360.0f;
-    while (d < -180.0f) d += 360.0f;
-    return d;
+    return NavMath::wrapDeg180(d);
 }
 
 // Раньше прокачивала g_motor.loop() вручную во время ожидания. Теперь поток команд
@@ -150,6 +161,78 @@ static bool waitForInitialImuHeading(uint32_t timeoutMs) {
     return false;
 }
 
+static bool ensureTestOrigin() {
+    if (g_est.get().originSet) return true;
+    const auto& e = g_est.get();
+    const bool rtkOk =
+        (e.sol == SOL_FIXED && e.hAcc <= SAFE_HACC_FIXED_M) ||
+        (e.sol == SOL_FLOAT && e.hAcc <= 0.05f);
+    if (!rtkOk || e.lat == 0.0 || e.lon == 0.0) return false;
+    if (!g_est.setOrigin(e.lat, e.lon)) return false;
+    const auto& after = g_est.get();
+    Serial.printf("[TEST-ORIGIN] mapOriginLat=%.8f mapOriginLon=%.8f "
+                  "currentRobotX=%.3f currentRobotY=%.3f\n",
+                  after.originLat, after.originLon, after.x, after.y);
+    return true;
+}
+
+static bool startGoRoute(const char* tag, float distanceM, bool forwardFromHeading) {
+    if (!isfinite(distanceM) || distanceM <= 0.0f || distanceM > 2.0f) {
+        Serial.printf("[%s] refusing: distance %.2f outside (0,2.0]m\n",
+                      tag, (double)distanceM);
+        return false;
+    }
+    if (!ensureTestOrigin()) {
+        Serial.printf("[%s] refusing: no map origin and no usable RTK fix\n", tag);
+        return false;
+    }
+
+    const auto& e = g_est.get();
+    const float headingDeg =
+        e.headingValid ? e.headingFiltDeg : g_imu.yawDeg();
+    float dx = 0.0f;
+    float dy = distanceM;
+    if (forwardFromHeading) {
+        NavMath::forwardOffset(distanceM, headingDeg, dx, dy);
+    }
+    const float startX = e.x;
+    const float startY = e.y;
+    const float targetX = startX + dx;
+    const float targetY = startY + dy;
+    const float margin = 0.75f;
+    const float minX = fminf(startX, targetX) - margin;
+    const float maxX = fmaxf(startX, targetX) + margin;
+    const float minY = fminf(startY, targetY) - margin;
+    const float maxY = fmaxf(startY, targetY) + margin;
+
+    g_follow.reset();
+    if (!g_route.beginUpload(2, e.originLat, e.originLon)) {
+        Serial.printf("[%s] refusing: route begin failed\n", tag);
+        return false;
+    }
+    g_route.addWaypoint(0, startX, startY);
+    g_route.addWaypoint(1, targetX, targetY);
+    g_route.beginBoundary(4);
+    g_route.addBoundaryPoint(0, minX, minY);
+    g_route.addBoundaryPoint(1, maxX, minY);
+    g_route.addBoundaryPoint(2, maxX, maxY);
+    g_route.addBoundaryPoint(3, minX, maxY);
+    g_route.endBoundary();
+    g_route.beginForbidden(0, nullptr);
+    g_route.endForbidden();
+    g_route.endUpload();
+    g_route.start();
+    g_ws.requestDebugNavigation();
+    Serial.printf("[%s] distance=%.2f heading=%.1f start=(%.2f,%.2f) "
+                  "target=(%.2f,%.2f) origin=(%.8f,%.8f) speed=%.2f\n",
+                  tag, (double)distanceM, (double)headingDeg,
+                  (double)startX, (double)startY,
+                  (double)targetX, (double)targetY,
+                  e.originLat, e.originLon,
+                  (double)ROVER_V2_FORWARD_MPS);
+    return true;
+}
+
 static void connectWiFi() {
     WiFi.disconnect(true, true);
     delay(300);
@@ -197,195 +280,137 @@ static void stepFollower() {
         return;
     }
     if (g_route.isPaused()) {
+        g_follow.linearMps = g_follow.angularRadps = 0;
         g_motor.setLinearAngularSpeed(0, 0, true);
         return;
     }
+
     const auto& e = g_est.get();
     int total = g_route.count();
     NavPoint current{e.x, e.y};
 
-    // Hard guard: выход за boundary > HARD tolerance — это однозначно потеря позиции
-    // (сдвиг origin, обрыв RTCM, накопление ошибки). После 3 попыток — ERROR.
+    bool rtkOk = (e.sol == SOL_FIXED && e.hAcc <= SAFE_HACC_FIXED_M) ||
+                 (e.sol == SOL_FLOAT && e.hAcc <= 0.05f);
+    if (!rtkOk || e.pvtAgeMs > SAFE_PVT_AGE_MS ||
+        e.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {
+        g_follow.linearMps = 0;
+        g_follow.angularRadps = 0;
+        g_motor.stopImmediately();
+        return;
+    }
+    g_follow.faultReason = nullptr;
+
     if (!g_route.positionAllowed(current, ROVER_BOUNDARY_TOLERANCE_M)) {
         followerFault("perimeter_violation");
         return;
     }
 
     if (total == 0 || g_follow.wpIdx >= total) {
-        g_motor.setLinearAngularSpeed(0, 0, true);
         g_follow.running = false;
         g_follow.arrived = true;
+        g_follow.linearMps = 0;
+        g_follow.angularRadps = 0;
         g_route.finish();
+        g_motor.setLinearAngularSpeed(0, 0, true);
         return;
     }
 
     const Waypoint& wp = g_route.waypoint(g_follow.wpIdx);
-    const Waypoint* prevWp = (g_follow.wpIdx > 0) ? &g_route.waypoint(g_follow.wpIdx - 1) : nullptr;
+    float dx = wp.p.x - current.x;
+    float dy = wp.p.y - current.y;
+    float distToWp = sqrtf(dx * dx + dy * dy);
 
-    // ===== Активный сегмент =====
-    // Сегмент = (prevWp, wp). Для первого WP prevWp = nullptr — это вырожденный случай
-    // (старт маршрута, робот ещё в начале первого сегмента).
-    float segDx, segDy, segLen;
-    if (prevWp) {
-        segDx = wp.p.x - prevWp->p.x;
-        segDy = wp.p.y - prevWp->p.y;
-    } else {
-        // Старт: "сегмент" = направление на WP (для расчёта heading, без crosstrack).
-        segDx = wp.p.x - current.x;
-        segDy = wp.p.y - current.y;
-    }
-    segLen = sqrtf(segDx * segDx + segDy * segDy);
-
-    // ===== Lookahead target на сегменте (Sunray LOOOKAHEAD) =====
-    // Целевая точка = точка на сегменте на расстоянии lookahead ВПЕРЁД от проекции
-    // робота на сегмент. Если проекция за началом — цепляем к началу; если за WP —
-    // цепляемся к WP (для коротких сегментов).
-    float t = 0.0f;
-    if (prevWp && segLen > 0.05f) {
-        t = ((current.x - prevWp->p.x) * segDx + (current.y - prevWp->p.y) * segDy) / (segLen * segLen);
-        if (t < 0.0f) t = 0.0f;
-        if (t > 1.0f) t = 1.0f;
-    }
-    // Точка проекции
-    float projX, projY;
-    if (prevWp) {
-        projX = prevWp->p.x + segDx * t;
-        projY = prevWp->p.y + segDy * t;
-    } else {
-        projX = current.x; projY = current.y;
-    }
-    // Lookahead target
-    bool finalWp = (g_follow.wpIdx + 1 >= total);
-    float maxLa = (prevWp && !finalWp) ? min(ROVER_LOOKAHEAD_M, segLen * 0.5f) : 0.0f;
-    float laT = t + (maxLa / max(segLen, 0.05f));
-    if (laT > 1.0f) laT = 1.0f;
-    NavPoint lookAt;
-    if (prevWp) {
-        lookAt.x = prevWp->p.x + segDx * laT;
-        lookAt.y = prevWp->p.y + segDy * laT;
-    } else {
-        lookAt = wp.p;
-    }
-    // Финальный WP: целимся прямо в WP (lookahead = 0)
-    if (finalWp) {
-        lookAt = wp.p;
-    }
-
-    // ===== Расстояние до WP (для handoff и телеметрии) =====
-    float wdx = wp.p.x - current.x;
-    float wdy = wp.p.y - current.y;
-    float distToWp = sqrtf(wdx * wdx + wdy * wdy);
+    g_follow.targetX = wp.p.x;
+    g_follow.targetY = wp.p.y;
     g_follow.distToTarget = distToWp;
-
-    // ===== Crosstrack (поперечное отклонение от линии сегмента) =====
     g_follow.crossTrack = 0;
-    if (prevWp && segLen > 0.05f) {
-        float rx = current.x - prevWp->p.x;
-        float ry = current.y - prevWp->p.y;
-        // Знак: положительный = слева от направления движения
-        g_follow.crossTrack = (segDx * ry - segDy * rx) / segLen;
-        if (fabsf(g_follow.crossTrack) > ROVER_CROSSTRACK_HARD_M) {
-            // hard: 1.0 м — действительно потеряли путь, делаем recovery
-            followerFault("cross_track_hard");
-            return;
-        }
-    }
 
-    // ===== Handoff: переключение на следующий WP =====
-    float handoff;
-    if (finalWp) {
-        handoff = ROVER_ARRIVAL_RADIUS;
-    } else if (prevWp) {
-        handoff = max(ROVER_HANDOFF_MIN_M, min(ROVER_HANDOFF_MAX_M, segLen * ROVER_HANDOFF_FRAC));
-    } else {
-        // старт маршрута: пока нет prevWp, фиксированно ждём 0.5м отхода
-        handoff = 0.5f;
-    }
-    if (distToWp < handoff) {
-        g_follow.faultCount = 0;   // сброс — мы в норме
+    if (distToWp < ROVER_V2_ARRIVAL_RADIUS_M) {
+        g_follow.faultCount = 0;
         g_follow.lastFaultWp = -1;
         g_follow.wpIdx++;
         if (g_follow.wpIdx >= total) {
             g_follow.running = false;
             g_follow.arrived = true;
+            g_follow.linearMps = 0;
+            g_follow.angularRadps = 0;
             g_route.finish();
             g_motor.setLinearAngularSpeed(0, 0, true);
             return;
         }
-        stepFollower();
-        return;
+        const Waypoint& nextWp = g_route.waypoint(g_follow.wpIdx);
+        dx = nextWp.p.x - current.x;
+        dy = nextWp.p.y - current.y;
+        distToWp = sqrtf(dx * dx + dy * dy);
+        g_follow.targetX = nextWp.p.x;
+        g_follow.targetY = nextWp.p.y;
+        g_follow.distToTarget = distToWp;
     }
 
-    if (!g_route.segmentAllowed(current, wp.p, ROVER_BOUNDARY_TOLERANCE_M, ROVER_BOUNDARY_SAMPLE_M)) {
+    NavPoint target{g_follow.targetX, g_follow.targetY};
+    if (!g_route.segmentAllowed(current, target, ROVER_BOUNDARY_TOLERANCE_M, ROVER_BOUNDARY_SAMPLE_M)) {
         followerFault("route_segment_blocked");
         return;
     }
 
-    // ===== Желаемый heading = направление на lookahead target =====
-    // Это плавнее, чем "вдоль сегмента" — при подходе к финалу lookahead
-    // автоматически сокращается, и headingErr естественно → 0.
-    float ldx = lookAt.x - current.x;
-    float ldy = lookAt.y - current.y;
-    if (ldx*ldx + ldy*ldy < 1e-4f) {
-        ldx = segDx; ldy = segDy;
-    }
-    float desiredHeading = atan2f(ldx, ldy) * 180.0f / M_PI;
-    if (desiredHeading < 0) desiredHeading += 360.0f;
+    float desiredHeading = NavMath::targetHeadingDeg(dx, dy);
     float headingErr = wrapDeg180Local(desiredHeading - e.headingFiltDeg);
+    float absErr = fabsf(headingErr);
+
+    g_follow.targetHeadingDeg = desiredHeading;
     g_follow.headingErr = headingErr;
 
-    // ===== Скорость по safety + heading + crosstrack =====
-    float baseSpeed = ROVER_MAX_SPEED_MPS;
-    if (g_safety.level() == SAFETY_DEGRADED) baseSpeed = ROVER_FLOAT_SPEED;
-    else if (g_safety.level() == SAFETY_HOLD) baseSpeed = 0;
-    else if (g_safety.level() == SAFETY_ESTOP) baseSpeed = 0;
-
-    float absErr = fabsf(headingErr);
-    float absCt  = fabsf(g_follow.crossTrack);
-
-    // GPS-only рулёжка: всегда едем вперёд, поворот по дуге (Stanley).
-    // Притормаживаем у цели — но не до нуля, иначе GPS heading заморозится.
-    if (distToWp < 0.30f)      baseSpeed *= 0.45f;
-    else if (distToWp < 0.60f) baseSpeed *= 0.70f;
-
-    // При большой heading-ошибке — медленнее (круче дуга), но пол 0.40 гарантирует
-    // что робот движется и GPS-heading обновляется.
-    baseSpeed *= clampf(1.0f - absErr / 120.0f, 0.40f, 1.0f);
-
-    // При большом crosstrack — тоже медленнее (корректирующая дуга).
-    if (absCt > ROVER_CROSSTRACK_SOFT_M) {
-        baseSpeed *= clampf(1.0f - (absCt - ROVER_CROSSTRACK_SOFT_M) / 0.5f, 0.50f, 1.0f);
-    }
-
-    // Если уже были fault на этом WP — едем осторожнее.
-    if (g_follow.faultCount > 0) {
-        baseSpeed *= 0.6f;
-    }
-
-    // ===== Stanley =====
-    // headingTerm — P по heading-ошибке (в рад/с)
-    // crosstrackTerm — atan2(K*ct, soft + |v|) — пропорционально отклонению,
-    //                  делённому на скорость (классический Stanley)
-    float headingTerm = ROVER_K_HEADING * headingErr * M_PI / 180.0f;
-    float crosstrackTerm = atan2f(ROVER_K_CROSSTRACK * g_follow.crossTrack,
-                                  ROVER_STANLEY_SOFT_SPEED + fabsf(baseSpeed));
-    float w = headingTerm + crosstrackTerm;
-    w = clampf(w, -ROVER_MAX_ANGULAR_RADPS, ROVER_MAX_ANGULAR_RADPS);
-    g_follow.linearMps   = baseSpeed;
-    g_follow.angularRadps = w;
-
-    if (!checkFollowerProgress(e, baseSpeed)) {
-        return;
-    }
-
-    if (!g_ws.navRequested() || !g_route.isRunning()) {
-        g_motor.stopImmediately();
-        return;
-    }
-
-    if (g_safety.allowMotion()) {
-        g_motor.setLinearAngularSpeed(baseSpeed, w, true);
+    float linear = 0.0f;
+    float angular = 0.0f;
+    if (absErr > ROVER_V2_TURN_IN_PLACE_DEG) {
+        angular = (headingErr >= 0.0f ? 1.0f : -1.0f) * ROVER_V2_TURN_RADPS;
+        const uint32_t now = millis();
+        const float commandSign = angular >= 0.0f ? 1.0f : -1.0f;
+        if (!g_follow.turnWatchActive ||
+            commandSign != g_follow.turnWatchCommandSign) {
+            g_follow.turnWatchActive = true;
+            g_follow.turnWatchHeadingDeg = e.headingFiltDeg;
+            g_follow.turnWatchAbsErrorDeg = absErr;
+            g_follow.turnWatchCommandSign = commandSign;
+            g_follow.turnWatchSinceMs = now;
+        } else if ((now - g_follow.turnWatchSinceMs) >
+                   ROVER_V2_TURN_WATCHDOG_MS) {
+            const float signedHeadingDelta =
+                wrapDeg180Local(e.headingFiltDeg -
+                                g_follow.turnWatchHeadingDeg);
+            const bool directionOk =
+                signedHeadingDelta * commandSign >=
+                ROVER_V2_TURN_MIN_DELTA_DEG;
+            const bool errorImproved =
+                absErr <= g_follow.turnWatchAbsErrorDeg -
+                          ROVER_V2_TURN_MIN_ERROR_IMPROVE_DEG;
+            if (!directionOk || !errorImproved) {
+                followerFault(!directionOk ? "turn_wrong_direction_or_stuck"
+                                           : "turn_not_converging");
+                return;
+            }
+            g_follow.turnWatchHeadingDeg = e.headingFiltDeg;
+            g_follow.turnWatchAbsErrorDeg = absErr;
+            g_follow.turnWatchSinceMs = now;
+        }
     } else {
+        g_follow.turnWatchActive = false;
+        linear = (g_safety.level() == SAFETY_DEGRADED) ? ROVER_FLOAT_SPEED : ROVER_V2_FORWARD_MPS;
+        angular = clampf(ROVER_V2_HEADING_KP_RADPS_PER_DEG * headingErr,
+                         -ROVER_V2_MAX_CORRECTION_RADPS,
+                         ROVER_V2_MAX_CORRECTION_RADPS);
+    }
+
+    g_follow.linearMps = linear;
+    g_follow.angularRadps = angular;
+
+    if (!checkFollowerProgress(e, linear)) return;
+
+    if (g_ws.navRequested() && g_route.isRunning() && g_safety.allowMotion()) {
+        g_motor.setLinearAngularSpeed(linear, angular, true);
+    } else {
+        g_follow.linearMps = 0;
+        g_follow.angularRadps = 0;
         g_motor.stopImmediately();
     }
 }
@@ -444,9 +469,8 @@ void loop() {
     // Простые текстовые команды из Serial — для отладки без приложения.
     //   CAL\n   — текущее направление носа = "0°". После этого робот поедет туда,
     //              куда сейчас смотрит носом, при waypoint (x=0, y=+).
-    //   GO\n    — CAL + загрузить маршрут из 2 точек: (0,0) → (0,3) + стартовать.
-    //              Робот поедет ровно 3 метра туда, куда смотрит носом, и встанет.
-    //              Идеальный тест для проверки heading + моторов без приложения.
+    //   GO / GO_FORWARD[,m] — ехать m метров по текущему абсолютному heading.
+    //   GO_NORTH[,m]        — ехать к географическому северу (y+), не "от носа".
     //   STOP\n  — стоп моторов немедленно.
     //   LOG,0\n — выключить периодический лог (чтобы терминал не летал).
     //   LOG,1\n — включить обратно (200мс).
@@ -457,34 +481,20 @@ void loop() {
             buf[n] = 0;
             if (strcmp(buf, "CAL") == 0) {
                 float cur = g_imu.yawDeg();
-                g_est.seedHeadingDeg(0.0f);
+                g_est.seedHeadingDeg(cur);
                 g_follow.reset();
-                Serial.printf("[CAL] heading reseeded: imuYaw was %.1f → head=0\n",
+                Serial.printf("[CAL] estimator reseeded from absolute imuYaw=%.1f\n",
                               (double)cur);
             } else if (strcmp(buf, "GO") == 0) {
-                if (!g_est.get().originSet) {
-                    Serial.println("[GO] refusing: no origin yet (wait for RTK FIX/FLOAT)");
-                } else {
-                    float cur = g_imu.yawDeg();
-                    g_est.seedHeadingDeg(0.0f);
-                    g_follow.reset();
-                    g_route.beginUpload(2, g_est.get().originLat, g_est.get().originLon);
-                    g_route.addWaypoint(0, 0.0f, 0.0f);
-                    g_route.addWaypoint(1, 0.0f, 3.0f);
-                    g_route.beginBoundary(4);
-                    g_route.addBoundaryPoint(0, -2.0f, -2.0f);
-                    g_route.addBoundaryPoint(1,  2.0f, -2.0f);
-                    g_route.addBoundaryPoint(2,  2.0f,  5.0f);
-                    g_route.addBoundaryPoint(3, -2.0f,  5.0f);
-                    g_route.endBoundary();
-                    g_route.beginForbidden(0, nullptr);
-                    g_route.endForbidden();
-                    g_route.endUpload();
-                    g_route.start();
-                    Serial.printf("[GO] CAL+route+start: imuYaw was %.1f → head=0, "
-                                  "route: (0,0) → (0,3), speed=%.2f m/s\n",
-                                  (double)cur, (double)ROVER_MAX_SPEED_MPS);
-                }
+                roverdbg::handleGoForward(ROVER_GO_DEFAULT_DISTANCE_M);
+            } else if (strncmp(buf, "GO_FORWARD", 10) == 0) {
+                float distance = ROVER_GO_DEFAULT_DISTANCE_M;
+                if (buf[10] == ',') distance = atof(buf + 11);
+                roverdbg::handleGoForward(distance);
+            } else if (strncmp(buf, "GO_NORTH", 8) == 0) {
+                float distance = ROVER_GO_DEFAULT_DISTANCE_M;
+                if (buf[8] == ',') distance = atof(buf + 9);
+                roverdbg::handleGoNorth(distance);
             } else if (strcmp(buf, "STOP") == 0) {
                 g_motor.stopImmediately();
                 Serial.println("[STOP] motors stopped");
@@ -528,27 +538,8 @@ void loop() {
     g_est.onHoverboardFeedback(now, g_motor.speedLeftMeas(), g_motor.speedRightMeas());
     g_est.tick(now);
 
-    // Auto-origin: если origin ещё не задан, но есть валидный fix — захватываем текущую
-    // позицию как origin. Иначе est.x, est.y останутся 0,0 пока пользователь не отправит
-    // маршрут, и карта в приложении будет показывать робота в (0,0) — "он в разных точках".
-    // FIXED — идеал, FLOAT с hAcc<=5см тоже достаточно для старта.
-    {
-        static uint32_t lastAutoOriginLogMs = 0;
-        if (!g_est.get().originSet) {
-            const auto& e = g_est.get();
-            bool ok = (e.sol == SOL_FIXED) ||
-                      (e.sol == SOL_FLOAT && e.hAcc <= 0.05f);
-            if (ok) {
-                g_est.setOrigin(e.lat, e.lon);
-                if (now - lastAutoOriginLogMs > 2000) {
-                    Serial.printf("[AUTO-ORIGIN] captured: lat=%.7f lon=%.7f sol=%d hAcc=%.3f\n",
-                                  g_est.get().originLat, g_est.get().originLon,
-                                  (int)e.sol, e.hAcc);
-                    lastAutoOriginLogMs = now;
-                }
-            }
-        }
-    }
+    // Operational origin is supplied by ROUTE_BEGIN from the saved map.
+    // Current-position auto-origin exists only inside explicit GO_* test commands.
 
     SafetyInput si;
     si.wsConnected  = g_ws.isConnected();
@@ -560,6 +551,7 @@ void loop() {
     si.pDop         = g_est.get().pDop;
     si.hAcc         = g_est.get().hAcc;
     si.pvtAgeMs     = g_est.get().pvtAgeMs;
+    si.rtcmAgeMs    = g_rtcm.transportAgeMs(now);
     si.acceptedPositionAgeMs = g_est.get().acceptedPositionAgeMs;
     si.headingAgeMs = g_est.get().headingAgeMs;
     si.rejectedPositionFixes = g_est.get().rejectedPositionFixes;
@@ -630,20 +622,29 @@ void loop() {
     if (g_logEnabled && now - lastLog > 200) {
         lastLog = now;
         const auto& e = g_est.get();
-        Serial.printf("[R] sol=%d hAcc=%.3f head=%.1f imuYaw=%.1f mag=%d acc=%.2f "
-                      "spd=%.2f pvtAge=%u rtcmAge=%lu imuAge=%u "
-                      "wp=%d/%d dWp=%.2f hErr=%.1f ct=%.2f "
-                      "motL=%d motR=%d sp=%d st=%d "
-                      "safety=%d %s fault=%s\n",
-            (int)e.sol, e.hAcc, e.headingFiltDeg,
+        const char* navState =
+            g_follow.faultReason ? "ERROR" :
+            g_route.isPaused() ? "PAUSED" :
+            g_route.isRunning() ? "RUNNING" :
+            g_follow.arrived ? "ARRIVED" : "IDLE";
+        Serial.printf("[NAVV2] timestamp=%lu lat=%.8f lon=%.8f x=%.3f y=%.3f "
+                      "imuYaw=%.1f imuMag=%d imuAcc=%.2f estimatorHeading=%.1f "
+                      "target_x=%.3f target_y=%.3f target_heading=%.1f "
+                      "heading_error=%.1f distance=%.3f "
+                      "left_cmd=%d right_cmd=%d waypoint_index=%d/%d "
+                      "nav_state=%s rtk_status=%d hAcc=%.3f "
+                      "origin_lat=%.8f origin_lon=%.8f "
+                      "speed=%.2f pvtAge=%u rtcmAge=%lu imuAge=%u "
+                      "safety=%d reason=%s fault=%s\n",
+            (unsigned long)now, e.lat, e.lon, e.x, e.y,
             g_imu.yawDeg(), g_imu.yawFromMag() ? 1 : 0, g_imu.yawAccRad(),
-            e.speedMps, e.pvtAgeMs,
-            g_rtcm.transportAgeMs(now),
-            g_imu.ageMs(now),
-            g_follow.wpIdx, g_route.count(),
-            g_follow.distToTarget, g_follow.headingErr, g_follow.crossTrack,
+            e.headingFiltDeg,
+            g_follow.targetX, g_follow.targetY, g_follow.targetHeadingDeg,
+            g_follow.headingErr, g_follow.distToTarget,
             g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
-            g_motor.lastSpeedCmd(), g_motor.lastSteerCmd(),
+            g_follow.wpIdx, g_route.count(), navState, (int)e.sol, e.hAcc,
+            e.originLat, e.originLon,
+            e.speedMps, e.pvtAgeMs, g_rtcm.transportAgeMs(now), g_imu.ageMs(now),
             (int)g_safety.level(), g_safety.reason(),
             g_follow.faultReason ? g_follow.faultReason : "-");
     }
@@ -687,16 +688,17 @@ static void currentMagPairs(float& mxy, float& myx, float& mxz,
 
 void handleCal() {
     float cur = g_imu.yawDeg();
-    g_est.seedHeadingDeg(0.0f);
+    g_est.seedHeadingDeg(cur);
     g_follow.reset();
-    Serial.printf("[CAL] heading reseeded: imuYaw was %.1f → head=0\n", (double)cur);
+    Serial.printf("[CAL] estimator reseeded from absolute imuYaw=%.1f\n",
+                  (double)cur);
 }
 
 bool handleGo() {
-    if (!g_est.get().originSet) {
-        Serial.println("[GO] refusing: no origin yet (wait for RTK FIX/FLOAT)");
-        return false;
-    }
+    return handleGoForward(ROVER_GO_DEFAULT_DISTANCE_M);
+}
+
+static bool goPrecheck() {
     // Жёсткий гейт: если IMU не отвечает дольше 500мс — отказываем.
     // Иначе heading "застрянет" на старом значении, Stanley поведёт не туда,
     // и робот развернётся при старте. Это страховка от I2C-зависания BNO085.
@@ -723,26 +725,17 @@ bool handleGo() {
                   g_ws.navRequested() ? 1 : 0,
                   (int)g_safety.level(), g_safety.reason());
 
-    float cur = g_imu.yawDeg();
-    g_est.seedHeadingDeg(0.0f);
-    g_follow.reset();
-    g_route.beginUpload(2, g_est.get().originLat, g_est.get().originLon);
-    g_route.addWaypoint(0, 0.0f, 0.0f);
-    g_route.addWaypoint(1, 0.0f, 3.0f);
-    g_route.beginBoundary(4);
-    g_route.addBoundaryPoint(0, -2.0f, -2.0f);
-    g_route.addBoundaryPoint(1,  2.0f, -2.0f);
-    g_route.addBoundaryPoint(2,  2.0f,  5.0f);
-    g_route.addBoundaryPoint(3, -2.0f,  5.0f);
-    g_route.endBoundary();
-    g_route.beginForbidden(0, nullptr);
-    g_route.endForbidden();
-    g_route.endUpload();
-    g_route.start();
-    Serial.printf("[GO] CAL+route+start: imuYaw was %.1f → head=0, "
-                  "route: (0,0) → (0,3), speed=%.2f m/s\n",
-                  (double)cur, (double)ROVER_MAX_SPEED_MPS);
     return true;
+}
+
+bool handleGoForward(float distanceM) {
+    if (!goPrecheck()) return false;
+    return startGoRoute("GO_FORWARD", distanceM, true);
+}
+
+bool handleGoNorth(float distanceM) {
+    if (!goPrecheck()) return false;
+    return startGoRoute("GO_NORTH", distanceM, false);
 }
 
 void setLogEnabled(bool enabled) {

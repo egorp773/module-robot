@@ -30,6 +30,10 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
         set(SAFETY_ESTOP, "pvt_stale");
         return;
     }
+    if (in.navRequested && in.rtcmAgeMs > SAFE_RTK_AGE_MS) {
+        set(SAFETY_ESTOP, "rtcm_stale");
+        return;
+    }
     if (in.numSv < SAFE_NUM_SV || in.pDop > SAFE_PDOP_MAX) {
         set(SAFETY_HOLD, "sky_bad");
         return;
@@ -62,15 +66,8 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
             return;
         }
         if (in.headingAgeMs > SAFE_HEADING_AGE_MS) {
-            // Если heading однажды засеян (CAL_IMU или seedHeadingDeg на бутстрапе) —
-            // считаем его валидным, пока PVT идёт. На стоянке GPS-курс заморожен, и
-            // таймстамп _lastHeadingMs мог не обновляться — это не повод стопорить.
-            if (est.get().headingValid) {
-                // heading валиден по seed — пропускаем гейт
-            } else {
-                set(SAFETY_HOLD, "heading_stale");
-                return;
-            }
+            set(SAFETY_HOLD, "heading_stale");
+            return;
         }
         if (in.sol == SOL_INVALID) {
             set(SAFETY_HOLD, "rtk_invalid");

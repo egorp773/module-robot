@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hello_flutter/core/gps_display_math.dart';
+import 'package:hello_flutter/core/gps_projection.dart';
 
 void main() {
   test('distance and bearing stay usable for monitor display', () {
@@ -33,7 +34,15 @@ void main() {
 
     final point = geometry.toLocal(55.751344, 37.618523);
 
-    expect(point.x, greaterThan(6));
-    expect(point.y, greaterThan(11));
+    // Same fixture and expected values are used by firmware NavMath tests.
+    expect(point.x, closeTo(6.2793, 0.01));
+    expect(point.y, closeTo(11.132, 0.01));
+
+    final legacyProjection = GpsProjection(
+      refLat: 55.751244,
+      refLon: 37.618423,
+    ).toLocal(55.751344, 37.618523);
+    expect(legacyProjection.dx, closeTo(point.x, 1e-6));
+    expect(legacyProjection.dy, closeTo(point.y, 1e-6));
   });
 }

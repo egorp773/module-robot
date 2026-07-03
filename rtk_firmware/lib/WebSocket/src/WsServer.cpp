@@ -2,17 +2,7 @@
 
 #include "WsServer.h"
 #include "RtkConfig.h"
-
-// Forward declarations из rover.cpp (namespace roverdbg) — нужны, чтобы WsServer
-// мог дёргать отладочные команды (CAL/GO/LOG) из приложения, не включая сам rover.cpp
-// (там циклическая зависимость по глобальным объектам).
-namespace roverdbg {
-    bool handleGo();
-    void setLogEnabled(bool);
-    String diagLine();
-    String imuZeroLine();
-    String imuDiagLine();
-}
+#include "RoverDebug.h"
 
 void WsServer::begin(StateEstimator& est, Imu& imu, Gnss& gnss, RtcmLink& rtcm,
                      Route& route, Motor& motor, Safety& safety, uint16_t port) {
@@ -43,7 +33,7 @@ void WsServer::onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         _lastRxMs = millis();
         sendText(client, "STATE,CONNECTED");
         // Подсказка оператору — какие команды есть для отладки.
-        sendText(client, "[HELP] DIAG | IMU_ZERO | IMU_DIAG | CAL | GO | STOP | LOG,0 | LOG,1");
+        sendText(client, "[HELP] DIAG | IMU_ZERO | IMU_DIAG | CAL | GO_FORWARD[,m] | GO_NORTH[,m] | STOP | LOG,0 | LOG,1");
     } else if (type == WS_EVT_DISCONNECT) {
         if (_client == client) _client = nullptr;
         stopActuators();
@@ -97,21 +87,38 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
     if (line == "CAL") {
         if (_imu && _est) {
             float cur = _imu->yawDeg();
-            _est->seedHeadingDeg(0.0f);
-            sendText(client, String("[CAL] imuYaw was ") + String(cur, 1) + " → head=0");
+            _est->seedHeadingDeg(cur);
+            sendText(client, String("[CAL] estimator=imuYaw ") + String(cur, 1));
         } else {
             sendText(client, "ERR,CAL_NO_IMU");
         }
         return;
     }
-    if (line == "GO") {
-        if (roverdbg::handleGo()) {
+    if (line == "GO" || line.startsWith("GO_FORWARD")) {
+        float distance = ROVER_GO_DEFAULT_DISTANCE_M;
+        if (line.startsWith("GO_FORWARD,")) {
+            distance = atof(line.c_str() + 11);
+        }
+        if (roverdbg::handleGoForward(distance)) {
             // handleGo() только готовит маршрут, но stepFollower() в loop() крутится
             // только если navRequested==true. Без этого — маршрут запущен, моторы стоят.
             _navRequested = true;
-            sendText(client, "OK,GO start: " + roverdbg::diagLine());
+            sendText(client, "OK,GO_FORWARD: " + roverdbg::diagLine());
         } else {
-            sendText(client, "ERR,GO_NO_ORIGIN: " + roverdbg::diagLine());
+            sendText(client, "ERR,GO_FORWARD: " + roverdbg::diagLine());
+        }
+        return;
+    }
+    if (line == "GO_NORTH" || line.startsWith("GO_NORTH,")) {
+        float distance = ROVER_GO_DEFAULT_DISTANCE_M;
+        if (line.startsWith("GO_NORTH,")) {
+            distance = atof(line.c_str() + 9);
+        }
+        if (roverdbg::handleGoNorth(distance)) {
+            _navRequested = true;
+            sendText(client, "OK,GO_NORTH: " + roverdbg::diagLine());
+        } else {
+            sendText(client, "ERR,GO_NORTH: " + roverdbg::diagLine());
         }
         return;
     }
@@ -206,8 +213,17 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
                 sendText(client, "ERR,NAV_ACTIVE");
                 return;
             }
-            if (_route->beginUpload(count, lat, lon)) {
-                _est->setOrigin(lat, lon);
+            const bool originValid =
+                isfinite(lat) && isfinite(lon) &&
+                lat >= -90.0 && lat <= 90.0 &&
+                lon >= -180.0 && lon <= 180.0 &&
+                !(lat == 0.0 && lon == 0.0);
+            if (originValid && _route->beginUpload(count, lat, lon) &&
+                _est->setOrigin(lat, lon)) {
+                const auto& e = _est->get();
+                Serial.printf("[MAP-ORIGIN] mapOriginLat=%.8f mapOriginLon=%.8f "
+                              "currentRobotX=%.3f currentRobotY=%.3f\n",
+                              e.originLat, e.originLon, e.x, e.y);
                 sendText(client, "OK,ROUTE_BEGIN");
             } else {
                 sendText(client, "ERR,ROUTE_BEGIN");

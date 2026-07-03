@@ -41,6 +41,7 @@ public:
     // counters / state
     uint32_t lastCmdMs() const { return _lastCmdMs; }
     bool navRequested() const { return _navRequested; }
+    void requestDebugNavigation() { _navRequested = true; }
     // Выставляется из roverdbg::handleGo() чтобы stepFollower() начал крутиться —
     // иначе условие в loop() "if (g_ws.navRequested() && g_route.isRunning())"
     // не сработает и моторы не получат команду.
