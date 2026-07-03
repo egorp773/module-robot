@@ -33,7 +33,7 @@ void WsServer::onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         _lastRxMs = millis();
         sendText(client, "STATE,CONNECTED");
         // Подсказка оператору — какие команды есть для отладки.
-        sendText(client, "[HELP] DIAG | IMU_ZERO | IMU_DIAG | CAL | GO_FORWARD[,m] | GO_NORTH[,m] | STOP | LOG,0 | LOG,1");
+        sendText(client, "[HELP] DIAG | IMU_STATUS | IMU_ZERO | IMU_DIAG | CAL | IMU_CAL_START | IMU_CAL_SAVE | IMU_CAL_CLEAR | IMU_TARE_YAW | IMU_TARE_PERSIST | GO_FORWARD[,m] | GO_NORTH[,m] | STOP | LOG,0 | LOG,1");
     } else if (type == WS_EVT_DISCONNECT) {
         if (_client == client) _client = nullptr;
         stopActuators();
@@ -85,13 +85,31 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
     // === Отладочные команды из приложения (через WebSocket).
     // Без этого "GO"/"CAL"/"LOG" из приложения падают в ERR,UNKNOWN. ===
     if (line == "CAL") {
-        if (_imu && _est) {
-            float cur = _imu->yawDeg();
-            _est->seedHeadingDeg(cur);
-            sendText(client, String("[CAL] estimator=imuYaw ") + String(cur, 1));
-        } else {
-            sendText(client, "ERR,CAL_NO_IMU");
-        }
+        sendText(client, roverdbg::handleCal() ? "OK,CAL" : "ERR,CAL");
+        return;
+    }
+    if (line == "IMU_STATUS") {
+        sendText(client, roverdbg::imuStatusLine());
+        return;
+    }
+    if (line == "IMU_CAL_START") {
+        sendText(client, roverdbg::imuCalStartLine());
+        return;
+    }
+    if (line == "IMU_CAL_SAVE") {
+        sendText(client, roverdbg::imuCalSaveLine());
+        return;
+    }
+    if (line == "IMU_CAL_CLEAR") {
+        sendText(client, roverdbg::imuCalClearLine());
+        return;
+    }
+    if (line == "IMU_TARE_YAW") {
+        sendText(client, roverdbg::imuTareYawLine());
+        return;
+    }
+    if (line == "IMU_TARE_PERSIST") {
+        sendText(client, roverdbg::imuTarePersistLine());
         return;
     }
     if (line == "GO" || line.startsWith("GO_FORWARD")) {
@@ -160,7 +178,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         float heading = 0;
         if (sscanf(line.c_str(), "SET_HEADING,%f", &heading) == 1) {
             _est->seedHeadingDeg(heading);
-            sendText(client, "OK,HEADING");
+            sendText(client, "OK,HEADING_MANUAL_ESTIMATOR_ONLY");
         } else {
             sendText(client, "ERR,SET_HEADING");
         }
@@ -338,6 +356,13 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
             sendText(client, "ERR,GPS_JUMP");
         } else if (!e.headingValid || e.headingAgeMs > SAFE_HEADING_AGE_MS) {
             sendText(client, "ERR,HEADING_STALE");
+        } else if (!_imu || !ImuMath::canUseAbsoluteYawForNav(
+                              _imu->headingState(),
+                              _imu->yawAbsoluteValid(),
+                              _imu->yawAccRad(),
+                              _imu->yawAgeMs(now),
+                              SAFE_IMU_AGE_MS)) {
+            sendText(client, "ERR,IMU_ABSOLUTE_UNAVAILABLE");
         } else if (_imu && _imu->ageMs(now) > SAFE_IMU_AGE_MS) {
             sendText(client, "ERR,IMU_STALE");
         } else if (_rtcm && _rtcm->transportAgeMs(now) > SAFE_RTK_AGE_MS) {

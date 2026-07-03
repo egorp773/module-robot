@@ -148,12 +148,39 @@ static bool checkFollowerProgress(const Estimate& e, float commandedSpeed) {
     return true;
 }
 
-static bool waitForInitialImuHeading(uint32_t timeoutMs) {
+static bool waitForInitialAbsoluteHeading(uint32_t timeoutMs, float& outHeadingDeg) {
     uint32_t start = millis();
+    uint32_t stableSince = 0;
+    float firstHeading = 0.0f;
+    bool haveFirst = false;
     while ((uint32_t)(millis() - start) < timeoutMs) {
         g_imu.loop();
         uint32_t now = millis();
-        if (g_imu.fresh() && g_imu.yawAgeMs(now) < SAFE_IMU_AGE_MS) {
+        if (!g_imu.fresh() || g_imu.yawAgeMs(now) >= SAFE_IMU_AGE_MS) {
+            delay(10);
+            continue;
+        }
+        if (g_imu.headingState() != ImuHeadingState::IMU_ABSOLUTE_OK ||
+            !g_imu.yawAbsoluteValid() ||
+            g_imu.yawAccRad() > IMU_ABS_YAW_MAX_ACC_RAD) {
+            delay(10);
+            continue;
+        }
+        float cur = g_imu.yawDeg();
+        if (!haveFirst) {
+            firstHeading = cur;
+            stableSince = now;
+            haveFirst = true;
+        }
+        if (fabsf(wrapDeg180Local(cur - firstHeading)) > IMU_STARTUP_MAX_JUMP_DEG) {
+            firstHeading = cur;
+            stableSince = now;
+            haveFirst = false;
+            delay(10);
+            continue;
+        }
+        if (stableSince != 0 && (now - stableSince) >= IMU_STARTUP_STATIONARY_MS) {
+            outHeadingDeg = cur;
             return true;
         }
         delay(10);
@@ -441,17 +468,19 @@ void setup() {
     g_imu.begin(PIN_IMU_SDA, PIN_IMU_SCL);
     g_gnss.begin(F9pSerial, GNSS_ROVER);
     g_est.begin();
-    if (waitForInitialImuHeading(1500)) {
-        g_est.seedHeadingDeg(g_imu.yawDeg());
-        Serial.printf("[ROVER] heading seed: %.1f° (IMU corrected, raw=%.1f rotOffset=%.1f adjust=%.1f mag=%d acc=%.2f)\n",
-                      (double)g_imu.yawDeg(), (double)g_imu.rawYawDeg(),
-                      (double)IMU_ROT_YAW_OFFSET_DEG, (double)IMU_COMPASS_YAW_ADJUST_DEG,
+    float startupHeading = 0.0f;
+    if (waitForInitialAbsoluteHeading(IMU_STARTUP_WAIT_MS, startupHeading)) {
+        g_est.seedHeadingDeg(startupHeading, g_imu.yawSource());
+        Serial.printf("[ROVER] heading seed: %.1f° source=%d abs=1 raw=%.1f mount=%.1f sign=%.1f mag=%d acc=%.2f state=%d\n",
+                      (double)startupHeading, (int)g_imu.yawSource(),
+                      (double)g_imu.rawYawDeg(),
+                      (double)IMU_ROT_YAW_OFFSET_DEG,
+                      (double)IMU_ROT_YAW_SIGN,
                       g_imu.yawFromMag() ? 1 : 0,
-                      (double)g_imu.yawAccRad());
+                      (double)g_imu.yawAccRad(),
+                      (int)g_imu.headingState());
     } else {
-        g_est.seedHeadingDeg(ROVER_INITIAL_HEADING_DEG);
-        Serial.printf("[ROVER] heading seed: %.1f° (fallback, IMU unavailable)\n",
-                      (double)ROVER_INITIAL_HEADING_DEG);
+        Serial.println("[IMU] absolute heading unavailable; game vector is relative; route start blocked");
     }
     g_route.begin();
     g_safety.begin();
@@ -480,11 +509,19 @@ void loop() {
         if (n > 0) {
             buf[n] = 0;
             if (strcmp(buf, "CAL") == 0) {
-                float cur = g_imu.yawDeg();
-                g_est.seedHeadingDeg(cur);
-                g_follow.reset();
-                Serial.printf("[CAL] estimator reseeded from absolute imuYaw=%.1f\n",
-                              (double)cur);
+                roverdbg::handleCal();
+            } else if (strcmp(buf, "IMU_STATUS") == 0) {
+                Serial.println(roverdbg::imuStatusLine());
+            } else if (strcmp(buf, "IMU_CAL_START") == 0) {
+                Serial.println(roverdbg::imuCalStartLine());
+            } else if (strcmp(buf, "IMU_CAL_SAVE") == 0) {
+                Serial.println(roverdbg::imuCalSaveLine());
+            } else if (strcmp(buf, "IMU_CAL_CLEAR") == 0) {
+                Serial.println(roverdbg::imuCalClearLine());
+            } else if (strcmp(buf, "IMU_TARE_YAW") == 0) {
+                Serial.println(roverdbg::imuTareYawLine());
+            } else if (strcmp(buf, "IMU_TARE_PERSIST") == 0) {
+                Serial.println(roverdbg::imuTarePersistLine());
             } else if (strcmp(buf, "GO") == 0) {
                 roverdbg::handleGoForward(ROVER_GO_DEFAULT_DISTANCE_M);
             } else if (strncmp(buf, "GO_FORWARD", 10) == 0) {
@@ -531,8 +568,8 @@ void loop() {
             g_gnss.lastNumSv(), g_gnss.lastPDop());
     }
     g_est.onImu(now, g_imu.yawRateDps(), g_imu.fresh() && g_imu.ageMs(now) < SAFE_IMU_AGE_MS,
-                g_imu.yawDeg(), g_imu.yawAgeMs(now) < SAFE_IMU_AGE_MS,
-                g_imu.yawAccRad());
+                g_imu.yawDeg(), g_imu.yawAbsoluteValid(),
+                g_imu.yawAccRad(), g_imu.yawSource(), g_imu.yawIsAbsolute());
     // Hoverboard feedback → EKF predict. TX-задача на ядре 0 обновляет _fb в Motor;
     // здесь читаем актуальные обороты. Если feedback ещё не пришёл, шлёт 0/0.
     g_est.onHoverboardFeedback(now, g_motor.speedLeftMeas(), g_motor.speedRightMeas());
@@ -628,7 +665,10 @@ void loop() {
             g_route.isRunning() ? "RUNNING" :
             g_follow.arrived ? "ARRIVED" : "IDLE";
         Serial.printf("[NAVV2] timestamp=%lu lat=%.8f lon=%.8f x=%.3f y=%.3f "
-                      "imuYaw=%.1f imuMag=%d imuAcc=%.2f estimatorHeading=%.1f "
+                      "imuYaw=%.1f imuRawYaw=%.1f imuState=%d imuSource=%d imuAbs=%d "
+                      "imuMag=%d imuMagNorm=%.2f imuMagX=%.2f imuMagY=%.2f imuMagZ=%.2f "
+                      "imuAcc=%.2f estimatorHeading=%.1f "
+                      "headingUsed=%d absYaw=%.1f absYawValid=%d "
                       "target_x=%.3f target_y=%.3f target_heading=%.1f "
                       "heading_error=%.1f distance=%.3f "
                       "left_cmd=%d right_cmd=%d waypoint_index=%d/%d "
@@ -637,8 +677,11 @@ void loop() {
                       "speed=%.2f pvtAge=%u rtcmAge=%lu imuAge=%u "
                       "safety=%d reason=%s fault=%s\n",
             (unsigned long)now, e.lat, e.lon, e.x, e.y,
-            g_imu.yawDeg(), g_imu.yawFromMag() ? 1 : 0, g_imu.yawAccRad(),
-            e.headingFiltDeg,
+            g_imu.yawDeg(), g_imu.rawYawDeg(), (int)g_imu.headingState(), (int)g_imu.yawSource(), g_imu.yawAbsoluteValid() ? 1 : 0,
+            g_imu.yawFromMag() ? 1 : 0, g_imu.magNorm(),
+            g_imu.magX(), g_imu.magY(), g_imu.magZ(),
+            g_imu.yawAccRad(), e.headingFiltDeg,
+            e.headingUsedByEstimator ? 1 : 0, e.absYawDeg, e.absYawValid ? 1 : 0,
             g_follow.targetX, g_follow.targetY, g_follow.targetHeadingDeg,
             g_follow.headingErr, g_follow.distToTarget,
             g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
@@ -686,12 +729,18 @@ static void currentMagPairs(float& mxy, float& myx, float& mxz,
     mzy = pairHeadingDeg(mz, my);
 }
 
-void handleCal() {
+bool handleCal() {
+    if (!g_imu.yawAbsoluteValid() || g_imu.headingState() != ImuHeadingState::IMU_ABSOLUTE_OK) {
+        Serial.printf("[CAL] refusing: absolute heading unavailable state=%d source=%d acc=%.2f\n",
+                      (int)g_imu.headingState(), (int)g_imu.yawSource(), g_imu.yawAccRad());
+        return false;
+    }
     float cur = g_imu.yawDeg();
-    g_est.seedHeadingDeg(cur);
+    g_est.seedHeadingDeg(cur, g_imu.yawSource());
     g_follow.reset();
-    Serial.printf("[CAL] estimator reseeded from absolute imuYaw=%.1f\n",
-                  (double)cur);
+    Serial.printf("[CAL] estimator reseeded from absolute imuYaw=%.1f source=%d\n",
+                  (double)cur, (int)g_imu.yawSource());
+    return true;
 }
 
 bool handleGo() {
@@ -702,25 +751,39 @@ static bool goPrecheck() {
     // Жёсткий гейт: если IMU не отвечает дольше 500мс — отказываем.
     // Иначе heading "застрянет" на старом значении, Stanley поведёт не туда,
     // и робот развернётся при старте. Это страховка от I2C-зависания BNO085.
-    {
-        uint32_t tNow = millis();
-        if (g_imu.ageMs(tNow) > 500u || !g_imu.fresh()) {
-            Serial.printf("[GO] refusing: IMU dead (age=%u fresh=%d)\n",
-                          (unsigned)g_imu.ageMs(tNow), g_imu.fresh() ? 1 : 0);
-            return false;
-        }
+    uint32_t tNow = millis();
+    if (g_imu.ageMs(tNow) > SAFE_IMU_AGE_MS || !g_imu.fresh()) {
+        Serial.printf("[GO] refusing: IMU dead (age=%u fresh=%d)\n",
+                      (unsigned)g_imu.ageMs(tNow), g_imu.fresh() ? 1 : 0);
+        return false;
+    }
+    if (!ImuMath::canUseAbsoluteYawForNav(
+            g_imu.headingState(),
+            g_imu.yawAbsoluteValid(),
+            g_imu.yawAccRad(),
+            g_imu.yawAgeMs(tNow),
+            SAFE_IMU_AGE_MS)) {
+        Serial.printf("[GO] refusing: absolute yaw unavailable state=%d source=%d acc=%.2f\n",
+                      (int)g_imu.headingState(), (int)g_imu.yawSource(), g_imu.yawAccRad());
+        return false;
+    }
+    if (!g_est.get().headingValid) {
+        Serial.println("[GO] refusing: estimator heading is not seeded");
+        return false;
     }
     // Диагностика перед запуском — что может блокировать движение.
     const auto& e = g_est.get();
     uint32_t now = millis();
-    Serial.printf("[GO] precheck: sol=%d hAcc=%.3f imuYaw=%.1f mag=%d acc=%.2f "
+    Serial.printf("[GO] precheck: sol=%d hAcc=%.3f imuYaw=%.1f source=%d abs=%d state=%d mag=%d acc=%.2f "
                   "imuAge=%u pvtAge=%u rtcmAge=%lu motFB=%d "
-                  "wsConn=%d navReq=%d safety=%d reason=%s\n",
+                  "headingValid=%d wsConn=%d navReq=%d safety=%d reason=%s\n",
                   (int)e.sol, e.hAcc, g_imu.yawDeg(),
-                  g_imu.yawFromMag() ? 1 : 0, g_imu.yawAccRad(),
+                  (int)g_imu.yawSource(), g_imu.yawAbsoluteValid() ? 1 : 0,
+                  (int)g_imu.headingState(), g_imu.yawFromMag() ? 1 : 0, g_imu.yawAccRad(),
                   g_imu.ageMs(now), e.pvtAgeMs,
                   g_rtcm.transportAgeMs(now),
                   g_motor.haveFeedback() ? 1 : 0,
+                  e.headingValid ? 1 : 0,
                   g_ws.isConnected() ? 1 : 0,
                   g_ws.navRequested() ? 1 : 0,
                   (int)g_safety.level(), g_safety.reason());
@@ -785,8 +848,9 @@ String imuZeroLine() {
     s_imuZeroed = true;
     char buf[420];
     snprintf(buf, sizeof(buf),
-             "IMU_ZERO,yaw=%.1f,raw=%.1f,game=%.1f,rot=%.1f,geo=%.1f,"
+             "IMU_ZERO,state=%d,source=%d,abs=%d,yaw=%.1f,raw=%.1f,game=%.1f,rot=%.1f,geo=%.1f,"
              "mag=%.2f/%.2f/%.2f,gint=%.1f/%.1f/%.1f,cnt=%lu/%lu/%lu/%lu/%lu",
+             (int)g_imu.headingState(), (int)g_imu.yawSource(), g_imu.yawAbsoluteValid() ? 1 : 0,
              s0Yaw, s0Raw, s0Game, s0Rot, s0Geo,
              g_imu.magX(), g_imu.magY(), g_imu.magZ(), s0Gx, s0Gy, s0Gz,
              (unsigned long)s0CntMag, (unsigned long)s0CntGeo,
@@ -804,12 +868,13 @@ String imuDiagLine() {
     char buf[760];
     snprintf(buf, sizeof(buf),
              "IMU_DIAG,"
-             "dYaw=%.1f,dRaw=%.1f,dGame=%.1f,dRot=%.1f,dGeo=%.1f,"
+             "state=%d,source=%d,abs=%d,dYaw=%.1f,dRaw=%.1f,dGame=%.1f,dRot=%.1f,dGeo=%.1f,"
              "dGx=%.1f,dGy=%.1f,dGz=%.1f,"
              "dMxy=%.1f,dMyx=%.1f,dMxz=%.1f,dMzx=%.1f,dMyz=%.1f,dMzy=%.1f,"
              "rate=%.1f/%.1f/%.1f,"
              "age=%u,cnt=%lu/%lu/%lu/%lu/%lu,"
              "nowYaw=%.1f,raw=%.1f,game=%.1f,rot=%.1f,geo=%.1f,mag=%.2f/%.2f/%.2f",
+             (int)g_imu.headingState(), (int)g_imu.yawSource(), g_imu.yawAbsoluteValid() ? 1 : 0,
              wrapDeg180Local(g_imu.yawDeg() - s0Yaw),
              wrapDeg180Local(g_imu.rawYawDeg() - s0Raw),
              wrapDeg180Local(g_imu.gameYawDeg() - s0Game),
@@ -835,6 +900,63 @@ String imuDiagLine() {
              g_imu.rotYawDeg(), g_imu.geoYawDeg(),
              g_imu.magX(), g_imu.magY(), g_imu.magZ());
     return String(buf);
+}
+
+String imuStatusLine() {
+    char buf[520];
+    snprintf(buf, sizeof(buf),
+             "IMU_STATUS,state=%d,stateName=%s,source=%d,sourceName=%s,abs=%d,disturbed=%d,acc=%.2f,"
+             "yaw=%.1f,raw=%.1f,sourceYaw=%.1f,absYaw=%.1f,magNorm=%.2f,mag=%.2f/%.2f/%.2f,"
+             "stability=%.1f,age=%u,headingAge=%u,gyroRate=%.1f,estUsed=%d",
+             (int)g_imu.headingState(), ImuMath::headingStateName(g_imu.headingState()),
+             (int)g_imu.yawSource(), ImuMath::yawSourceName(g_imu.yawSource()),
+             g_imu.yawAbsoluteValid() ? 1 : 0, g_imu.magDisturbed() ? 1 : 0, g_imu.yawAccRad(),
+             g_imu.yawDeg(), g_imu.rawYawDeg(), g_imu.sourceYawDeg(), g_imu.absYawDeg(),
+             g_imu.magNorm(), g_imu.magX(), g_imu.magY(), g_imu.magZ(),
+             g_imu.startupAbsDeltaDeg(), (unsigned)g_imu.ageMs(millis()),
+             (unsigned)g_imu.yawAgeMs(millis()), g_imu.yawRateDps(),
+             g_est.get().headingUsedByEstimator ? 1 : 0);
+    return String(buf);
+}
+
+String imuCalStartLine() {
+    String err;
+    if (g_imu.startCalibration(&err)) {
+        return String("IMU_CAL_START,OK");
+    }
+    return String("IMU_CAL_START,ERR,") + err;
+}
+
+String imuCalSaveLine() {
+    String err;
+    if (g_imu.saveCalibration(&err)) {
+        return String("IMU_CAL_SAVE,OK");
+    }
+    return String("IMU_CAL_SAVE,ERR,") + err;
+}
+
+String imuCalClearLine() {
+    String err;
+    if (g_imu.clearCalibration(&err)) {
+        return String("IMU_CAL_CLEAR,OK");
+    }
+    return String("IMU_CAL_CLEAR,ERR,") + err;
+}
+
+String imuTareYawLine() {
+    String err;
+    if (g_imu.tareYaw(false, &err)) {
+        return String("IMU_TARE_YAW,OK");
+    }
+    return String("IMU_TARE_YAW,ERR,") + err;
+}
+
+String imuTarePersistLine() {
+    String err;
+    if (g_imu.tareYaw(true, &err)) {
+        return String("IMU_TARE_PERSIST,OK");
+    }
+    return String("IMU_TARE_PERSIST,ERR,") + err;
 }
 
 }  // namespace roverdbg

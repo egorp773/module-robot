@@ -5,6 +5,7 @@
 #include "StateEstimator.h"
 #include "RtkConfig.h"
 #include "NavMath.h"
+#include "ImuMath.h"
 
 void StateEstimator::begin() {
     est = Estimate{};
@@ -61,12 +62,18 @@ bool StateEstimator::setOrigin(double lat, double lon) {
     return true;
 }
 
-void StateEstimator::seedHeadingDeg(float headingDeg) {
+void StateEstimator::seedHeadingDeg(float headingDeg, ImuYawSource yawSource) {
     uint32_t nowMs = millis();
-    float h = normalizeDeg360(headingDeg);
+    float h = ImuMath::normalizeDeg360(headingDeg);
+    const bool sourceAbsolute = ImuMath::yawSourceIsAbsolute(yawSource);
     est.headingDeg = h;
     est.headingFiltDeg = h;
     est.headingValid = true;
+    est.absYawDeg = h;
+    est.absYawValid = sourceAbsolute;
+    est.yawIsAbsolute = sourceAbsolute;
+    est.yawSource = yawSource;
+    est.headingUsedByEstimator = sourceAbsolute;
     est.acceptedPositionAgeMs = (_lastAcceptedPositionMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastAcceptedPositionMs);
     est.headingAgeMs = (_lastHeadingMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastHeadingMs);
     _lastHeadingMs = nowMs;
@@ -84,7 +91,8 @@ void StateEstimator::seedHeadingDeg(float headingDeg) {
 // GPS course-over-ground fusion is temporarily disabled in onPvt().
 // Kalman корректно работает даже когда PVT запаздывает — heading не «прыгает».
 void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh,
-                           float absYawDeg, bool absYawValid, float absYawAccRad) {
+                           float absYawDeg, bool absYawValid, float absYawAccRad,
+                           ImuYawSource yawSource, bool yawIsAbsolute) {
     if (!imuFresh) { _lastImuMs = nowMs; return; }
     _lastImuMs = nowMs;
     float yawRateRadps = yawRateDps * 0.01745329f;   // deg/s → rad/s
@@ -106,17 +114,28 @@ void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh,
         _ekf.predict(dt, v_mps, omega_radps, yawRateRadps);
     }
 
-    if (_headingSeeded && absYawValid) {
-        float yawRad = normalizeDeg360(absYawDeg) * 0.01745329f;
+    est.absYawDeg = ImuMath::normalizeDeg360(absYawDeg);
+    est.absYawValid = absYawValid &&
+                      yawIsAbsolute &&
+                      ImuMath::yawSourceIsAbsolute(yawSource) &&
+                      absYawAccRad <= IMU_ABS_YAW_MAX_ACC_RAD;
+    est.absYawAccRad = absYawAccRad;
+    est.yawSource = yawSource;
+    est.yawIsAbsolute = yawIsAbsolute;
+
+    bool headingUsed = false;
+    if (_headingSeeded && est.absYawValid) {
+        float yawRad = est.absYawDeg * 0.01745329f;
         float covRad2 = absYawAccRad * absYawAccRad;
         if (covRad2 < 0.0004f) covRad2 = 0.0004f;  // ~1.1 deg minimum
         if (covRad2 > 2.0f) covRad2 = 2.0f;
-        _ekf.updateHeading(yawRad, covRad2, true);
+        headingUsed = _ekf.updateHeading(yawRad, covRad2, true);
     }
+    est.headingUsedByEstimator = headingUsed;
 
     if (_headingSeeded) {
         float hDeg = _ekf.heading() * 57.2957795f;
-        hDeg = normalizeDeg360(hDeg);
+        hDeg = ImuMath::normalizeDeg360(hDeg);
         est.headingFiltDeg = hDeg;
         est.headingValid = true;
         est.headingAgeMs = 0;
@@ -203,8 +222,8 @@ void StateEstimator::onPvt(uint32_t nowMs,
     // --- Курс: raw GPS course only for telemetry ---
     // U-blox headMot is course-over-ground. At rover speed it is often dominated
     // by RTK position jitter, so it must not correct EKF heading for now.
-    est.headingDeg = (float)headMot_deg_e5 * 1e-5f;   // сырой GPS-курс только для ТЕЛЕМЕТРИИ
-    est.headingDeg = normalizeDeg360(est.headingDeg);
+    est.headingDeg = (float)headMot_deg_e5 * 1e-5f;   // сырой GPS-курс только для телеметрии
+    est.headingDeg = ImuMath::normalizeDeg360(est.headingDeg);
 
     // GPS course-over-ground fusion is intentionally disabled for now.
     // At low rover speed headMot is dominated by RTK position jitter; heading is
@@ -214,7 +233,7 @@ void StateEstimator::onPvt(uint32_t nowMs,
     // heading look fresh. GPS course fusion is disabled.
     if (_headingSeeded) {
         float hDeg = _ekf.heading() * 57.2957795f;
-        hDeg = normalizeDeg360(hDeg);
+        hDeg = ImuMath::normalizeDeg360(hDeg);
         est.headingFiltDeg = hDeg;
         est.headingValid = true;
     }

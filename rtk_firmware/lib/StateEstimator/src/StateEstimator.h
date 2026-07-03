@@ -3,6 +3,7 @@
 #pragma once
 #include <Arduino.h>
 #include "RtkEkf.h"
+#include "ImuMath.h"
 
 enum SolType : uint8_t {
     SOL_INVALID = 0,
@@ -22,6 +23,12 @@ struct Estimate {
     float   speedMps = 0;     // 2D ground speed
     float   headingDeg = 0;   // 0..360, GPS heading (motion-based)
     bool    headingValid = false;
+    float   absYawDeg = 0;
+    bool    absYawValid = false;
+    float   absYawAccRad = 999;
+    ImuYawSource yawSource = ImuYawSource::NONE;
+    bool    yawIsAbsolute = false;
+    bool    headingUsedByEstimator = false;
     // quality
     SolType sol = SOL_INVALID;
     int     numSv = 0;
@@ -72,12 +79,13 @@ public:
     // absYawDeg/absYawValid — абсолютный курс от магнитометра (0..360 CW от севера):
     // если валиден, подаётся в EKF как measurement update и убирает дрейф/ошибку seed.
     void onImu(uint32_t nowMs, float yawRateDps, bool imuFresh,
-               float absYawDeg = 0.0f, bool absYawValid = false, float absYawAccRad = 999.0f);
+               float absYawDeg = 0.0f, bool absYawValid = false, float absYawAccRad = 999.0f,
+               ImuYawSource yawSource = ImuYawSource::NONE, bool yawIsAbsolute = false);
 
     // origin для перевода lat/lon → x/y
     bool setOrigin(double lat, double lon);
     void clearOrigin() { est.originSet = false; }
-    void seedHeadingDeg(float headingDeg);   // абсолютная калибровка курса (CAL_HEADING)
+    void seedHeadingDeg(float headingDeg, ImuYawSource yawSource = ImuYawSource::NONE);   // абсолютная калибровка курса (CAL_HEADING)
 
     const Estimate& get() const { return est; }
 

@@ -9,6 +9,7 @@ import '../../core/wifi_connection.dart';
 import '../../core/map_storage.dart';
 import '../../core/cleaning_route_planner.dart';
 import '../../core/gps_display_math.dart';
+import '../../core/nav_run_tracker.dart';
 import '../manual/manual_control_screen.dart';
 import '../home/home_screen.dart' show batteryPercentProvider;
 
@@ -66,6 +67,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   bool _navCommandSending = false;
   int _routeSendProgress = 0;
   String? _routeWorkflowError;
+  NavRunTracker? _navRunTracker;
 
   // Состояние для управления картой
   double _zoom = 1.0;
@@ -601,6 +603,14 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     try {
       await ref.read(wifiConnectionProvider.notifier).sendNavStart();
       if (!mounted) return;
+      final map = _mapState;
+      if (map != null && map.refLat != null && map.refLon != null) {
+        _navRunTracker = NavRunTracker(
+          originLat: map.refLat!,
+          originLon: map.refLon!,
+        )..begin();
+        _navRunTracker?.observe(ref.read(wifiConnectionProvider));
+      }
     } catch (e) {
       final err = 'NAV_START failed: $e';
       if (mounted) setState(() => _routeWorkflowError = err);
@@ -687,6 +697,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         _routeSent = false;
         _routeWorkflowError = 'Stopped: send the route again before Start.';
       });
+      _finalizeRunFeedback(ref, endReason: 'NAV_STOP');
       _showNotice(
         ref,
         title: 'Stopped',
@@ -718,6 +729,105 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         );
   }
 
+  bool _isActiveNavState(String? navState) {
+    switch (navState?.toUpperCase()) {
+      case 'RUNNING':
+      case 'APPROACHING':
+      case 'PAUSED':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  void _finalizeRunFeedback(WidgetRef ref, {required String endReason}) {
+    final tracker = _navRunTracker;
+    if (tracker == null) return;
+    _navRunTracker = null;
+
+    final summary = tracker.finish();
+    final summaryText = summary?.shortText ??
+        'Недостаточно точек для уверенного разбора.';
+
+    ref.read(wifiConnectionProvider.notifier).addLocalLog(
+          'RUN_SUMMARY end=$endReason $summaryText',
+        );
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _showRunFeedbackDialog(
+        ref,
+        endReason: endReason,
+        summaryText: summaryText,
+      );
+    });
+  }
+
+  Future<void> _showRunFeedbackDialog(
+    WidgetRef ref, {
+    required String endReason,
+    required String summaryText,
+  }) async {
+    final controller = TextEditingController(text: summaryText);
+    final result = await showDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Как робот поехал?'),
+          content: SizedBox(
+            width: 420,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Стоп: $endReason'),
+                const SizedBox(height: 8),
+                Text(
+                  summaryText,
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: controller,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    labelText: 'Опишите фактический маршрут',
+                    hintText: 'например: вперед, налево, вперед, налево, стоп',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Пропустить'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(controller.text),
+              child: const Text('Сохранить'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+
+    final text = result?.trim();
+    if (text == null || text.isEmpty) return;
+    ref.read(wifiConnectionProvider.notifier).addLocalLog('RUN_FEEDBACK $text');
+    if (mounted) {
+      _showNotice(
+        ref,
+        title: 'Feedback saved',
+        message: text,
+        kind: NoticeKind.info,
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     ref.listen<WifiConnectionState>(wifiConnectionProvider, (previous, next) {
@@ -726,6 +836,15 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           _routeSent = false;
           _routeWorkflowError = 'Connection lost: send the route again.';
         });
+      }
+      _navRunTracker?.observe(next);
+      if (_navRunTracker != null && (previous?.isConnected ?? false) && !next.isConnected) {
+        _finalizeRunFeedback(ref, endReason: 'DISCONNECT');
+      }
+      if (_navRunTracker != null &&
+          _isActiveNavState(previous?.navState) &&
+          !_isActiveNavState(next.navState)) {
+        _finalizeRunFeedback(ref, endReason: next.navState ?? 'IDLE');
       }
     });
     final wifi = ref.watch(wifiConnectionProvider);

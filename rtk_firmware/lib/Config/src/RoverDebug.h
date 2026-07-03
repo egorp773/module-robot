@@ -7,8 +7,8 @@
 
 namespace roverdbg {
 
-// CAL: текущий imuYaw посеять как head=0.
-void handleCal();
+// CAL: reseed estimator from absolute IMU heading if it is ready.
+bool handleCal();
 
 // GO: CAL + маршрут (0,0) → (0,3) с boundary 4×4 вокруг + старт.
 // Возвращает true если маршрут сформирован и запущен.
@@ -24,5 +24,11 @@ void setLogEnabled(bool enabled);
 String diagLine();
 String imuZeroLine();
 String imuDiagLine();
+String imuStatusLine();
+String imuCalStartLine();
+String imuCalSaveLine();
+String imuCalClearLine();
+String imuTareYawLine();
+String imuTarePersistLine();
 
 }  // namespace roverdbg

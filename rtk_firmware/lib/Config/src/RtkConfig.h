@@ -14,8 +14,28 @@
 #define PIN_RELAY_MOUNT   33
 // Пины 25/26/27 — раньше I2S звук (sound.ino). Звук не используется, пины свободны.
 
-// Знак оси yaw-rate BNO085 относительно heading (0..360, по часовой).
-// +1 или -1 — ВЫВЕРИТЬ на железе: повернуть робота по часовой, yawRateDps должен быть > 0.
+// BNO085 heading conventions.
+// Raw BNO yaw is converted only by ImuMath::imuRawToRobotHeadingDeg():
+//   robotHeading = normalize(IMU_ROT_YAW_SIGN * rawYaw +
+//                            IMU_ROT_YAW_OFFSET_DEG +
+//                            IMU_COMPASS_YAW_ADJUST_DEG)
+// Project convention: x=East, y=North, 0=North, 90=East, clockwise-positive.
+#define IMU_ROT_YAW_SIGN          (-1.0f)
+#define IMU_ROT_YAW_OFFSET_DEG    172.0f
+#define IMU_COMPASS_YAW_ADJUST_DEG  7.7f
+
+// Startup/runtime absolute heading gates.
+#define IMU_ABS_YAW_MAX_ACC_RAD              0.5f
+#define IMU_ABS_CANDIDATE_RESET_DELTA_DEG   12.0f
+#define IMU_ABS_STARTUP_STABLE_MS         1500u
+#define IMU_ABS_STARTUP_MAX_DELTA_DEG       10.0f
+#define IMU_STARTUP_WAIT_MS               4000u
+#define IMU_STARTUP_STATIONARY_MS         1200u
+#define IMU_STARTUP_MAX_JUMP_DEG             5.0f
+#define IMU_MAG_DISTURBANCE_RATIO            0.25f
+
+// Sign of BNO085 yaw-rate relative to heading (0..360, clockwise-positive).
+// Verify on hardware: turn the rover clockwise, yawRateDps must be > 0.
 #define IMU_YAW_RATE_SIGN  (-1)
 
 // ---------------- Serial baud ----------------
@@ -83,18 +103,6 @@
 #define ROVER_KEEPALIVE_PULSE_PCT  3
 #define ROVER_KEEPALIVE_PULSE_MS   2000u
 #define ROVER_INITIAL_HEADING_DEG 124.0f  // fallback, если IMU не дала heading при старте
-// IMU yaw calibration: 17.06.2026, magnetic-field raw heading.
-// При реальном heading ~259° calibrated magnetometer raw≈102°.
-// Формула heading = offset - raw: offset = 259 + 102 = 361° == 1°.
-#define IMU_YAW_OFFSET_DEG   1.0f
-// RotationVector yaw на этом монтаже убывает при повороте робота по часовой.
-// Heading для навигации: normalize(IMU_ROT_YAW_OFFSET_DEG - rotYaw).
-// 90° сохраняет текущую грубую абсолютную ориентацию после перехода с raw mag.
-#define IMU_ROT_YAW_OFFSET_DEG 172.0f
-// 2026-07-03 field correction after BNO source settled:
-// telemetry showed imuYaw=230.6 while the rover nose was physically about 180 deg.
-// Applied after mount transform.
-#define IMU_COMPASS_YAW_ADJUST_DEG 7.7f
 #define ROVER_ARRIVAL_RADIUS 0.10f
 #define ROVER_ARRIVAL_CONFIRM_S 1.5f
 // Lookahead для Stanley: целевая точка берётся НА СЕГМЕНТЕ на расстоянии lookahead

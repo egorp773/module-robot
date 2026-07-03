@@ -18,7 +18,12 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
         set(SAFETY_ESTOP, "ws_disconnected");
         return;
     }
-    if (in.navRequested && in.lastCmdMs != 0 && (nowMs - in.lastCmdMs) > SAFE_NAV_TIMEOUT_MS) {
+    // WebSocket callbacks run asynchronously. A callback can store lastCmdMs
+    // a few milliseconds after the main loop captured nowMs. Guard the
+    // subtraction to avoid unsigned underflow and an immediate false timeout.
+    if (in.navRequested && in.lastCmdMs != 0 &&
+        nowMs >= in.lastCmdMs &&
+        (nowMs - in.lastCmdMs) > SAFE_NAV_TIMEOUT_MS) {
         set(SAFETY_ESTOP, "nav_cmd_timeout");
         return;
     }
@@ -55,6 +60,15 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
         }
         if (!in.routeReady) {
             set(SAFETY_HOLD, "no_route");
+            return;
+        }
+        if (!ImuMath::canUseAbsoluteYawForNav(
+                imu.headingState(),
+                imu.yawAbsoluteValid(),
+                imu.yawAccRad(),
+                imu.yawAgeMs(nowMs),
+                SAFE_IMU_AGE_MS)) {
+            set(SAFETY_HOLD, "imu_no_absolute_heading");
             return;
         }
         if (in.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {

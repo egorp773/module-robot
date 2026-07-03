@@ -43,8 +43,13 @@ int main() {
 
     fakeMillis = 100;
     estimator.onImu(
-        fakeMillis, 0.0f, true, 90.0f, true, 0.03f);
+        fakeMillis, 0.0f, true, 90.0f, true, 0.03f,
+        ImuYawSource::ROTATION_VECTOR, true);
     assert(estimator.get().headingValid);
+    assert(estimator.get().yawSource == ImuYawSource::ROTATION_VECTOR);
+    assert(estimator.get().yawIsAbsolute);
+    assert(estimator.get().absYawValid);
+    assert(estimator.get().headingUsedByEstimator);
     expectNear(estimator.get().headingFiltDeg, 90.0f, 2.0f);
 
     const float beforeGpsCourse = estimator.get().headingFiltDeg;
@@ -62,8 +67,47 @@ int main() {
     invalidAbsoluteYaw.seedHeadingDeg(0.0f);
     fakeMillis = 100;
     invalidAbsoluteYaw.onImu(
-        fakeMillis, 0.0f, true, 90.0f, false, 0.03f);
+        fakeMillis, 0.0f, true, 90.0f, false, 0.03f,
+        ImuYawSource::ROTATION_VECTOR, true);
     expectNear(invalidAbsoluteYaw.get().headingFiltDeg, 0.0f, 0.1f);
+    assert(!invalidAbsoluteYaw.get().headingUsedByEstimator);
+
+    StateEstimator badAccuracyYaw;
+    fakeMillis = 0;
+    badAccuracyYaw.begin();
+    badAccuracyYaw.seedHeadingDeg(0.0f);
+    fakeMillis = 100;
+    badAccuracyYaw.onImu(
+        fakeMillis, 0.0f, true, 90.0f, true, 0.6f,
+        ImuYawSource::ROTATION_VECTOR, true);
+    expectNear(badAccuracyYaw.get().headingFiltDeg, 0.0f, 0.1f);
+    assert(!badAccuracyYaw.get().absYawValid);
+    assert(!badAccuracyYaw.get().headingUsedByEstimator);
+
+    StateEstimator gameYaw;
+    fakeMillis = 0;
+    gameYaw.begin();
+    gameYaw.seedHeadingDeg(0.0f);
+    fakeMillis = 100;
+    gameYaw.onImu(
+        fakeMillis, 0.0f, true, 123.0f, false, 0.5f,
+        ImuYawSource::GAME_ROTATION_VECTOR, false);
+    expectNear(gameYaw.get().headingFiltDeg, 0.0f, 0.1f);
+    assert(gameYaw.get().yawSource == ImuYawSource::GAME_ROTATION_VECTOR);
+    assert(!gameYaw.get().yawIsAbsolute);
+    assert(!gameYaw.get().absYawValid);
+    assert(!gameYaw.get().headingUsedByEstimator);
+
+    StateEstimator geomagAbsolute;
+    fakeMillis = 0;
+    geomagAbsolute.begin();
+    geomagAbsolute.seedHeadingDeg(10.0f);
+    fakeMillis = 100;
+    geomagAbsolute.onImu(
+        fakeMillis, 0.0f, true, 12.0f, true, 0.04f,
+        ImuYawSource::GEOMAGNETIC_ROTATION_VECTOR, true);
+    assert(geomagAbsolute.get().absYawValid);
+    assert(geomagAbsolute.get().headingUsedByEstimator);
 
     std::puts("StateEstimator absolute-yaw and GPS-course tests passed");
     return 0;
