@@ -54,8 +54,8 @@ class Ekf:
         if dt <= 0: return
         if dt > 0.5: dt = 0.5
         ch, sh = math.cos(self._h), math.sin(self._h)
-        self._x += v_mps * ch * dt
-        self._y += v_mps * sh * dt
+        self._x += v_mps * sh * dt
+        self._y += v_mps * ch * dt
         self._h += yawRateRadps * dt
         # wrap
         while self._h > math.pi: self._h -= 2*math.pi
@@ -65,10 +65,10 @@ class Ekf:
         # Jacobian F
         F = [[0]*5 for _ in range(5)]
         for i in range(5): F[i][i] = 1.0
-        F[0][2] = -v_mps * sh * dt
-        F[1][2] =  v_mps * ch * dt
-        F[0][3] =  ch * dt
-        F[1][3] =  sh * dt
+        F[0][2] =  v_mps * ch * dt
+        F[1][2] = -v_mps * sh * dt
+        F[0][3] =  sh * dt
+        F[1][3] =  ch * dt
         F[2][4] =  dt
 
         # Q
@@ -151,7 +151,7 @@ class Ekf:
 def test_straight_line():
     print("=== Test 1: straight line 10m with noisy GPS ===")
     ekf = Ekf()
-    ekf.reset(0, 0, 0)  # heading = 0 (East)
+    ekf.reset(0, 0, 0)  # heading = 0 (North)
     v = 0.25
     true_x, true_y = 0.0, 0.0
     true_h = 0.0
@@ -162,8 +162,8 @@ def test_straight_line():
     outlier_count = 0
     for t_ms in range(0, 40000, 20):  # 40 sec at 50Hz
         dt = 0.02
-        true_x += v * math.cos(true_h) * dt
-        true_y += v * math.sin(true_h) * dt
+        true_x += v * math.sin(true_h) * dt
+        true_y += v * math.cos(true_h) * dt
         # IMU predict
         ekf.predict(dt, v, 0.0, 0.0)
 
@@ -203,11 +203,11 @@ def test_outlier_rejection():
             print(f"  t=50: outlier at (5,0) -> updatePosition returned {result}")
             outlier_rejected = (not result)
         elif t % 10 == 0:
-            ekf.updatePosition(0.01 * t, 0.0, 0.0004, True)
+            ekf.updatePosition(0.0, 0.01 * t, 0.0004, True)
     assert outlier_rejected, "Outlier was NOT rejected!"
-    # После outlier позиция должна быть близка к (1, 0), не к (5, 0)
-    assert abs(ekf.x - 1.0) < 0.1, f"After outlier, ekf.x = {ekf.x} (expected ~1.0)"
-    print(f"  EKF x after outlier: {ekf.x:.3f} m (expected ~1.0)")
+    # После outlier позиция должна быть близка к (0, 1), не к (5, 0)
+    assert abs(ekf.y - 1.0) < 0.1, f"After outlier, ekf.y = {ekf.y} (expected ~1.0)"
+    print(f"  EKF y after outlier: {ekf.y:.3f} m (expected ~1.0)")
     print("  PASS")
 
 
@@ -223,7 +223,7 @@ def test_gps_outage():
 
     for t in range(50*5):  # 5 sec at 50Hz
         dt = 0.02
-        true_x += v_true * dt
+        true_y += v_true * dt
         ekf.predict(dt, v_true, 0.0, 0.0)
         if t > 50 and t < 100:
             gps_available = False

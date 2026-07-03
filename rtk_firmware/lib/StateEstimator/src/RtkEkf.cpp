@@ -68,15 +68,16 @@ void RtkEkf::predict(float dt, float v_mps, float omega_radps, float yawRateRadp
     if (dt > 0.5f) dt = 0.5f;   // guard against long pauses (boot, stall)
 
     // === State update (motion model) ===
-    // x' = x + v * cos(h) * dt
-    // y' = y + v * sin(h) * dt
+    // x' = x + v * sin(h) * dt
+    // y' = y + v * cos(h) * dt
+    // x = East, y = North, h=0 North, h=pi/2 East, clockwise-positive.
     // h' = h + yawRate * dt  (IMU gyro primary)
     // v' = v
     // w' = w
     float ch = cosf(_h);
     float sh = sinf(_h);
-    _x += v_mps * ch * dt;
-    _y += v_mps * sh * dt;
+    _x += v_mps * sh * dt;
+    _y += v_mps * ch * dt;
     _h += yawRateRadps * dt;
     // wrap heading to [-pi, pi]
     while (_h >  3.14159265f) _h -= 6.28318530f;
@@ -91,10 +92,10 @@ void RtkEkf::predict(float dt, float v_mps, float omega_radps, float yawRateRadp
     F[12] = 1;
     F[18] = 1;
     F[24] = 1;
-    matSet(F, 5, 0, 2, -v_mps * sh * dt);   // dx/dh
-    matSet(F, 5, 1, 2,  v_mps * ch * dt);   // dy/dh
-    matSet(F, 5, 0, 3,  ch * dt);           // dx/dv
-    matSet(F, 5, 1, 3,  sh * dt);           // dy/dv
+    matSet(F, 5, 0, 2,  v_mps * ch * dt);   // dx/dh
+    matSet(F, 5, 1, 2, -v_mps * sh * dt);   // dy/dh
+    matSet(F, 5, 0, 3,  sh * dt);           // dx/dv
+    matSet(F, 5, 1, 3,  ch * dt);           // dy/dv
     matSet(F, 5, 2, 4,  dt);                // dh/dw
 
     // === Process noise Q (diagonal) ===

@@ -418,9 +418,9 @@ void setup() {
     g_est.begin();
     if (waitForInitialImuHeading(1500)) {
         g_est.seedHeadingDeg(g_imu.yawDeg());
-        Serial.printf("[ROVER] heading seed: %.1f° (IMU corrected, raw=%.1f rotOffset=%.1f corr=%.1f mag=%d acc=%.2f)\n",
+        Serial.printf("[ROVER] heading seed: %.1f° (IMU corrected, raw=%.1f rotOffset=%.1f adjust=%.1f mag=%d acc=%.2f)\n",
                       (double)g_imu.yawDeg(), (double)g_imu.rawYawDeg(),
-                      (double)IMU_ROT_YAW_OFFSET_DEG, (double)IMU_COMPASS_CORRECTION_DEG,
+                      (double)IMU_ROT_YAW_OFFSET_DEG, (double)IMU_COMPASS_YAW_ADJUST_DEG,
                       g_imu.yawFromMag() ? 1 : 0,
                       (double)g_imu.yawAccRad());
     } else {

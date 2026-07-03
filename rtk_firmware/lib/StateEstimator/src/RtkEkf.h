@@ -1,5 +1,6 @@
 // RtkEkf.h — 5-state Extended Kalman Filter for RTK platform.
-// State: [x, y, heading, v, omega] (x/y in local meters, heading in radians).
+// State: [x, y, heading, v, omega].
+// x = East, y = North, heading radians: 0 = North, pi/2 = East, clockwise-positive.
 // Predict: odometry (v, omega from hoverboard feedback) + IMU gyro (heading).
 // Update:  RTK fix (x, y) + GPS motion heading (heading, only when moving).
 //

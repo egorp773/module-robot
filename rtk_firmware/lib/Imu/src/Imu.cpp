@@ -11,7 +11,7 @@ static float normalizeYawDeg(float yaw) {
 }
 
 static float correctedYawDeg(float bnoYaw) {
-    return normalizeYawDeg(IMU_ROT_YAW_OFFSET_DEG - bnoYaw - IMU_COMPASS_CORRECTION_DEG);
+    return normalizeYawDeg(IMU_ROT_YAW_OFFSET_DEG - bnoYaw + IMU_COMPASS_YAW_ADJUST_DEG);
 }
 
 bool Imu::begin(uint8_t sdaPin, uint8_t sclPin) {

@@ -91,9 +91,10 @@
 // Heading для навигации: normalize(IMU_ROT_YAW_OFFSET_DEG - rotYaw).
 // 90° сохраняет текущую грубую абсолютную ориентацию после перехода с raw mag.
 #define IMU_ROT_YAW_OFFSET_DEG 172.0f
-// 2026-07-03 field correction: BNO085 published 230.6 deg while the rover nose
-// was physically about 180 deg (south). Publish compass-like yaw = yaw - 50.6.
-#define IMU_COMPASS_CORRECTION_DEG 50.6f
+// 2026-07-03 field correction after BNO source settled:
+// telemetry showed imuYaw=230.6 while the rover nose was physically about 180 deg.
+// Applied after mount transform.
+#define IMU_COMPASS_YAW_ADJUST_DEG 7.7f
 #define ROVER_ARRIVAL_RADIUS 0.10f
 #define ROVER_ARRIVAL_CONFIRM_S 1.5f
 // Lookahead для Stanley: целевая точка берётся НА СЕГМЕНТЕ на расстоянии lookahead
