@@ -6,6 +6,12 @@
 
 #include "ImuMath.h"
 
+// Persistence namespace/key for the user heading correction.
+// On real ESP32 hardware this lives in NVS via Preferences; host tests
+// fall back to an in-memory default (see Imu.cpp).
+#define IMU_PREF_NAMESPACE        "imu"
+#define IMU_PREF_HEAD_CORR_KEY    "head_corr"
+
 class Imu {
 public:
     bool begin(uint8_t sdaPin, uint8_t sclPin);
@@ -62,6 +68,12 @@ public:
     uint32_t lastReportAgeMs(uint32_t nowMs) const { return ageMs(nowMs); }
 
     // Manual calibration helpers exposed to Serial/WebSocket.
+    //
+    // startCalibration() is non-blocking: sh2_startCal() runs in a
+    // dedicated FreeRTOS task on core 0 and we wait at most ~1500 ms
+    // for it. If the call hangs (BNO085 unresponsive, blocking retry
+    // loop inside the SH2 lib) we return IMU_CAL_START,ERR,timeout
+    // instead of stalling the rover loop.
     bool startCalibration(String* err = nullptr);
     bool saveCalibration(String* err = nullptr);
     bool clearCalibration(String* err = nullptr);
@@ -71,6 +83,45 @@ public:
     bool persistTare(String* err = nullptr);
     bool setDynamicCalibration(bool enabled, String* err = nullptr);
     bool saveDcdNow(String* err = nullptr);
+
+    // Status of the last IMU_CAL_START. Callers (rover.cpp, IMU_CAL_STATUS)
+    // read these to surface state machine diagnostics.
+    enum class CalStartState : uint8_t {
+        IDLE = 0,
+        RUNNING,
+        OK,
+        ERROR,
+        TIMEOUT,
+    };
+    CalStartState lastCalStartState() const { return _calStartState; }
+    uint32_t lastCalStartMs() const { return _calStartMs; }
+    int      lastCalStartRc() const { return _calStartRc; }
+
+    // Debug-only manual heading trust. Set by IMU_TRUST_CURRENT_HEADING_ONCE,
+    // cleared by IMU_CLEAR_MANUAL_HEADING_TRUST or any reboot. Not persisted.
+    // While true, NAV_START / goPrecheck are allowed to bypass the
+    // absolute-yaw gate (with a warning log).
+    bool manualYawTrusted() const { return _manualYawTrusted; }
+    float manualTrustedHeadingDeg() const { return _manualTrustedHeadingDeg; }
+    uint32_t manualTrustedAtMs() const { return _manualTrustedAtMs; }
+    void setManualYawTrusted(bool trusted, float headingDeg);
+    void clearManualYawTrusted() { setManualYawTrusted(false, 0.0f); }
+
+    // User heading correction: persistent runtime adjustment on top of
+    // sign + mount offset + static compass adjust. Survives reboots.
+    // final = normalize360(base + userCorrectionDeg)
+    float baseHeadingDeg() const { return _baseYawDeg; }
+    float userHeadingCorrectionDeg() const { return _userHeadingCorrectionDeg; }
+    // Set the persistent user correction in degrees (any value, will be
+    // wrapped into [-180, 180] for storage but applied as a delta).
+    // Returns true on success. Persists to NVS on ESP32.
+    bool setUserHeadingCorrectionDeg(float correctionDeg, String* err = nullptr);
+    // Clear (set to 0) and persist. Returns true on success.
+    bool clearUserHeadingCorrection(String* err = nullptr);
+    // Force-load from NVS at boot.
+    void loadUserHeadingCorrection();
+    // Set raw correction and persist (used by align commands).
+    bool applyAndSaveUserCorrection(float newCorrectionDeg, String* err = nullptr);
 
     // For startup validation / diagnostics.
     float startupAbsDeltaDeg() const { return _startupAbsDeltaDeg; }
@@ -98,10 +149,13 @@ private:
     bool updateAbsoluteCandidate(ImuYawSource source, float sourceYawDeg, float robotYawDeg, float accRad, uint32_t nowMs);
     void updateHeadingState(uint32_t nowMs);
     void rememberMagNorm(float mx, float my, float mz);
+    void recomputeFinalYaw();
     Adafruit_BNO08x _bno;
     sh2_SensorValue_t _val;
     bool _has = false;
     float _robotYawDeg = 0.0f;
+    float _baseYawDeg = 0.0f;
+    float _userHeadingCorrectionDeg = 0.0f;
     float _rawYawDeg = 0.0f;
     float _sourceYawDeg = 0.0f;
     float _absYawDeg = 0.0f;
@@ -144,4 +198,13 @@ private:
     uint32_t _gyroCount = 0;
     int _quality = 0;
     bool _running = false;
+    CalStartState _calStartState = CalStartState::IDLE;
+    uint32_t _calStartMs = 0;
+    int      _calStartRc = 0;
+    // FreeRTOS handle for the async calibration task (core 0).
+    void*    _calTaskHandle = nullptr;
+    // Manual heading trust (debug-only).
+    bool     _manualYawTrusted = false;
+    float    _manualTrustedHeadingDeg = 0.0f;
+    uint32_t _manualTrustedAtMs = 0;
 };

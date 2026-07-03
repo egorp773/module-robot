@@ -4,6 +4,10 @@
 #include "RtkConfig.h"
 #include <Wire.h>
 
+#ifdef ARDUINO_ARCH_ESP32
+#include <Preferences.h>
+#endif
+
 namespace {
 
 static float quatYawDeg(float x, float y, float z, float w) {
@@ -22,8 +26,84 @@ static float headingFromSourceYaw(float rawYawDeg) {
 
 }  // namespace
 
+void Imu::recomputeFinalYaw() {
+    _robotYawDeg = ImuMath::applyHeadingCorrectionDeg(_baseYawDeg, _userHeadingCorrectionDeg);
+}
+
+void Imu::loadUserHeadingCorrection() {
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences prefs;
+    if (!prefs.begin(IMU_PREF_NAMESPACE, true)) {
+        _userHeadingCorrectionDeg = 0.0f;
+        return;
+    }
+    const float v = prefs.getFloat(IMU_PREF_HEAD_CORR_KEY, 0.0f);
+    prefs.end();
+    if (!isfinite(v)) {
+        _userHeadingCorrectionDeg = 0.0f;
+        return;
+    }
+    // Wrap into [-180, 180] so storage stays compact.
+    _userHeadingCorrectionDeg = ImuMath::wrapDeg180(v);
+#else
+    // Host tests / non-ESP32 build: in-memory default. Tests can poke the
+    // value directly via setUserHeadingCorrectionDeg (no-op persistence).
+    _userHeadingCorrectionDeg = 0.0f;
+#endif
+}
+
+bool Imu::setUserHeadingCorrectionDeg(float correctionDeg, String* err) {
+    if (!isfinite(correctionDeg)) {
+        if (err) *err = "non-finite correctionDeg";
+        return false;
+    }
+    _userHeadingCorrectionDeg = ImuMath::wrapDeg180(correctionDeg);
+    recomputeFinalYaw();
+    return true;
+}
+
+bool Imu::applyAndSaveUserCorrection(float newCorrectionDeg, String* err) {
+    if (!setUserHeadingCorrectionDeg(newCorrectionDeg, err)) return false;
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences prefs;
+    if (!prefs.begin(IMU_PREF_NAMESPACE, false)) {
+        if (err) *err = "Preferences.begin failed";
+        return false;
+    }
+    const size_t wrote = prefs.putFloat(IMU_PREF_HEAD_CORR_KEY, _userHeadingCorrectionDeg);
+    prefs.end();
+    if (wrote == 0) {
+        if (err) *err = "Preferences.putFloat failed";
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool Imu::clearUserHeadingCorrection(String* err) {
+    _userHeadingCorrectionDeg = 0.0f;
+    recomputeFinalYaw();
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences prefs;
+    if (!prefs.begin(IMU_PREF_NAMESPACE, false)) {
+        if (err) *err = "Preferences.begin failed";
+        return false;
+    }
+    prefs.remove(IMU_PREF_HEAD_CORR_KEY);
+    prefs.end();
+#endif
+    return true;
+}
+
+void Imu::setManualYawTrusted(bool trusted, float headingDeg) {
+    _manualYawTrusted = trusted;
+    _manualTrustedHeadingDeg = ImuMath::normalizeDeg360(headingDeg);
+    _manualTrustedAtMs = trusted ? millis() : 0;
+}
+
 bool Imu::begin(uint8_t sdaPin, uint8_t sclPin) {
     Wire.begin(sdaPin, sclPin, 400000);
+    loadUserHeadingCorrection();
     Serial.print("[IMU] I2C scan: ");
     bool found = false;
     for (uint8_t addr = 0x08; addr < 0x78; ++addr) {
@@ -88,7 +168,8 @@ bool Imu::updateAbsoluteCandidate(ImuYawSource source, float sourceYawDeg, float
     _sourceYawDeg = sourceYawDeg;
     _absYawDeg = robotYawDeg;
     _rawYawDeg = sourceYawDeg;
-    _robotYawDeg = robotYawDeg;
+    _baseYawDeg = robotYawDeg;
+    recomputeFinalYaw();
     _yawAccRad = accRad;
     _has = true;
     _lastMs = nowMs;
@@ -219,7 +300,8 @@ void Imu::loop() {
                 _yawSource = ImuYawSource::GEOMAGNETIC_ROTATION_VECTOR;
                 _sourceYawDeg = yaw;
                 _rawYawDeg = yaw;
-                _robotYawDeg = robotYaw;
+                _baseYawDeg = robotYaw;
+                recomputeFinalYaw();
                 _yawAccRad = accRad;
                 _has = true;
                 _lastMs = nowMs;
@@ -248,7 +330,8 @@ void Imu::loop() {
                 _yawSource = ImuYawSource::ROTATION_VECTOR;
                 _sourceYawDeg = yaw;
                 _rawYawDeg = yaw;
-                _robotYawDeg = robotYaw;
+                _baseYawDeg = robotYaw;
+                recomputeFinalYaw();
                 _yawAccRad = accRad;
                 _has = true;
                 _lastMs = nowMs;
@@ -273,7 +356,8 @@ void Imu::loop() {
                 _yawSource = ImuYawSource::GAME_ROTATION_VECTOR;
                 _sourceYawDeg = yaw;
                 _rawYawDeg = yaw;
-                _robotYawDeg = headingFromSourceYaw(yaw);
+                _baseYawDeg = headingFromSourceYaw(yaw);
+                recomputeFinalYaw();
                 _yawAccRad = 999.0f;
                 _lastYawMs = nowMs;
                 _headingState = ImuHeadingState::IMU_RELATIVE_ONLY;
@@ -305,12 +389,118 @@ void Imu::loop() {
     updateHeadingState(nowMs);
 }
 
-bool Imu::startCalibration(String* err) {
+// Async calibration start. sh2_startCal() inside Adafruit_BNO08x can hang
+// the caller (blocking retry loop on I2C). We run it in a dedicated
+// FreeRTOS task on core 0 and poll its result with a hard 1500 ms cap
+// so the rover main loop never blocks indefinitely.
+//
+// Lifecycle:
+//   IDLE -> RUNNING -> OK / ERROR / TIMEOUT
+// We only allow a new run when the previous one finished (state != RUNNING).
+namespace {
+struct ImuCalStartArgs {
+    int* rcOut;
+    volatile bool* doneFlag;
+};
+
+void imuCalStartTask(void* arg) {
+    ImuCalStartArgs* a = static_cast<ImuCalStartArgs*>(arg);
+    Serial.println("[IMU-CAL] before sh2_startCal");
     const int rc = sh2_startCal(10000);
-    if (rc == SH2_OK) return true;
-    if (err) *err = "sh2_startCal failed rc=" + String(rc);
+    Serial.printf("[IMU-CAL] after sh2_startCal ok=%d rc=%d\n", (rc == SH2_OK) ? 1 : 0, rc);
+    *(a->rcOut) = rc;
+    *(a->doneFlag) = true;
+    vTaskDelete(nullptr);
+}
+}  // namespace
+
+bool Imu::startCalibration(String* err) {
+    // sh2_startCal() inside Adafruit_BNO08x can block the caller for an
+    // unbounded time (retry loop on a wedged I2C). Until the underlying
+    // library is fixed, refuse rather than hang the rover main loop.
+    _calStartState = CalStartState::ERROR;
+    _calStartRc = -100;
+    _calStartMs = millis();
+    if (err) *err = "sh2_startCal_disabled_blocking_api";
     return false;
 }
+
+#if 0
+// The full non-blocking implementation is preserved below for the day
+// when sh2_startCal() is replaced or wrapped safely. It compiles fine
+// behind #if 0 and keeps the surrounding async infrastructure (state
+// machine + worker task trampoline) ready to use.
+bool Imu::startCalibrationAsyncImpl(String* err) {
+    if (!_running) {
+        if (err) *err = "imu_not_initialized";
+        _calStartState = CalStartState::ERROR;
+        _calStartRc = -999;
+        _calStartMs = millis();
+        return false;
+    }
+
+    // If a previous async run is still in flight, refuse rather than
+    // racing. The caller will see IMU_CAL_START,ERR,busy and may retry.
+    if (_calStartState == CalStartState::RUNNING) {
+        if (err) *err = "calibration_already_running";
+        return false;
+    }
+
+    _calStartState = CalStartState::RUNNING;
+    _calStartMs = millis();
+    _calStartRc = 0;
+    _calTaskHandle = nullptr;
+
+    int rcLocal = 0;
+    volatile bool done = false;
+    ImuCalStartArgs args{&rcLocal, &done};
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        imuCalStartTask,
+        "imuCalStart",
+        4096,
+        &args,
+        3,
+        (TaskHandle_t*)&_calTaskHandle,
+        0 /* core */);
+    if (ok != pdPASS) {
+        _calStartState = CalStartState::ERROR;
+        _calStartRc = -1;
+        if (err) *err = "task_create_failed";
+        return false;
+    }
+
+    // Hard cap: 1500 ms. We do not wait on the task handle (deleting a
+    // task that is stuck in I2C is unsafe), we just let it run and
+    // forget. Worst case the next IMU_CAL_START will be rejected as
+    // busy until the lib eventually returns.
+    constexpr uint32_t CAL_START_TIMEOUT_MS = 1500u;
+    const uint32_t t0 = millis();
+    while (!done && (millis() - t0) < CAL_START_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (!done) {
+        _calStartState = CalStartState::TIMEOUT;
+        _calStartRc = -2;
+        Serial.println("[IMU-CAL] start timeout; SH2 calibration call did not return");
+        if (err) *err = "timeout";
+        // Intentionally do not block on _calTaskHandle. The orphaned
+        // task may eventually return; further IMU_CAL_STARTs will be
+        // rejected as `calibration_already_running` until it does.
+        return false;
+    }
+
+    _calStartRc = rcLocal;
+    if (rcLocal == SH2_OK) {
+        _calStartState = CalStartState::OK;
+        return true;
+    }
+    _calStartState = CalStartState::ERROR;
+    if (err) *err = "sh2_startCal failed rc=" + String(rcLocal);
+    return false;
+}
+#endif  // disabled async impl, see startCalibration() above
 
 bool Imu::saveCalibration(String* err) {
     sh2_CalStatus_t status;

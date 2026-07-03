@@ -33,7 +33,7 @@ void WsServer::onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         _lastRxMs = millis();
         sendText(client, "STATE,CONNECTED");
         // Подсказка оператору — какие команды есть для отладки.
-        sendText(client, "[HELP] DIAG | IMU_STATUS | IMU_ZERO | IMU_DIAG | CAL | IMU_CAL_START | IMU_CAL_SAVE | IMU_CAL_CLEAR | IMU_TARE_YAW | IMU_TARE_PERSIST | GO_FORWARD[,m] | GO_NORTH[,m] | STOP | LOG,0 | LOG,1");
+        sendText(client, "[HELP] DIAG | IMU_STATUS | IMU_ZERO | IMU_DIAG | CAL(=IMU_CAL_START) | CAL_HEADING_SEED | IMU_CAL_START | IMU_CAL_SAVE | IMU_CAL_STATUS | IMU_CAL_CLEAR | IMU_TARE_YAW | IMU_TARE_PERSIST | AUTO_ALIGN_HEADING_BY_RTK | HEADING_STATUS | CLEAR_HEADING_TRUST | NAV_START_AUTO_ALIGN | GO_FORWARD[,m] | GO_NORTH[,m] | STOP | LOG,0 | LOG,1");
     } else if (type == WS_EVT_DISCONNECT) {
         if (_client == client) _client = nullptr;
         stopActuators();
@@ -85,7 +85,13 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
     // === Отладочные команды из приложения (через WebSocket).
     // Без этого "GO"/"CAL"/"LOG" из приложения падают в ERR,UNKNOWN. ===
     if (line == "CAL") {
-        sendText(client, roverdbg::handleCal() ? "OK,CAL" : "ERR,CAL");
+        // Legacy alias: route to BNO085 dynamic calibration (not heading
+        // seed). Calibration must work from ABSOLUTE_UNCALIBRATED.
+        sendText(client, roverdbg::imuCalStartLine());
+        return;
+    }
+    if (line == "CAL_HEADING_SEED") {
+        sendText(client, roverdbg::handleHeadingSeed() ? "OK,CAL_HEADING_SEED" : "ERR,CAL_HEADING_SEED");
         return;
     }
     if (line == "IMU_STATUS") {
@@ -100,6 +106,10 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         sendText(client, roverdbg::imuCalSaveLine());
         return;
     }
+    if (line == "IMU_CAL_STATUS") {
+        sendText(client, roverdbg::imuCalStatusLine());
+        return;
+    }
     if (line == "IMU_CAL_CLEAR") {
         sendText(client, roverdbg::imuCalClearLine());
         return;
@@ -110,6 +120,47 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
     }
     if (line == "IMU_TARE_PERSIST") {
         sendText(client, roverdbg::imuTarePersistLine());
+        return;
+    }
+    if (line.startsWith("IMU_SET_TRUE_HEADING,")) {
+        float deg = 0;
+        if (sscanf(line.c_str(), "IMU_SET_TRUE_HEADING,%f", &deg) == 1) {
+            sendText(client, roverdbg::imuSetTrueHeadingLine(deg));
+        } else {
+            sendText(client, "ERR,IMU_SET_TRUE_HEADING_FORMAT");
+        }
+        return;
+    }
+    if (line == "IMU_CLEAR_HEADING_CORRECTION") {
+        sendText(client, roverdbg::imuClearHeadingCorrectionLine());
+        return;
+    }
+    if (line == "IMU_HEADING_TEST") {
+        sendText(client, roverdbg::imuHeadingTestLine());
+        return;
+    }
+    if (line == "IMU_TRUST_CURRENT_HEADING_ONCE") {
+        sendText(client, roverdbg::imuTrustCurrentHeadingOnceLine());
+        return;
+    }
+    if (line == "IMU_CLEAR_MANUAL_HEADING_TRUST") {
+        sendText(client, roverdbg::imuClearManualHeadingTrustLine());
+        return;
+    }
+    if (line == "AUTO_ALIGN_HEADING_BY_RTK") {
+        sendText(client, roverdbg::autoAlignHeadingByRtkLineWs());
+        return;
+    }
+    if (line == "HEADING_STATUS") {
+        sendText(client, roverdbg::headingStatusLine());
+        return;
+    }
+    if (line == "CLEAR_HEADING_TRUST") {
+        sendText(client, roverdbg::clearHeadingTrustLine());
+        return;
+    }
+    if (line == "NAV_START_AUTO_ALIGN") {
+        sendText(client, roverdbg::navStartAutoAlignLineWs());
         return;
     }
     if (line == "GO" || line.startsWith("GO_FORWARD")) {
@@ -362,8 +413,21 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
                               _imu->yawAccRad(),
                               _imu->yawAgeMs(now),
                               SAFE_IMU_AGE_MS)) {
-            sendText(client, "ERR,IMU_ABSOLUTE_UNAVAILABLE");
-        } else if (_imu && _imu->ageMs(now) > SAFE_IMU_AGE_MS) {
+            // IMU absolute is preferred but no longer mandatory. We
+            // accept RTK-motion-aligned heading (set by AUTO_ALIGN_*) or
+            // manual trust flag. Both paths log a WARNING on Serial.
+            if (_imu && _imu->manualYawTrusted()) {
+                Serial.println("[NAV] WARNING using manually trusted IMU heading; BNO absolute yaw is not valid");
+            } else {
+                // RTK-motion-aligned handled in rover.cpp via the WS
+                // bridge: see NAV_START_AUTO_ALIGN command. The plain
+                // NAV_START command here can still reach this branch only
+                // if no trusted heading exists, in which case refuse.
+                sendText(client, "ERR,IMU_ABSOLUTE_UNAVAILABLE");
+                return;
+            }
+        }
+        if (_imu && _imu->ageMs(now) > SAFE_IMU_AGE_MS) {
             sendText(client, "ERR,IMU_STALE");
         } else if (_rtcm && _rtcm->transportAgeMs(now) > SAFE_RTK_AGE_MS) {
             sendText(client, "ERR,RTCM_STALE");

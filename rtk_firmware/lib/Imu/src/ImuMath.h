@@ -52,6 +52,18 @@ inline float imuRawToRobotHeadingDeg(
     return normalizeDeg360(headingSign * raw + mountOffsetDeg + compassAdjustDeg);
 }
 
+inline float headingCorrectionDeg(float currentHeadingDeg, float trueHeadingDeg) {
+    return wrapDeg180(trueHeadingDeg - currentHeadingDeg);
+}
+
+inline float applyHeadingCorrectionDeg(float headingDeg, float correctionDeg) {
+    return normalizeDeg360(headingDeg + correctionDeg);
+}
+
+inline float rtkForwardHeadingDeg(float dxEast, float dyNorth) {
+    return normalizeDeg360(atan2f(dxEast, dyNorth) * 180.0f / M_PI);
+}
+
 inline bool yawStateIsAbsolute(ImuHeadingState state) {
     return state == ImuHeadingState::IMU_ABSOLUTE_OK;
 }

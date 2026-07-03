@@ -44,6 +44,22 @@ int main() {
     assert(!ImuMath::canUseAbsoluteYawForNav(
         ImuHeadingState::IMU_STALE, true, 0.03f, 100u, 200u));
 
-    std::puts("ImuMath heading transform tests passed");
+    // headingCorrectionDeg: delta to add so current -> true.
+    expectNear(ImuMath::headingCorrectionDeg(90.0f, 260.0f),  170.0f, 0.0001f);
+    expectNear(ImuMath::headingCorrectionDeg(350.0f, 10.0f),   20.0f, 0.0001f);
+    expectNear(ImuMath::headingCorrectionDeg(10.0f,  350.0f), -20.0f, 0.0001f);
+
+    // applyHeadingCorrectionDeg: base + user -> final, normalized 0..360.
+    expectNear(ImuMath::applyHeadingCorrectionDeg(90.0f,  170.0f), 260.0f, 0.0001f);
+    expectNear(ImuMath::applyHeadingCorrectionDeg(350.0f, 20.0f),  10.0f,  0.0001f);
+    expectNear(ImuMath::applyHeadingCorrectionDeg(10.0f, -20.0f),  350.0f, 0.0001f);
+
+    // rtkForwardHeadingDeg: target heading from dx east / dy north.
+    expectNear(ImuMath::rtkForwardHeadingDeg( 1.0f,  0.0f),  90.0f, 0.0001f);
+    expectNear(ImuMath::rtkForwardHeadingDeg( 0.0f,  1.0f),   0.0f, 0.0001f);
+    expectNear(ImuMath::rtkForwardHeadingDeg(-1.0f,  0.0f), 270.0f, 0.0001f);
+    expectNear(ImuMath::rtkForwardHeadingDeg( 0.0f, -1.0f), 180.0f, 0.0001f);
+
+    std::puts("ImuMath heading transform + correction tests passed");
     return 0;
 }

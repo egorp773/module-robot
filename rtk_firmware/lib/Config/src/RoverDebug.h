@@ -7,8 +7,17 @@
 
 namespace roverdbg {
 
-// CAL: reseed estimator from absolute IMU heading if it is ready.
+// CAL / IMU_CAL_START: start BNO085 dynamic calibration. Allowed from
+// every state except "IMU not responding" — this is the operation that
+// turns ABSOLUTE_UNCALIBRATED into ABSOLUTE_OK, so the old
+// `IMU_ABSOLUTE_OK` gate was a bug.
 bool handleCal();
+// CAL_HEADING_SEED: strictly-gated — reseed StateEstimator from IMU.
+// Only valid when yaw is absolute. Exposed only as `CAL_HEADING_SEED`
+// on Serial, never as `CAL`.
+bool handleHeadingSeed();
+bool handleCalStart();
+bool handleCalSave();
 
 // GO: CAL + маршрут (0,0) → (0,3) с boundary 4×4 вокруг + старт.
 // Возвращает true если маршрут сформирован и запущен.
@@ -27,8 +36,21 @@ String imuDiagLine();
 String imuStatusLine();
 String imuCalStartLine();
 String imuCalSaveLine();
+String imuCalStatusLine();
 String imuCalClearLine();
 String imuTareYawLine();
 String imuTarePersistLine();
+String imuSetTrueHeadingLine(float trueHeadingDeg);
+String imuClearHeadingCorrectionLine();
+String imuHeadingTestLine();
+String imuTrustCurrentHeadingOnceLine();
+String imuClearManualHeadingTrustLine();
+String autoAlignHeadingByRtkLine();
+String autoAlignHeadingByRtkLineWs();
+String headingStatusLine();
+String clearHeadingTrustLine();
+String navStartAutoAlignLine();
+String navStartAutoAlignLineWs();
+String handleNavStartLine();
 
 }  // namespace roverdbg
