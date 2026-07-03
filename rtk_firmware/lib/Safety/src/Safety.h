@@ -29,6 +29,20 @@ struct SafetyInput {
     uint16_t rejectedPositionFixes = 0;
     bool originLocked = false;
     bool routeReady = false;
+    // True while Serial AUTO_ALIGN_HEADING_BY_RTK is running. Lets the
+    // motion survive a missing WebSocket link so the operator can debug
+    // via Serial Monitor alone. WebSocket-issued alignments must NOT
+    // set this — they should still abort on WS disconnect.
+    bool serialDebugMotion = false;
+    // True if estimator heading is valid for navigation. Combines the
+    // "trusted" sources: BNO085 absolute OK, manual trust flag, and
+    // RTK-motion alignment. Set by rover.cpp each tick.
+    bool headingTrustedForNav = false;
+    // True when the current heading trust comes from IMU (absolute OK or
+    // manual trust). When false the navigation does not depend on BNO085
+    // being live, so IMU staleness must not be fatal. Used to gate the
+    // imu_stale Safety check.
+    bool headingUsesImu = false;
 };
 
 class Safety {

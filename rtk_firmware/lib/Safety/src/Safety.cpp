@@ -13,8 +13,12 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
     if (!_inited) return;
     auto set = [&](SafetyLevel l, const char* r) { _level = l; _reason = r; };
 
-    // 1. жёсткие failsafe — всегда побеждают
-    if (!in.wsConnected) {
+    // 1. жёсткие failsafe — всегда побеждают. ws_disconnected is NOT
+    // fatal when the operator is running a Serial-only debug session
+    // (e.g. AUTO_ALIGN_HEADING_BY_RTK with no app). STOP / ESTOP / HOLD
+    // are still reachable via serialDebugMotion=false after alignment
+    // ends, so the gate is tight whenever motion is real and attributable.
+    if (!in.wsConnected && !in.serialDebugMotion) {
         set(SAFETY_ESTOP, "ws_disconnected");
         return;
     }
@@ -28,8 +32,13 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
         return;
     }
     if (!in.navRequested) {
-        set(SAFETY_OK, "manual_ok");
-        return;
+        // During serialDebugMotion we may still want motion even when
+        // navRequested=false (alignment drives motor directly, not via
+        // the follower). Let the rest of the gates apply.
+        if (!in.serialDebugMotion) {
+            set(SAFETY_OK, "manual_ok");
+            return;
+        }
     }
     if (in.pvtAgeMs > SAFE_PVT_AGE_MS) {
         set(SAFETY_ESTOP, "pvt_stale");
@@ -44,8 +53,11 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
         return;
     }
 
-    // 2. в навигации — IMU must be fresh
-    if (in.navRequested) {
+    // 2. в навигации — IMU stale is only fatal when navigation actually
+    //    depends on a live IMU. RTK-motion aligned heading does NOT
+    //    require fresh BNO085; the EKF integrates gyro in estimator.cpp
+    //    and `headingAgeMs` is the real staleness metric for that path.
+    if (in.navRequested && in.headingUsesImu) {
         if (imu.ageMs(nowMs) > SAFE_IMU_AGE_MS) {
             set(SAFETY_ESTOP, "imu_stale");
             return;
@@ -62,13 +74,14 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
             set(SAFETY_HOLD, "no_route");
             return;
         }
-        if (!ImuMath::canUseAbsoluteYawForNav(
-                imu.headingState(),
-                imu.yawAbsoluteValid(),
-                imu.yawAccRad(),
-                imu.yawAgeMs(nowMs),
-                SAFE_IMU_AGE_MS)) {
-            set(SAFETY_HOLD, "imu_no_absolute_heading");
+        // Heading trust gate. Three acceptable paths:
+        //   - BNO085 absolute OK (preferred, canUseAbsoluteYawForNav)
+        //   - manual trust flag (debug escape hatch)
+        //   - RTK-motion alignment this boot AND estimator heading still
+        //     fresh (set by rover.cpp via headingTrustedForNav)
+        // If none of these holds we refuse to drive.
+        if (!in.headingTrustedForNav) {
+            set(SAFETY_HOLD, "heading_not_trusted");
             return;
         }
         if (in.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {
@@ -107,7 +120,29 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in, const StateEstimator& e
         return;
     }
 
-    // 4. ручной режим — IMU опционален, RTK не нужен
+    // 4. serialDebugMotion path: alignment drives motors directly
+    // (bypassing the follower). We still demand RTK is alive; the
+    // alignment state machine aborts itself on RTK loss independently.
+    if (in.serialDebugMotion) {
+        if (in.sol == SOL_INVALID) {
+            set(SAFETY_HOLD, "manual_no_fix");
+        } else if (in.sol == SOL_FLOAT) {
+            if (in.hAcc > 0.05f) {
+                set(SAFETY_HOLD, "manual_float_hacc_gt_5cm");
+            } else {
+                set(SAFETY_OK, "manual_float");
+            }
+        } else if (in.sol == SOL_FIXED) {
+            if (in.hAcc > SAFE_HACC_FIXED_M) {
+                set(SAFETY_HOLD, "manual_fixed_hacc_gt_2cm");
+            } else {
+                set(SAFETY_OK, "manual_fixed");
+            }
+        }
+        return;
+    }
+
+    // 5. ручной режим — IMU опционален, RTK не нужен
     if (in.sol == SOL_INVALID) {
         set(SAFETY_HOLD, "manual_no_fix");
     } else if (in.sol == SOL_FLOAT) {

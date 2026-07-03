@@ -219,10 +219,10 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         return;
     }
     if (line == "STOP") {
-        if (_motor) _motor->stopImmediately();
-        if (_route) _route->stop();
+        // Single source of truth: roverdbg::handleStopLine() also aborts
+        // any running AUTO_ALIGN_HEADING_BY_RTK and logs the abort.
+        sendText(client, roverdbg::handleStopLine());
         _navRequested = false;
-        sendText(client, "OK STOP");
         return;
     }
     if (line.startsWith("SET_HEADING,")) {
@@ -391,52 +391,14 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         return;
     }
     if (line == "NAV_START") {
-        const auto& e = _est->get();
-        uint32_t now = millis();
-        if (!_route->isReady()) {
-            sendText(client, "ERR,NO_ROUTE");
-        } else if (!e.originSet) {
-            sendText(client, "ERR,NO_ORIGIN");
-        } else if (e.sol != SOL_FIXED) {
-            sendText(client, "ERR,RTK_NOT_FIXED");
-        } else if (e.hAcc > SAFE_HACC_FIXED_M) {
-            sendText(client, "ERR,HACC");
-        } else if (e.pvtAgeMs > SAFE_PVT_AGE_MS || e.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {
-            sendText(client, "ERR,POSITION_STALE");
-        } else if (e.rejectedPositionFixes > SAFE_REJECTED_POSITION_FIXES_MAX) {
-            sendText(client, "ERR,GPS_JUMP");
-        } else if (!e.headingValid || e.headingAgeMs > SAFE_HEADING_AGE_MS) {
-            sendText(client, "ERR,HEADING_STALE");
-        } else if (!_imu || !ImuMath::canUseAbsoluteYawForNav(
-                              _imu->headingState(),
-                              _imu->yawAbsoluteValid(),
-                              _imu->yawAccRad(),
-                              _imu->yawAgeMs(now),
-                              SAFE_IMU_AGE_MS)) {
-            // IMU absolute is preferred but no longer mandatory. We
-            // accept RTK-motion-aligned heading (set by AUTO_ALIGN_*) or
-            // manual trust flag. Both paths log a WARNING on Serial.
-            if (_imu && _imu->manualYawTrusted()) {
-                Serial.println("[NAV] WARNING using manually trusted IMU heading; BNO absolute yaw is not valid");
-            } else {
-                // RTK-motion-aligned handled in rover.cpp via the WS
-                // bridge: see NAV_START_AUTO_ALIGN command. The plain
-                // NAV_START command here can still reach this branch only
-                // if no trusted heading exists, in which case refuse.
-                sendText(client, "ERR,IMU_ABSOLUTE_UNAVAILABLE");
-                return;
-            }
-        }
-        if (_imu && _imu->ageMs(now) > SAFE_IMU_AGE_MS) {
-            sendText(client, "ERR,IMU_STALE");
-        } else if (_rtcm && _rtcm->transportAgeMs(now) > SAFE_RTK_AGE_MS) {
-            sendText(client, "ERR,RTCM_STALE");
-        } else if (_motor && !_motor->haveFeedback()) {
-            sendText(client, "ERR,MOTOR_NO_FEEDBACK");
-        } else {
-            _route->start();
+        // Single source of truth for the gate: roverdbg::handleNavStartLine().
+        // It honours RTK + estimator heading trust, and the resulting
+        // navigation works whether heading is sourced from IMU absolute
+        // OK, manual trust, or RTK-motion alignment.
+        const String reply = roverdbg::handleNavStartLine();
+        sendText(client, reply);
+        if (reply.startsWith("OK,NAV_START")) {
             _navRequested = true;
-            sendText(client, "OK,NAV_START");
         }
         return;
     }

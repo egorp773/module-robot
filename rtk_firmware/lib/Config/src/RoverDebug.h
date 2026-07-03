@@ -52,5 +52,6 @@ String clearHeadingTrustLine();
 String navStartAutoAlignLine();
 String navStartAutoAlignLineWs();
 String handleNavStartLine();
+String handleStopLine();
 
 }  // namespace roverdbg

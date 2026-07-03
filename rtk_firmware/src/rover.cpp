@@ -1152,8 +1152,7 @@ void loop() {
                 if (buf[8] == ',') distance = atof(buf + 9);
                 roverdbg::handleGoNorth(distance);
             } else if (strcmp(buf, "STOP") == 0) {
-                g_motor.stopImmediately();
-                Serial.println("[STOP] motors stopped");
+                roverdbg::handleStopLine();
             } else if (strcmp(buf, "IMU_ZERO") == 0) {
                 Serial.println(roverdbg::imuZeroLine());
             } else if (strcmp(buf, "IMU_DIAG") == 0) {
@@ -1251,6 +1250,42 @@ void loop() {
     si.rejectedPositionFixes = g_est.get().rejectedPositionFixes;
     si.originLocked = g_est.get().originSet;
     si.routeReady   = g_route.isReady();
+
+    // Serial-issued AUTO_ALIGN_HEADING_BY_RTK only. WebSocket-issued
+    // alignment must NOT flip this flag — otherwise ws_disconnected
+    // would no longer abort a WS-side run. See Safety::tick() for the
+    // matching gate.
+    si.serialDebugMotion =
+        g_align.active &&
+        g_heading.alignState == AlignState::RUNNING &&
+        !g_align.fromWebSocket;
+
+    // Heading trust gate. Accept any of:
+    //   - BNO085 absolute yaw OK (computed below via canUseAbsoluteYawForNav
+    //     inside Safety; here we just pre-declare it for the safer fallback)
+    //   - manual trust flag set by IMU_TRUST_CURRENT_HEADING_ONCE
+    //   - RTK-motion alignment completed this boot AND estimator heading
+    //     is still fresh
+    // `headingUsesImu` is true only when the trusted heading source IS
+    // the IMU. RTK-motion aligned navigation does not depend on BNO085
+    // being live, so imu_stale is not fatal there.
+    {
+        const auto& e = g_est.get();
+        const bool imuAbsOk = ImuMath::canUseAbsoluteYawForNav(
+                g_imu.headingState(),
+                g_imu.yawAbsoluteValid(),
+                g_imu.yawAccRad(),
+                g_imu.yawAgeMs(now),
+                SAFE_IMU_AGE_MS);
+        const bool manualTrust = g_imu.manualYawTrusted();
+        const bool rtkAlignFresh =
+            g_heading.trusted &&
+            g_heading.source == HeadingSource::RTK_MOTION_ALIGNED &&
+            e.headingValid &&
+            e.headingAgeMs <= SAFE_HEADING_AGE_MS;
+        si.headingTrustedForNav = imuAbsOk || manualTrust || rtkAlignFresh;
+        si.headingUsesImu       = imuAbsOk || manualTrust;
+    }
     g_safety.tick(now, si, g_est, g_imu);
     if (!g_safety.allowMotion()) {
         digitalWrite(PIN_RELAY_ATTACH, LOW);
@@ -2059,6 +2094,25 @@ String handleNavStartLine() {
         g_ws.setNavRequested(true);
         return String("OK,NAV_START");
     }
+}
+
+// STOP: drop the route, abort any running alignment, stop motors. Single
+// source of truth for both Serial `STOP` and WebSocket `STOP` so the two
+// surfaces cannot drift.
+String handleStopLine() {
+    if (g_heading.alignState == AlignState::RUNNING) {
+        g_align.active = false;
+        g_heading.alignState = AlignState::ERR;
+        g_heading.lastAlignError = "stopped";
+        g_heading.lastAlignDist = 0;
+        g_heading.lastAlignDx = 0;
+        g_heading.lastAlignDy = 0;
+        Serial.println("[ALIGN-RTK] abort: stopped");
+    }
+    g_route.stop();
+    g_motor.stopImmediately();
+    Serial.println("[STOP] motors stopped");
+    return String("OK STOP");
 }
 
 }  // namespace roverdbg
