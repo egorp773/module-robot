@@ -18,6 +18,9 @@ bool handleCal();
 bool handleHeadingSeed();
 bool handleCalStart();
 bool handleCalSave();
+bool handleGoLShape(float firstM, float turnDeg, float secondM);
+String handleGoLShapeDebugLine(float firstM, float turnDeg, float secondM);
+String handleGoSquareDebugLine(float sideM);
 
 // GO: CAL + маршрут (0,0) → (0,3) с boundary 4×4 вокруг + старт.
 // Возвращает true если маршрут сформирован и запущен.

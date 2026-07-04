@@ -149,6 +149,7 @@ public:
         _lastYawMs = 0;
         _lastRotYawMs = 0;
         _lastGeoYawMs = 0;
+        _lastRelYawMs = 0;
         _lastGoodRotYawMs = 0;
         _lastGoodGeoYawMs = 0;
         _absCandidateSinceMs = 0;

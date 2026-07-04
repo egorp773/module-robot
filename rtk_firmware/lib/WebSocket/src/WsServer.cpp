@@ -33,7 +33,7 @@ void WsServer::onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         _lastRxMs = millis();
         sendText(client, "STATE,CONNECTED");
         // Подсказка оператору — какие команды есть для отладки.
-        sendText(client, "[HELP] DIAG | IMU_STATUS | IMU_ZERO | IMU_DIAG | CAL(=IMU_CAL_START) | CAL_HEADING_SEED | IMU_CAL_START | IMU_CAL_SAVE | IMU_CAL_STATUS | IMU_CAL_CLEAR | IMU_TARE_YAW | IMU_TARE_PERSIST | AUTO_ALIGN_HEADING_BY_RTK | HEADING_STATUS | CLEAR_HEADING_TRUST | NAV_START_AUTO_ALIGN | GO_FORWARD[,m] | GO_NORTH[,m] | STOP | LOG,0 | LOG,1");
+        sendText(client, "[HELP] DIAG | IMU_STATUS | IMU_ZERO | IMU_DIAG | CAL(=IMU_CAL_START) | CAL_HEADING_SEED | IMU_CAL_START | IMU_CAL_SAVE | IMU_CAL_STATUS | IMU_CAL_CLEAR | IMU_TARE_YAW | IMU_TARE_PERSIST | AUTO_ALIGN_HEADING_BY_RTK | HEADING_STATUS | CLEAR_HEADING_TRUST | NAV_START_AUTO_ALIGN | GO_FORWARD[,m] | GO_NORTH[,m] | GO_L_SHAPE[,first,turn,second] | STOP | LOG,0 | LOG,1");
     } else if (type == WS_EVT_DISCONNECT) {
         if (_client == client) _client = nullptr;
         stopActuators();
@@ -208,6 +208,59 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
             sendText(client, "OK,GO_NORTH: " + roverdbg::diagLine());
         } else {
             sendText(client, "ERR,GO_NORTH: " + roverdbg::diagLine());
+        }
+        return;
+    }
+    if (line.startsWith("GO_L_SHAPE_DEBUG")) {
+        float firstM = 1.0f, turnDeg = 90.0f, secondM = 1.0f;
+        int parsed = 0;
+        if (line.length() > 16 && line.c_str()[15] == ',') {
+            parsed = sscanf(line.c_str() + 16, "%f,%f,%f",
+                            &firstM, &turnDeg, &secondM);
+        }
+        if (parsed < 3) {
+            sendText(client, "ERR,GO_L_SHAPE_DEBUG_FORMAT");
+            return;
+        }
+        const String reply = roverdbg::handleGoLShapeDebugLine(firstM, turnDeg, secondM);
+        sendText(client, reply);
+        if (reply.startsWith("OK")) {
+            _navRequested = true;
+        }
+        return;
+    }
+    if (line.startsWith("GO_SQUARE_DEBUG")) {
+        float sideM = 1.0f;
+        int parsed = 0;
+        if (line.length() > 15 && line.c_str()[15] == ',') {
+            parsed = sscanf(line.c_str() + 16, "%f", &sideM);
+        }
+        if (parsed < 1) {
+            sendText(client, "ERR,GO_SQUARE_DEBUG_FORMAT");
+            return;
+        }
+        const String reply = roverdbg::handleGoSquareDebugLine(sideM);
+        sendText(client, reply);
+        if (reply.startsWith("OK")) {
+            _navRequested = true;
+        }
+        return;
+    }
+    if (line.startsWith("GO_L_SHAPE")) {
+        float firstM = 1.0f, turnDeg = 90.0f, secondM = 1.0f;
+        if (line.length() > 10 && line.c_str()[10] == ',') {
+            int parsed = sscanf(line.c_str() + 11, "%f,%f,%f",
+                                 &firstM, &turnDeg, &secondM);
+            if (parsed < 3) {
+                sendText(client, "ERR,GO_L_SHAPE_FORMAT");
+                return;
+            }
+        }
+        if (roverdbg::handleGoLShape(firstM, turnDeg, secondM)) {
+            _navRequested = true;
+            sendText(client, "OK,GO_L_SHAPE");
+        } else {
+            sendText(client, "ERR,GO_L_SHAPE: " + roverdbg::diagLine());
         }
         return;
     }

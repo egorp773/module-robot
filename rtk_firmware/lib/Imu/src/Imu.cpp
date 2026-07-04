@@ -349,6 +349,7 @@ void Imu::loop() {
             }
             case SH2_GAME_ROTATION_VECTOR: {
                 _gameCount++;
+                _lastRelYawMs = nowMs;
                 float yaw = quatYawDeg(
                     _val.un.gameRotationVector.i,
                     _val.un.gameRotationVector.j,
