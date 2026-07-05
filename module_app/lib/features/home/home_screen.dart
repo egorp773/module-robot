@@ -237,22 +237,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                             iconColor: accentWhite,
                             onTap: () => context.go('/test'),
                           ),
-                          SizedBox(width: s(10)),
-                          _IconGlassButton(
-                            size: topIconSize,
-                            glyphSize: topIconGlyph,
-                            icon: Icons.tune_rounded,
-                            tooltip: 'Настройки',
-                            iconColor: accentWhite,
-                            onTap: () {
-                              showModalBottomSheet(
-                                context: context,
-                                backgroundColor: Colors.transparent,
-                                barrierColor: Colors.black.withOpacity(0.55),
-                                builder: (_) => const _QuickSheet(),
-                              );
-                            },
-                          ),
                         ],
                       ),
 

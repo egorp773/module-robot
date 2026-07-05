@@ -8,6 +8,80 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 const int _maxTelemetryAgeMs = 60000;
 
+/// Heading alignment state parsed from HEADING_STATUS,alignState=...
+enum HeadingAlignState { idle, running, ok, failed, unknown }
+
+HeadingAlignState _parseAlignState(String? raw) {
+  switch (raw?.trim().toLowerCase()) {
+    case 'idle':
+      return HeadingAlignState.idle;
+    case 'running':
+      return HeadingAlignState.running;
+    case 'ok':
+      return HeadingAlignState.ok;
+    case 'failed':
+    case 'err':
+    case 'error':
+      return HeadingAlignState.failed;
+    default:
+      return HeadingAlignState.unknown;
+  }
+}
+
+/// Parsed HEADING_STATUS payload from the rover. Mirrors the firmware
+/// string produced by `roverdbg::headingStatusLine()`.
+@immutable
+class HeadingStatus {
+  final bool trusted;
+  final String? source; // raw headingSource (e.g. RTK_MOTION_ALIGNED, IMU_ABSOLUTE)
+  final double? headingDeg;
+  final int? headingAgeMs;
+  final HeadingAlignState alignState;
+  final double? lastAlignDist;
+  final double? lastAlignHAcc;
+  final String? lastAlignError;
+  final DateTime? receivedAt;
+
+  const HeadingStatus({
+    required this.trusted,
+    required this.source,
+    required this.headingDeg,
+    required this.headingAgeMs,
+    required this.alignState,
+    required this.lastAlignDist,
+    required this.lastAlignHAcc,
+    required this.lastAlignError,
+    required this.receivedAt,
+  });
+
+  bool get isEmpty => headingDeg == null && !trusted && alignState == HeadingAlignState.unknown;
+
+  static HeadingStatus? tryParse(String line, {DateTime? now}) {
+    if (!line.startsWith('HEADING_STATUS')) return null;
+    final parts = line.split(',');
+    if (parts.length < 2) return null;
+    final map = <String, String>{};
+    for (final p in parts.skip(1)) {
+      final eq = p.indexOf('=');
+      if (eq < 0) continue;
+      map[p.substring(0, eq).trim()] = p.substring(eq + 1).trim();
+    }
+    return HeadingStatus(
+      trusted: (map['headingTrusted'] ?? '0').trim() == '1',
+      source: (map['headingSource'] ?? '').isEmpty ? null : map['headingSource'],
+      headingDeg: double.tryParse(map['headingDeg'] ?? ''),
+      headingAgeMs: int.tryParse(map['headingAgeMs'] ?? ''),
+      alignState: _parseAlignState(map['alignState']),
+      lastAlignDist: double.tryParse(map['lastAlignDist'] ?? ''),
+      lastAlignHAcc: double.tryParse(map['lastAlignHAcc'] ?? ''),
+      lastAlignError: (map['lastAlignError'] ?? '-') == '-'
+          ? null
+          : map['lastAlignError'],
+      receivedAt: now ?? DateTime.now(),
+    );
+  }
+}
+
 String buildRouteBeginCommand(
   int count, {
   required double mapOriginLat,
@@ -84,6 +158,9 @@ class WifiConnectionState {
   final int? calQuality; // 0-100
   final bool? calVerified; // verified flag
 
+  // Heading status (parsed from HEADING_STATUS,...)
+  final HeadingStatus? headingStatus;
+
   const WifiConnectionState({
     required this.isConnecting,
     required this.isConnected,
@@ -135,6 +212,7 @@ class WifiConnectionState {
     this.calStdDev,
     this.calQuality,
     this.calVerified,
+    this.headingStatus,
   });
 
   factory WifiConnectionState.initial() => const WifiConnectionState(
@@ -188,6 +266,7 @@ class WifiConnectionState {
         calStdDev: null,
         calQuality: null,
         calVerified: null,
+        headingStatus: null,
       );
 
   WifiConnectionState copyWith({
@@ -241,6 +320,7 @@ class WifiConnectionState {
     double? calStdDev,
     int? calQuality,
     bool? calVerified,
+    HeadingStatus? headingStatus,
   }) {
     return WifiConnectionState(
       isConnecting: isConnecting ?? this.isConnecting,
@@ -293,6 +373,7 @@ class WifiConnectionState {
       calStdDev: calStdDev ?? this.calStdDev,
       calQuality: calQuality ?? this.calQuality,
       calVerified: calVerified ?? this.calVerified,
+      headingStatus: headingStatus ?? this.headingStatus,
     );
   }
 
@@ -353,6 +434,7 @@ class WifiConnectionState {
       calStdDev: null,
       calQuality: null,
       calVerified: null,
+      headingStatus: null,
     );
   }
 }
@@ -473,6 +555,11 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
   WifiConnectionNotifier(this._ref) : super(WifiConnectionState.initial()) {
     _initConnectivityListener();
   }
+
+  /// Публичный алиас для текущего снимка состояния. [StateNotifier.state]
+  /// помечено `@visibleForTesting`, поэтому контроллеры/виджеты
+  /// должны использовать этот геттер.
+  WifiConnectionState get current => state;
 
   String get _host {
     final host = _ref.read(wifiRobotHostProvider).trim();
@@ -1041,6 +1128,28 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
             }
           }
 
+          // Парсинг HEADING_STATUS,headingTrusted=...,headingSource=...,
+          //   headingDeg=...,headingAgeMs=...,alignState=...,
+          //   lastAlignDist=...,lastAlignHAcc=...,lastAlignError=...
+          // Используется AutonomyController для ожидания headingTrusted=1
+          // после AUTO_ALIGN_HEADING_BY_RTK и перед NAV_START.
+          if (msgStr.startsWith("HEADING_STATUS")) {
+            try {
+              final parsed = HeadingStatus.tryParse(msgStr, now: DateTime.now());
+              if (parsed != null) {
+                state = state.copyWith(headingStatus: parsed);
+              }
+            } catch (e) {
+              _log("× Failed to parse HEADING_STATUS: $e");
+            }
+          }
+
+          // Замечание о AUTO_ALIGN_HEADING_BY_RTK: ответ приходит как
+          // "AUTO_ALIGN_HEADING_BY_RTK,OK,driving" либо
+          // "AUTO_ALIGN_HEADING_BY_RTK,ERR,...". Оба варианта попадают под
+          // общий обработчик OK/ERR сверху, поэтому дополнительный парсер
+          // тут не нужен.
+
           // Если получили STATE,CONNECTED - соединение установлено
           if (msgStr.startsWith("MOTOR,")) {
             try {
@@ -1524,6 +1633,40 @@ class WifiConnectionNotifier extends StateNotifier<WifiConnectionState> {
       "NAV_STOP",
       "NAV_STOP",
       (ack) => ack == "OK,NAV_STOP",
+    );
+  }
+
+  /// Запросить у робота текущий HEADING_STATUS (raw). Ответ приходит
+  /// синхронно по тому же каналу и парсится в state.headingStatus.
+  void sendHeadingStatus() {
+    if (!state.isConnected) return;
+    sendRaw("HEADING_STATUS");
+  }
+
+  /// Запустить автоматическое определение курса по RTK:
+  /// робот проедет ~1.5 м вперёд и вычислит heading из RTK-смещения.
+  /// Асинхронно — завершение ловим через state.headingStatus, который
+  /// будет регулярно обновляться (или разово прислать сразу после команды).
+  /// Не блокирует UI.
+  Future<void> sendAutoAlignHeadingByRtk() async {
+    await _sendAcked(
+      "AUTO_ALIGN_HEADING_BY_RTK",
+      "AUTO_ALIGN_HEADING_BY_RTK",
+      (ack) =>
+          ack == "AUTO_ALIGN_HEADING_BY_RTK,OK,driving" ||
+          ack.startsWith("AUTO_ALIGN_HEADING_BY_RTK,OK") ||
+          ack.startsWith("AUTO_ALIGN_HEADING_BY_RTK,ERR"),
+    );
+  }
+
+  /// Аварийный стоп. Шлёт именно STOP (а не NAV_STOP) — это
+  /// единый стоп-сигнал и для авто-навигации, и для авто-выравнивания
+  /// курса (см. rover.cpp::handleStopLine).
+  Future<void> sendHardStop() async {
+    await _sendAcked(
+      "STOP",
+      "STOP",
+      (ack) => ack.startsWith("OK"),
     );
   }
 

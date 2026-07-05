@@ -48,6 +48,19 @@ class AutoMapScreen extends ConsumerStatefulWidget {
   ConsumerState<AutoMapScreen> createState() => _AutoMapScreenState();
 }
 
+/// Результат успешного AUTO_ALIGN_HEADING_BY_RTK, используется
+/// в логах и в финальном notice.
+class _AlignInfo {
+  final double headingDeg;
+  final double lastAlignDist;
+  final double lastAlignHAcc;
+  const _AlignInfo({
+    required this.headingDeg,
+    required this.lastAlignDist,
+    required this.lastAlignHAcc,
+  });
+}
+
 class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   static const double _draftLineStepMeters = 0.35;
   static const int _maxRouteWaypoints = 254;
@@ -55,6 +68,16 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   static const int _maxForbiddenPolygons = 16;
   static const int _maxForbiddenPoints = _maxRouteWaypoints;
   static const double _maxStartOutsideBoundaryMeters = 0.0;
+
+  // === Гейты для Start по сохранённой карте (см. требование "Preflight")
+  static const double _startMaxHAccMm = 50.0; // 0.05 m
+  static const int _startMaxPvtAgeMs = 300;
+  // === Гейты успешного auto-align (см. требование шаг 7)
+  static const int _alignMaxHeadingAgeMs = 2000;
+  static const double _alignMinLastAlignDistM = 1.0;
+  static const double _alignMaxLastAlignHAccM = 0.05;
+  static const Duration _alignTotalTimeout = Duration(seconds: 30);
+  static const Duration _alignPollInterval = Duration(milliseconds: 800);
 
   ManualMapState? _mapState;
   bool _isLoading = true;
@@ -568,69 +591,293 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   }
 
   Future<void> _startNavigation(BuildContext context, WidgetRef ref) async {
-    final wifi = ref.read(wifiConnectionProvider);
-    if (!wifi.isConnected) {
-      _showNotice(
-        ref,
-        title: 'Не подключено',
-        message: 'Подключитесь к роботу перед стартом.',
-        kind: NoticeKind.warning,
-      );
-      return;
-    }
-    if (!_routeSent) {
-      _showNotice(
-        ref,
-        title: 'Маршрут не отправлен',
-        message: 'Сначала отправьте построенный маршрут.',
-        kind: NoticeKind.warning,
-      );
-      return;
-    }
-    final msg = _navStartBlockReason(wifi);
-    if (msg != null) {
-      setState(() => _routeWorkflowError = msg);
-      _showNotice(
-        ref,
-        title: 'Start blocked',
-        message: msg,
-        kind: NoticeKind.danger,
-      );
-      return;
-    }
+    // === Полный алгоритм старта по сохранённой карте ===
+    //
+    //   1) Preflight (WiFi, карта, RTK FIXED, hAcc, pvtAge, GPS не нулевые,
+    //      есть рабочая зона для построения маршрута).
+    //   2) Модал "Робот проедет 1.5-2 м вперёд" — ждём подтверждения.
+    //   3) AUTO_ALIGN_HEADING_BY_RTK + опрос HEADING_STATUS пока
+    //      headingTrusted=1 AND alignState=OK AND
+    //      headingAgeMs <= 2000 AND lastAlignDist >= 1.0
+    //      AND lastAlignHAcc <= 0.05.
+    //   4) Перечитываем СВЕЖУЮ GPS-позицию робота (он физически сдвинулся).
+    //   5) Перестраиваем маршрут через CleaningRoutePlanner с актуальным
+    //      startOverride = проекция свежей GPS на origin карты.
+    //   6) Upload: ROUTE_BEGIN / ROUTE_WP * N / ROUTE_END.
+    //   7) NAV_START.
+
     if (_navCommandSending) return;
-    setState(() => _navCommandSending = true);
-    try {
-      await ref.read(wifiConnectionProvider.notifier).sendNavStart();
-      if (!mounted) return;
-      final map = _mapState;
-      if (map != null && map.refLat != null && map.refLon != null) {
-        _navRunTracker = NavRunTracker(
-          originLat: map.refLat!,
-          originLon: map.refLon!,
-        )..begin();
-        _navRunTracker?.observe(ref.read(wifiConnectionProvider));
-      }
-    } catch (e) {
-      final err = 'NAV_START failed: $e';
-      if (mounted) setState(() => _routeWorkflowError = err);
-      _showNotice(
-        ref,
-        title: 'Start failed',
-        message: err,
-        kind: NoticeKind.danger,
-      );
+    final wifi0 = ref.read(wifiConnectionProvider);
+    if (!wifi0.isConnected) {
+      _showNotice(ref,
+          title: 'Не подключено',
+          message: 'Подключитесь к роботу перед стартом.',
+          kind: NoticeKind.warning);
       return;
+    }
+
+    // === 1. Preflight
+    final preflightReason = _preflightReason(wifi0);
+    if (preflightReason != null) {
+      setState(() => _routeWorkflowError = preflightReason);
+      _showNotice(ref,
+          title: 'Start blocked', message: preflightReason,
+          kind: NoticeKind.danger);
+      return;
+    }
+
+    // === 2. Auto-align warning
+    final confirmed = await _showAutoAlignWarning();
+    if (!confirmed) {
+      _showNotice(ref,
+          title: 'Отменено',
+          message: 'Старт отменён пользователем.',
+          kind: NoticeKind.info);
+      return;
+    }
+
+    setState(() {
+      _navCommandSending = true;
+      _routeWorkflowError = 'Auto-align: робот едет вперёд ~1.5-2 м…';
+    });
+    final ctrl = ref.read(wifiConnectionProvider.notifier);
+
+    try {
+      // === 3. AUTO_ALIGN + wait heading trusted
+      await ctrl.sendAutoAlignHeadingByRtk();
+      if (!mounted) return;
+      final alignInfo = await _waitHeadingTrusted();
+      if (!mounted) return;
+      setState(() {
+        _routeWorkflowError =
+            'Auto-align OK: heading=${alignInfo.headingDeg.toStringAsFixed(1)}° '
+            'dist=${alignInfo.lastAlignDist.toStringAsFixed(2)}м '
+            'hAcc=${(alignInfo.lastAlignHAcc * 1000).toStringAsFixed(0)}мм';
+      });
+      ref.read(wifiConnectionProvider.notifier).addLocalLog(
+          'AUTO_ALIGN_OK heading=${alignInfo.headingDeg.toStringAsFixed(2)} '
+          'dist=${alignInfo.lastAlignDist.toStringAsFixed(3)} '
+          'hAcc=${alignInfo.lastAlignHAcc.toStringAsFixed(3)}');
+
+      // === 4. Перечитываем СВЕЖУЮ GPS-позицию робота
+      final wifi1 = ref.read(wifiConnectionProvider);
+      final map = _mapState;
+      if (map == null ||
+          map.coordinateType != 'gps' ||
+          map.refLat == null ||
+          map.refLon == null) {
+        throw StateError('Карта без GPS- origin не поддерживается');
+      }
+      if (wifi1.gpsLat == null ||
+          wifi1.gpsLon == null ||
+          wifi1.gpsCarrier?.toLowerCase() != 'fixed' ||
+          (wifi1.gpsAccuracy ?? 9999) > _startMaxHAccMm ||
+          (wifi1.gpsAgeMs ?? 9999) > _startMaxPvtAgeMs) {
+        throw StateError(
+            'После auto-align потеряли RTK FIX: '
+            'lat=${wifi1.gpsLat} lon=${wifi1.gpsLon} '
+            'rtk=${wifi1.gpsCarrier} hAcc=${wifi1.gpsAccuracy} '
+            'pvtAge=${wifi1.gpsAgeMs}');
+      }
+
+      // === 5. Перестраиваем маршрут с актуальным стартом
+      final geom = GpsDisplayGeometry(
+          originLat: map.refLat!, originLon: map.refLon!);
+      final robotLocal = geom.toLocal(wifi1.gpsLat!, wifi1.gpsLon!);
+      final startOverride = Offset(robotLocal.x, robotLocal.y);
+      final cleaningRoute =
+          CleaningRoutePlanner.planRoute(map, lineStep: _draftLineStepMeters,
+              borderPasses: 1, startOverride: startOverride,
+              maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
+              debugPrint: true) ??
+              CleaningRoutePlanner.planRoute(map,
+                  lineStep: math.max(_draftLineStepMeters, 0.50),
+                  borderPasses: 1, startOverride: startOverride,
+                  boundaryMarginMeters: 0.05,
+                  maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
+                  debugPrint: true);
+      if (cleaningRoute == null || cleaningRoute.path.isEmpty) {
+        throw StateError(
+            'Не удалось построить маршрут после auto-align. '
+            'Проверьте, что новая позиция робота внутри рабочей зоны.');
+      }
+      if (cleaningRoute.path.length > _maxRouteWaypoints) {
+        throw StateError(
+            'Маршрут слишком длинный: ${cleaningRoute.path.length} точек '
+            '(лимит $_maxRouteWaypoints)');
+      }
+
+      // === 6. Upload route
+      final freshRoute = cleaningRoute.path;
+      setState(() {
+        _route = freshRoute;
+        _routeDistanceM = cleaningRoute.totalDistance;
+        _routeRunTimeS = _estimatedRunTimeSeconds(cleaningRoute.totalDistance);
+        _routeSent = false;
+        _routeSendProgress = 0;
+        _routeWorkflowError =
+            'Uploading route: 0/${freshRoute.length}';
+      });
+      ref.read(wifiConnectionProvider.notifier).addLocalLog(
+          'ROUTE_PREVIEW origin=(${map.refLat!.toStringAsFixed(7)},'
+          '${map.refLon!.toStringAsFixed(7)}) '
+          'robotLocal=(${robotLocal.x.toStringAsFixed(3)},'
+          '${robotLocal.y.toStringAsFixed(3)}) '
+          'wp0=(${freshRoute.first.dx.toStringAsFixed(3)},'
+          '${freshRoute.first.dy.toStringAsFixed(3)}) '
+          'totalWaypoints=${freshRoute.length} '
+          'totalDistance=${cleaningRoute.totalDistance.toStringAsFixed(2)}');
+
+      await ctrl.sendRouteBegin(freshRoute.length,
+          originLat: map.refLat!, originLon: map.refLon!);
+      for (var i = 0; i < freshRoute.length; i++) {
+        final p = freshRoute[i];
+        await ctrl.sendRoutePoint(i, p.dx, p.dy);
+        if (mounted) {
+          setState(() => _routeWorkflowError =
+              'Uploading route: ${i + 1}/${freshRoute.length}');
+        }
+      }
+      // Boundary / forbidden в MVP-режиме не шлём — карта уже была
+      // сохранена без них, а текущий flow их не требует.
+      await ctrl.sendRouteEnd(freshRoute.length);
+
+      if (!mounted) return;
+      setState(() {
+        _routeSent = true;
+        _routeWorkflowError =
+            'Route uploaded OK (${freshRoute.length} wp). Starting nav…';
+      });
+
+      // === 7. NAV_START
+      await ctrl.sendNavStart();
+      if (!mounted) return;
+      setState(() => _routeWorkflowError = null);
+      _navRunTracker = NavRunTracker(
+        originLat: map.refLat!,
+        originLon: map.refLon!,
+      )..begin();
+      _navRunTracker?.observe(ref.read(wifiConnectionProvider));
+      _showNotice(ref,
+          title: 'Автономка запущена',
+          message: 'NAV_START OK. Робот едет по маршруту '
+              '(${freshRoute.length} wp).',
+          kind: NoticeKind.success);
+    } catch (e) {
+      if (!mounted) return;
+      final err = '$e';
+      setState(() => _routeWorkflowError = err);
+      _showNotice(ref,
+          title: 'Start aborted', message: err, kind: NoticeKind.danger);
     } finally {
       if (mounted) setState(() => _navCommandSending = false);
     }
-    setState(() => _routeWorkflowError = null);
-    _showNotice(
-      ref,
-      title: 'Автономка запущена',
-      message: 'Rover confirmed NAV_START.',
-      kind: NoticeKind.info,
+  }
+
+  // === Preflight: точная причина, не generic ===
+  String? _preflightReason(WifiConnectionState wifi) {
+    if (!wifi.isConnected) return 'WebSocket не подключен';
+    final map = _mapState;
+    if (map == null) return 'Карта не загружена';
+    if (map.coordinateType != 'gps' ||
+        map.refLat == null ||
+        map.refLon == null) {
+      return 'Карта без GPS-origin — автономка невозможна';
+    }
+    if (wifi.gpsLat == null || wifi.gpsLon == null) {
+      return 'Робот не прислал GPS (gpsLat/gpsLon = null)';
+    }
+    final carrier = wifi.gpsCarrier?.toLowerCase();
+    if (carrier != 'fixed') {
+      return 'RTK не в FIXED (текущий carrier=$carrier)';
+    }
+    final hAcc = wifi.gpsAccuracy;
+    if (hAcc == null) {
+      return 'Нет данных о точности (hAcc=null)';
+    }
+    if (hAcc > _startMaxHAccMm) {
+      return 'hAcc=${hAcc}мм > ${_startMaxHAccMm.toStringAsFixed(0)}мм';
+    }
+    final pvtAge = wifi.gpsAgeMs;
+    if (pvtAge == null) return 'Нет PVT-возраста (pvtAgeMs=null)';
+    if (pvtAge > _startMaxPvtAgeMs) {
+      return 'pvtAge=${pvtAge}мс > ${_startMaxPvtAgeMs}мс — позиция устарела';
+    }
+    if (_maxStartOutsideBoundaryMeters <= 0 &&
+        _currentRobotStart(map, wifi) == null) {
+      return 'Текущая позиция робота не внутри рабочей зоны — '
+          'переместите его в зону или увеличьте maxStartOutsideBoundaryMeters';
+    }
+    return null;
+  }
+
+  // === Модал перед auto-align (см. требование шаг 4) ===
+  Future<bool> _showAutoAlignWarning() async {
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text(
+            'Робот сейчас сам проедет вперёд примерно 1.5–2 м '
+            'для определения курса.'),
+        content: const Text(
+            'Убедись, что перед роботом нет людей, животных, стен, '
+            'машин, ям и препятствий.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Вперёд свободен — начать'),
+          ),
+        ],
+      ),
     );
+    return result == true;
+  }
+
+  // === Ожидание HEADING_STATUS с нужными гейтами ===
+  Future<_AlignInfo> _waitHeadingTrusted() async {
+    final ctrl = ref.read(wifiConnectionProvider.notifier);
+    final deadline = DateTime.now().add(_alignTotalTimeout);
+    while (DateTime.now().isBefore(deadline)) {
+      ctrl.sendHeadingStatus();
+      // Дать парсеру шанс обновить wifi.current.headingStatus.
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      final hs = ref.read(wifiConnectionProvider).headingStatus;
+      if (hs != null) {
+        if (hs.alignState == HeadingAlignState.failed) {
+          throw StateError(
+              'AUTO_ALIGN FAILED: ${hs.lastAlignError ?? "unknown"}');
+        }
+        final okTrusted = hs.trusted;
+        final okAlignState = hs.alignState == HeadingAlignState.ok;
+        final headingAgeOk = (hs.headingAgeMs ?? 999999) <=
+            _alignMaxHeadingAgeMs;
+        final distOk = (hs.lastAlignDist ?? 0.0) >=
+            _alignMinLastAlignDistM;
+        final hAccOk = (hs.lastAlignHAcc ?? 999.0) <=
+            _alignMaxLastAlignHAccM;
+        if (okTrusted &&
+            okAlignState &&
+            headingAgeOk &&
+            distOk &&
+            hAccOk &&
+            hs.headingDeg != null) {
+          return _AlignInfo(
+            headingDeg: hs.headingDeg!,
+            lastAlignDist: hs.lastAlignDist ?? 0.0,
+            lastAlignHAcc: hs.lastAlignHAcc ?? 0.0,
+          );
+        }
+      }
+      await Future<void>.delayed(_alignPollInterval);
+    }
+    throw StateError(
+        'Auto-align: таймаут ${_alignTotalTimeout.inSeconds}с — '
+        'headingTrusted=1 с нужными гейтами не получен');
   }
 
   Future<void> _pauseNavigation(WidgetRef ref) async {
@@ -688,34 +935,31 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   }
 
   Future<void> _stopNavigation(WidgetRef ref) async {
-    if (_navCommandSending) return;
-    setState(() => _navCommandSending = true);
-    try {
-      await ref.read(wifiConnectionProvider.notifier).sendNavStop();
-      if (!mounted) return;
-      setState(() {
-        _routeSent = false;
-        _routeWorkflowError = 'Stopped: send the route again before Start.';
-      });
-      _finalizeRunFeedback(ref, endReason: 'NAV_STOP');
-      _showNotice(
-        ref,
-        title: 'Stopped',
-        message: 'Rover confirmed NAV_STOP. Route must be sent again.',
-        kind: NoticeKind.info,
-      );
-    } catch (e) {
-      final err = 'NAV_STOP failed: $e';
-      if (mounted) setState(() => _routeWorkflowError = err);
-      _showNotice(
-        ref,
-        title: 'Stop failed',
-        message: err,
-        kind: NoticeKind.danger,
-      );
-    } finally {
-      if (mounted) setState(() => _navCommandSending = false);
+    // === STOP должен быть non-blocking ===
+    // Шлём raw "STOP" (не NAV_STOP): единая команда для остановки
+    // навигации, auto-align и debug-motion (см. rover.cpp::handleStopLine).
+    final wifi = ref.read(wifiConnectionProvider);
+    if (!wifi.isConnected) {
+      _showNotice(ref,
+          title: 'STOP',
+          message: 'Нет WebSocket-соединения. Отправлять некуда.',
+          kind: NoticeKind.warning);
+      return;
     }
+    // Сразу отдаём отзыв пользователю — "STOP sent" (требование шаг 12).
+    ref.read(wifiConnectionProvider.notifier).addLocalLog(
+        'WORKFLOW [stop] STOP sent (raw, non-blocking)');
+    // Fire-and-forget, чтобы не блокировать UI:
+    ref.read(wifiConnectionProvider.notifier).sendRaw('STOP');
+    setState(() {
+      _routeSent = false;
+      _routeWorkflowError = 'Stopped: send the route again before Start.';
+    });
+    _finalizeRunFeedback(ref, endReason: 'STOP');
+    _showNotice(ref,
+        title: 'STOP sent',
+        message: 'Команда STOP отправлена. Ждём подтверждения робота.',
+        kind: NoticeKind.info);
   }
 
   void _showNotice(
