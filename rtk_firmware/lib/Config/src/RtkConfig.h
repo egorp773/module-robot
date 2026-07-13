@@ -40,7 +40,12 @@
 
 // ---------------- Serial baud ----------------
 #define SERIAL_BAUD       115200
-#define F9P_BAUD          38400    // F9P дефолт — важно для cold start
+#define F9P_BAUD          38400    // F9P дефолт после power-cycle — стартовый бауд для автодетекта
+// Рабочий бауд UART1 F9P. На 38400 (3.84 КБ/с) канал забит: RTCM-инжекция
+// ~2-3 КБ/с + NAV-PVT 5Гц + RXM-RTCM. Поправки опаздывают → FIXED флапает.
+// Gnss::begin() автодетектит текущий бауд (38400 после холодного старта,
+// 115200 после soft-reset ESP32) и поднимает чип до F9P_RUN_BAUD.
+#define F9P_RUN_BAUD      115200
 
 // ---------------- Networking ----------------
 #define WIFI_SSID         "Xiaomi_D465"
@@ -113,7 +118,10 @@
 //   w = k_heading*headingErr_rad + atan(k_crosstrack*ct / (k_soft + |v|))
 // Усиления увеличены vs старой версии (0.55 / 0.08) — старые были насыщены clamp.
 #define ROVER_K_HEADING       1.00f
-#define ROVER_K_CROSSTRACK    0.25f
+// 0.60 вместо 0.25: со старым гейном сходимость к линии занимала метры —
+// робот ехал параллельно сегменту со смещением. Курс теперь постоянно
+// корректируется GPS-course fusion, так что более агрессивный прижим безопасен.
+#define ROVER_K_CROSSTRACK    0.60f
 #define ROVER_STANLEY_SOFT_SPEED 0.30f
 #define ROVER_TURN_THRESH_DEG 25.0f
 #define ROVER_ROTATE_SPEED_RADPS 0.40f
@@ -142,6 +150,10 @@
 
 // nav-v2-simple: deliberately small waypoint controller for first field routes.
 #define ROVER_V2_ARRIVAL_RADIUS_M          0.35f
+// Финальный WP требует более узкого радиуса, чтобы корректно закрывать
+// route и матчиться по прибытии. Промежуточные WP переключаются по
+// along-track к сегменту, финальный — по этому радиусу.
+#define ROVER_V2_FINAL_ARRIVAL_RADIUS_M    0.10f
 #define ROVER_V2_TURN_IN_PLACE_DEG         20.0f
 #define ROVER_V2_TURN_RADPS                 0.95f
 #define ROVER_V2_FORWARD_MPS                0.18f
@@ -151,6 +163,36 @@
 #define ROVER_V2_TURN_MIN_DELTA_DEG          5.0f
 #define ROVER_V2_TURN_MIN_ERROR_IMPROVE_DEG  3.0f
 #define ROVER_GO_DEFAULT_DISTANCE_M         1.0f
+
+// DEBUG_RAMP_UP_M: ramp-up linear-скорости на первых ~15 см сегмента после
+// corner handoff. smoothstep 0->1 применяется только к линейной скорости;
+// turn/angular не трогает. Нужен потому что follower захватывал startX/Y
+// уже после 30-60см дрейфа гусениц по инерции (POST_TURN_SETTLE был 300мс),
+// и Stanley врезал steer в первом же тике — cross-track сразу 0.2м.
+// Объявлен в config, потому что stepFollower() видит его через include.
+#define DEBUG_RAMP_UP_M                     0.15f
+// DEBUG_RAMP_MIN_FACTOR: floor rampFactor — даже если smoothstep(0)=0 на
+// самом старте сегмента, даём ~0.45 от speedBase. Иначе rampFactor=0
+// → linear=0 → ровер не едет → along не растёт → ramp=0 навсегда
+// (deadlock). Только для активной DRIVE-фазы debug/precision flow.
+#define DEBUG_RAMP_MIN_FACTOR               0.45f
+
+// Turn-in-place P-profile + damping по yaw-rate.
+// ROVER_TURN_KP — усиление P-закона для угловой скорости при развороте на
+// месте. Минимум задаёт нижний порог угловой скорости, чтобы гусеницы
+// физически проворачивались (пробить трение).
+#define ROVER_TURN_KP                1.5f
+#define ROVER_TURN_EXIT_DEG          5.0f     // выход из turn-in-place
+#define ROVER_TURN_SETTLE_RATE_DPS   4.0f     // |yawRate| ниже — робот успокоился
+// Демпфирование по угловой скорости (anti-overshoot в Stanley-законе).
+#define ROVER_K_D_YAWRATE            0.10f
+
+// ---------------- GPS course-over-ground fusion ----------------
+// Курс EKF постоянно корректируется направлением движения из NAV-PVT (headMot),
+// но только при реальном движении и с ковариацией из headAcc (иначе на стоянке
+// headMot — чистый шум). Это убирает дрейф гироскопа после RTK-align.
+#define GPS_COURSE_FUSE_MIN_MPS     0.12f   // ниже — headMot не верим
+#define GPS_COURSE_FUSE_MAX_ACC_DEG 25.0f   // headAcc хуже — пропускаем (ковариация всё равно взвешивает)
 
 // ---------------- Telemetry period ----------------
 #define TEL_PERIOD_MS       200
@@ -167,8 +209,11 @@
 #define SAFE_IMU_AGE_MS     200
 #define SAFE_NAV_TIMEOUT_MS 8000
 #define SAFE_REJECTED_POSITION_FIXES_MAX 5
-#define SAFE_HACC_FIXED_M  0.02f
-#define SAFE_HACC_FLOAT_M  0.02f
+// 5 см вместо 2 см: F9P в честном FIXED рутинно репортит hAcc 1.4-2.5 см,
+// и на подвижной платформе кратко прыгает до 3-4 см. Гейт 2 см ронял
+// follower в HOLD (rtk_fixed_hacc) посреди сегмента без реальной потери FIXED.
+#define SAFE_HACC_FIXED_M  0.05f
+#define SAFE_HACC_FLOAT_M  0.05f
 #define SAFE_HACC_HOLD_M   1.00f
 #define SAFE_NUM_SV         10
 #define SAFE_PDOP_MAX       4.0

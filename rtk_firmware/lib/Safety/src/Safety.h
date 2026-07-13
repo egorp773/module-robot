@@ -49,6 +49,12 @@ struct SafetyInput {
     // being live, so IMU staleness must not be fatal. Used to gate the
     // imu_stale Safety check.
     bool headingUsesImu = false;
+    // True while the rover is actively rotating (turn-in-place or in-place
+    // corner turn). hAcc на подвижной платформе кратковременно прыгает до
+    // 2-3 см при повороте корпуса — это нормальный F9P jitter, не деградация
+    // фикса. Safety в этом случае даёт короткий tolerance на hAcc-spike
+    // вместо мгновенного HOLD/ESTOP.
+    bool rotatingInPlace = false;
 };
 
 class Safety {

@@ -26,9 +26,13 @@ public:
     uint32_t packets()      const { return _pkts; }
 
 private:
+    void tryStartUdp(uint32_t nowMs);
+
     Gnss*    _gnss    = nullptr;
     WiFiUDP  _udp;
     uint16_t _udpPort = 2101;
+    bool     _udpStarted = false;
+    uint32_t _lastUdpTryMs = 0;
 
     RtcmSource _src      = RTCM_NONE;
     uint32_t   _lastRxMs = 0;

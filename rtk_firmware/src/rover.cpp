@@ -227,6 +227,17 @@ struct SquareTestStats {
     uint32_t maxPvtAge = 0;
     uint32_t maxRtcmAge = 0;
     uint32_t maxHeadingAge = 0;
+
+    // === Per-segment metrics для SQTEST (4 стороны квадрата) ===
+    // cornerActualX[i] / cornerActualY[i] — где робот реально оказался
+    // при i-й вершине (0..3). cornerErr[i] = расстояние до плана.
+    // segPathLen[i] / segMaxCross[i] / segTurnErr[i] — i-й сегмент.
+    float cornerActualX[4]{NAN, NAN, NAN, NAN};
+    float cornerActualY[4]{NAN, NAN, NAN, NAN};
+    float cornerErr[4]{NAN, NAN, NAN, NAN};
+    float segPathLen[4]{0, 0, 0, 0};
+    float segMaxCross[4]{0, 0, 0, 0};
+    float segTurnErr[4]{NAN, NAN, NAN, NAN};
 };
 
 static SquareTestStats g_sqtest;
@@ -264,7 +275,11 @@ static float lshapeAlongTrack(float ax, float ay, float bx, float by, float px, 
 // cover ~0.5 m at 0.18 m/s ≈ 3 s of motion, plus some startup slack.
 static constexpr uint32_t SERIAL_GO_TIMEOUT_MS     = 10000u;
 static constexpr uint32_t SERIAL_L_SHAPE_TIMEOUT_MS = 30000u;
-static constexpr uint32_t SERIAL_MOTION_SAFETY_GRACE_MS = 500u;
+// Безопасность включает safety только через 1 секунду после старта
+// serialMotion (бывший 500мс). Раньше при первом тике после begin
+// ещё не успевал освежиться lastCmdMs — safety видел "stale link"
+// и убивал команду через 144-252 мс после старта.
+static constexpr uint32_t SERIAL_MOTION_SAFETY_GRACE_MS = 1000u;
 
 static void serialMotionBegin(SerialMotionSource src, uint32_t timeoutMs) {
     const uint32_t now = millis();
@@ -286,11 +301,24 @@ String handleGoSquareDebugLine(float sideM);
 void squareFinish(const char* reason);
 void precisionDebugOnTick();
 bool precisionDebugActive();
+// True если идёт corner turn / settle / post-turn-settle в LTEST/SQTEST.
+// В эти моменты hAcc кратко прыгает — Safety делает tolerance на spike.
+bool precisionIsRotating();
+// Гасит g_precision.active. Вызывается строго из serialMotionEnd() —
+// страховка от "LTEST-DRIVE-TRACE продолжает писать после safety/stop".
+// Не трогает сегменты, маршрут или follower — только precision-state.
+void precisionResetForSafetyEnd();
 }
 
 // Forward decl: resetFollowerConfig is defined below after the Follower
 // struct. Used in serialMotionEnd to revert L-shape test overrides.
 static void resetFollowerConfig();
+
+// Forward decl: ltestDriveTraceTick lives inside namespace roverdbg
+// (see roverdbg::ltestDriveTraceTick below). It needs g_precision /
+// PrecisionPhase which are namespace-local. Call site uses
+// roverdbg::ltestDriveTraceTick().
+namespace roverdbg { void ltestDriveTraceTick(); }
 
 static void serialMotionEnd(const char* reason) {
     if (!g_serialMotion.active && g_serialMotion.source == SerialMotionSource::NONE) return;
@@ -315,6 +343,12 @@ static void serialMotionEnd(const char* reason) {
     // visible via [LTEST] CONFIG at start; this guarantees it does
     // not leak into subsequent motions.
     resetFollowerConfig();
+    // === Точечная защита от "LTEST-DRIVE-TRACE продолжает писать после end" ===
+    // Если по какой-то причине precision-flow не закрылся (safety / STOP /
+    // timeout сбросили serialMotion.active, но g_precision остался активным
+    // с phase=DRIVE) — trace будет писать вечно. Гасим явно через
+    // roverdbg::precisionResetForSafetyEnd().
+    roverdbg::precisionResetForSafetyEnd();
     g_serialMotion.active = false;
     g_serialMotion.source = SerialMotionSource::NONE;
     g_serialMotion.startedAtMs = 0;
@@ -351,6 +385,35 @@ struct Follower {
     // не финишируем маршрут, а переключаемся в degraded-режим и пробуем снова.
     int   faultCount = 0;
     int   lastFaultWp = -1;
+    // FIXED loss: с момента потери начинаем отсчёт; после SAFE_NAV_TIMEOUT_MS —
+    // настоящий fault. 0 = либо нет потери, либо FIXED уже вернулся.
+    uint32_t rtkLostSinceMs = 0;
+    // Стартовая поза для wpIdx==0. Фиксируется один раз за маршрут —
+    // это конец виртуального сегмента A->WP[0].
+    bool  startCaptured = false;
+    float startX = 0;
+    float startY = 0;
+    // turn-in-place флаг (раньше был file-static, мог "застрять" в true).
+    bool  turnInPlaceActive = false;
+
+    // === Диагностика silent zero ===
+    // Последняя причина, по которой мы НЕ отправили команду мотору,
+    // хотя сегмент ещё не закончился. Если пусто — мотор шёл нормально.
+    const char* speedBlockedReason = nullptr;
+    // linear ДО crosstrack-soft и ДО clamp.
+    float linearPreClamp = 0;
+    // linear ПОСЛЕ crosstrack-soft (или 0 если fault).
+    float linearPostClamp = 0;
+    // slowFactor и rampFactor тоже полезны для разбора.
+    float slowFactorDbg = 0;
+    float rampFactorDbg = 0;
+    // heading valid/age на момент tick'а — для диагностики
+    // "navigation gate закрыт".
+    bool  headingValidDbg = false;
+    uint32_t headingAgeDbg = 0xFFFFFFFFu;
+    uint32_t pvtAgeDbg = 0;
+    bool  serialMotionDbg = false;
+    uint32_t lastBlockedLogMs = 0;
 
     void reset() {
         wpIdx = 0; running = false; paused = false;
@@ -366,6 +429,18 @@ struct Follower {
         turnWatchSinceMs = 0;
         faultCount = 0;
         lastFaultWp = -1;
+        rtkLostSinceMs = 0;
+        startCaptured = false;
+        startX = startY = 0;
+        turnInPlaceActive = false;
+        speedBlockedReason = nullptr;
+        linearPreClamp = linearPostClamp = 0;
+        slowFactorDbg = rampFactorDbg = 0;
+        headingValidDbg = false;
+        headingAgeDbg = 0xFFFFFFFFu;
+        pvtAgeDbg = 0;
+        serialMotionDbg = false;
+        lastBlockedLogMs = 0;
     }
 } g_follow;
 
@@ -385,7 +460,7 @@ struct Follower {
 // serialMotionEnd hook so debug overrides never leak into the next
 // regular route.
 static float g_arrivalRadiusM      = ROVER_V2_ARRIVAL_RADIUS_M;
-static float g_finalArrivalRadiusM = ROVER_V2_ARRIVAL_RADIUS_M;
+static float g_finalArrivalRadiusM = ROVER_V2_FINAL_ARRIVAL_RADIUS_M;
 static float g_forwardSpeedMps     = ROVER_V2_FORWARD_MPS;
 
 static void setFollowerConfig(float arrivalRadiusM,
@@ -398,8 +473,19 @@ static void setFollowerConfig(float arrivalRadiusM,
 
 static void resetFollowerConfig() {
     g_arrivalRadiusM      = ROVER_V2_ARRIVAL_RADIUS_M;
-    g_finalArrivalRadiusM = ROVER_V2_ARRIVAL_RADIUS_M;
+    g_finalArrivalRadiusM = ROVER_V2_FINAL_ARRIVAL_RADIUS_M;
     g_forwardSpeedMps     = ROVER_V2_FORWARD_MPS;
+}
+
+// Helper: список "link watchdog" причин, которые должны игнорироваться
+// во время serial/debug autonomous motion. Эти команды самостоятельные —
+// link между WebSocket / Manual и main loop идёт в idle после их запуска,
+// это НЕ признак потери командной связи.
+static bool isSerialMotionIgnorableSafetyReason(const char* reason) {
+    if (!reason) return false;
+    return strcmp(reason, "ws_disconnected") == 0 ||
+           strcmp(reason, "nav_cmd_timeout") == 0 ||
+           strcmp(reason, "manual_cmd_timeout") == 0;
 }
 
 // Called once per loop() from rover.cpp. Clears the serialDebugMotion
@@ -413,6 +499,18 @@ static void serialMotionTick() {
         if (now < g_serialMotion.safetyArmedAtMs &&
             safetyReason != nullptr &&
             strcmp(safetyReason, "ws_disconnected") == 0) {
+            // Старый grace-only-bypass для ws_disconnected — оставлен,
+            // но Safety.cpp уже сейчас возвращает SAFETY_OK для этих причин
+            // во время serial motion. Этот блок остаётся как защита на
+            // первые SERIAL_MOTION_SAFETY_GRACE_MS после begin().
+            return;
+        }
+        if (safetyReason != nullptr &&
+            isSerialMotionIgnorableSafetyReason(safetyReason)) {
+            // Link watchdog не должен убивать self-contained serial motion
+            // (AUTO_ALIGN / GO_FORWARD / GO_L_SHAPE_DEBUG / GO_SQUARE_DEBUG).
+            Serial.printf("[SERIAL-MOTION] ignoring safety reason=%s during serial motion\n",
+                          safetyReason);
             return;
         }
         Serial.printf("[SERIAL-MOTION] safety abort level=%d reason=%s ageSinceBegin=%u\n",
@@ -557,9 +655,8 @@ static bool waitForInitialAbsoluteHeading(uint32_t timeoutMs, float& outHeadingD
 static bool ensureTestOrigin() {
     if (g_est.get().originSet) return true;
     const auto& e = g_est.get();
-    const bool rtkOk =
-        (e.sol == SOL_FIXED && e.hAcc <= SAFE_HACC_FIXED_M) ||
-        (e.sol == SOL_FLOAT && e.hAcc <= 0.05f);
+    // FIXED only в автономных тестах — то же правило, что и stepFollower.
+    const bool rtkOk = (e.sol == SOL_FIXED && e.hAcc <= SAFE_HACC_FIXED_M);
     if (!rtkOk || e.lat == 0.0 || e.lon == 0.0) return false;
     if (!g_est.setOrigin(e.lat, e.lon)) return false;
     const auto& after = g_est.get();
@@ -674,6 +771,12 @@ static void connectWiFi() {
 }
 
 static void stepFollower() {
+    // === LTEST DRIVE PATH TRACE ===
+    // По нему видно, реально ли stepFollower() вызывается для LTEST
+    // и какой linear сейчас считает. Если ты видишь эти строки, но
+    // cmdL=cmdR=0 — значит linear=0 внутри расчёта (slow/ramp/turn).
+    // Если строк НЕТ — stepFollower() вообще не вызывается.
+    roverdbg::ltestDriveTraceTick();
     if (!g_route.isRunning()) {
         g_follow.linearMps = g_follow.angularRadps = 0;
         g_motor.setLinearAngularSpeed(0, 0, true);
@@ -689,15 +792,25 @@ static void stepFollower() {
     int total = g_route.count();
     NavPoint current{e.x, e.y};
 
-    bool rtkOk = (e.sol == SOL_FIXED && e.hAcc <= SAFE_HACC_FIXED_M) ||
-                 (e.sol == SOL_FLOAT && e.hAcc <= 0.05f);
+    // RTK gate (FIXED only в автономном режиме).
+    const bool rtkOk = (e.sol == SOL_FIXED && e.hAcc <= SAFE_HACC_FIXED_M);
     if (!rtkOk || e.pvtAgeMs > SAFE_PVT_AGE_MS ||
         e.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {
+        // Мягкая реакция: плавный стоп + ожидание reacquire в течение
+        // SAFE_NAV_TIMEOUT_MS. Только если FIXED не вернулся за это окно
+        // — реальный fault. followerFault() сам инкрементирует счётчик
+        // и после ROVER_FAULT_RECOVERY_COUNT фаулит маршрут.
         g_follow.linearMps = 0;
         g_follow.angularRadps = 0;
         g_motor.stopImmediately();
+        if (g_follow.rtkLostSinceMs == 0) g_follow.rtkLostSinceMs = millis();
+        if ((millis() - g_follow.rtkLostSinceMs) > SAFE_NAV_TIMEOUT_MS) {
+            followerFault(rtkOk ? "position_stale" : "rtk_lost");
+            g_follow.rtkLostSinceMs = 0;
+        }
         return;
     }
+    g_follow.rtkLostSinceMs = 0;
     g_follow.faultReason = nullptr;
 
     if (!g_route.positionAllowed(current, ROVER_BOUNDARY_TOLERANCE_M)) {
@@ -715,21 +828,55 @@ static void stepFollower() {
         return;
     }
 
+    // === Сегмент A -> B (line follower) ===
+    //   A = предыдущий WP, либо стартовая поза для wpIdx==0;
+    //   B = текущий WP (g_follow.wpIdx).
+    // Сейчас робот едет по waypoint'у (bearing на B), а не по линии AB.
+    // Это и есть "срезание углов + дуга после поворота + перескок курса".
+    // Переходим к Stanley-стилю line following с lookahead на сегменте.
+    NavPoint a;
+    if (g_follow.wpIdx == 0) {
+        // Стартовая поза — фиксируется при первом тике follower'а и
+        // остаётся неизменной до конца маршрута (или до nextUpload).
+        if (!g_follow.startCaptured) {
+            g_follow.startX = current.x;
+            g_follow.startY = current.y;
+            g_follow.startCaptured = true;
+        }
+        a.x = g_follow.startX;
+        a.y = g_follow.startY;
+    } else {
+        const Waypoint& prevWp = g_route.waypoint(g_follow.wpIdx - 1);
+        a.x = prevWp.p.x;
+        a.y = prevWp.p.y;
+    }
     const Waypoint& wp = g_route.waypoint(g_follow.wpIdx);
-    float dx = wp.p.x - current.x;
-    float dy = wp.p.y - current.y;
-    float distToWp = sqrtf(dx * dx + dy * dy);
+    const NavPoint b = wp.p;
 
-    g_follow.targetX = wp.p.x;
-    g_follow.targetY = wp.p.y;
-    g_follow.distToTarget = distToWp;
-    g_follow.crossTrack = 0;
+    const float segVx = b.x - a.x;
+    const float segVy = b.y - a.y;
+    const float segLen = sqrtf(segVx * segVx + segVy * segVy);
 
-    // The arrival radius is per-route configurable via
-    // setFollowerConfig(). Default value matches the original
-    // ROVER_V2_ARRIVAL_RADIUS_M macro; GO_L_SHAPE_DEBUG tightens it
-    // to 0.15 m so the waypoint flip is more precise.
-    if (distToWp < g_arrivalRadiusM) {
+    // along-track (проекция на ось A->B), cross-track (signed).
+    // Используем уже существующие lshape-along/Cross-функции — те же
+    // математика, просто переиспользуем, чтобы не плодить дублей.
+    const float along = lshapeAlongTrack(a.x, a.y, b.x, b.y, current.x, current.y);
+    const float cross = lshapeSignedCross(a.x, a.y, b.x, b.y, current.x, current.y);
+    g_follow.crossTrack = cross;
+
+    // --- Переключение waypoint ---
+    //   * промежуточные WP: along-track >= segLen (минус safety margin);
+    //   * финальный WP (wpIdx == total-1): финиш по радиусу finalArrival
+    //     (0.10 м), чтобы корректно закрывать route.
+    // Решение "по distToWp < arrival" раньше срезало углы.
+    const bool isFinalWp = (g_follow.wpIdx == total - 1);
+    const bool reachedByAlong = (segLen > 0.001f) &&
+                                (along >= segLen - 0.05f);
+    const float distToB = sqrtf((b.x - current.x) * (b.x - current.x) +
+                                (b.y - current.y) * (b.y - current.y));
+    const bool reachedByRadius = distToB <
+        (isFinalWp ? g_finalArrivalRadiusM : g_arrivalRadiusM);
+    if (reachedByAlong || reachedByRadius) {
         g_follow.faultCount = 0;
         g_follow.lastFaultWp = -1;
         g_follow.wpIdx++;
@@ -742,67 +889,173 @@ static void stepFollower() {
             g_motor.setLinearAngularSpeed(0, 0, true);
             return;
         }
-        const Waypoint& nextWp = g_route.waypoint(g_follow.wpIdx);
-        dx = nextWp.p.x - current.x;
-        dy = nextWp.p.y - current.y;
-        distToWp = sqrtf(dx * dx + dy * dy);
-        g_follow.targetX = nextWp.p.x;
-        g_follow.targetY = nextWp.p.y;
-        g_follow.distToTarget = distToWp;
+        // Не делаем резкий turn-in-place сразу после переключения, если
+        // угол между сегментами небольшой. Решение принимается ниже — если
+        // wpIdx уже инкрементирован, на следующем тике возьмём новый сегмент.
+        return;
     }
 
-    NavPoint target{g_follow.targetX, g_follow.targetY};
-    if (!g_route.segmentAllowed(current, target, ROVER_BOUNDARY_TOLERANCE_M, ROVER_BOUNDARY_SAMPLE_M)) {
+    // === Stanley line-follower на сегменте A->B ===
+    // headingErr — относительно направления сегмента (НЕ bearing на B).
+    const float desiredHeading =
+        (segLen > 0.001f) ? NavMath::targetHeadingDeg(segVx, segVy)
+                          : e.headingFiltDeg;
+    const float headingErr = wrapDeg180Local(desiredHeading - e.headingFiltDeg);
+    const float absErr = fabsf(headingErr);
+    g_follow.targetHeadingDeg = desiredHeading;
+    g_follow.headingErr = headingErr;
+
+    // Целевая точка на сегменте: проекция текущей позиции + lookahead.
+    // НО клампим до B, чтобы не уезжать за текущий WP.
+    const float lookahead = (segLen > 0.001f) ? ROVER_LOOKAHEAD_M : 0.0f;
+    float tgtProj = along + lookahead;
+    if (tgtProj > segLen) tgtProj = segLen;
+    float targetX, targetY;
+    if (segLen > 0.001f) {
+        const float u = tgtProj / segLen;
+        targetX = a.x + segVx * u;
+        targetY = a.y + segVy * u;
+    } else {
+        targetX = current.x;
+        targetY = current.y;
+    }
+    g_follow.targetX = targetX;
+    g_follow.targetY = targetY;
+    g_follow.distToTarget = distToB;
+
+    NavPoint targetN{targetX, targetY};
+    if (!g_route.segmentAllowed(current, targetN,
+                                ROVER_BOUNDARY_TOLERANCE_M,
+                                ROVER_BOUNDARY_SAMPLE_M)) {
         followerFault("route_segment_blocked");
         return;
     }
 
-    float desiredHeading = NavMath::targetHeadingDeg(dx, dy);
-    float headingErr = wrapDeg180Local(desiredHeading - e.headingFiltDeg);
-    float absErr = fabsf(headingErr);
-
-    g_follow.targetHeadingDeg = desiredHeading;
-    g_follow.headingErr = headingErr;
-
     float linear = 0.0f;
     float angular = 0.0f;
-    if (absErr > ROVER_V2_TURN_IN_PLACE_DEG) {
-        angular = (headingErr >= 0.0f ? 1.0f : -1.0f) * ROVER_V2_TURN_RADPS;
-        const uint32_t now = millis();
-        const float commandSign = angular >= 0.0f ? 1.0f : -1.0f;
-        if (!g_follow.turnWatchActive ||
-            commandSign != g_follow.turnWatchCommandSign) {
-            g_follow.turnWatchActive = true;
-            g_follow.turnWatchHeadingDeg = e.headingFiltDeg;
-            g_follow.turnWatchAbsErrorDeg = absErr;
-            g_follow.turnWatchCommandSign = commandSign;
-            g_follow.turnWatchSinceMs = now;
-        } else if ((now - g_follow.turnWatchSinceMs) >
-                   ROVER_V2_TURN_WATCHDOG_MS) {
-            const float signedHeadingDelta =
-                wrapDeg180Local(e.headingFiltDeg -
-                                g_follow.turnWatchHeadingDeg);
-            const bool directionOk =
-                signedHeadingDelta * commandSign >=
-                ROVER_V2_TURN_MIN_DELTA_DEG;
-            const bool errorImproved =
-                absErr <= g_follow.turnWatchAbsErrorDeg -
-                          ROVER_V2_TURN_MIN_ERROR_IMPROVE_DEG;
-            if (!directionOk || !errorImproved) {
-                followerFault(!directionOk ? "turn_wrong_direction_or_stuck"
-                                           : "turn_not_converging");
-                return;
-            }
-            g_follow.turnWatchHeadingDeg = e.headingFiltDeg;
-            g_follow.turnWatchAbsErrorDeg = absErr;
-            g_follow.turnWatchSinceMs = now;
-        }
-    } else {
+
+    // === Turn-in-place: гистерезис входа/выхода + P-профиль + settle по yawRate ===
+    // Раньше: bang-bang фиксированная omega=0.95 → перелёт 30°+ и осцилляции.
+    // Теперь: P-профиль clamp(KP*err, minW, maxW) со знаком, выход только когда
+    // ошибка < EXIT_DEG И |yawRate| < SETTLE_RATE_DPS.
+    // Флаг состояния теперь живёт в g_follow (а не file-static), и сбрасывается
+    // в g_follow.reset() — иначе между сессиями он мог застрять в true.
+    const float absYawRate = fabsf(g_imu.yawRateDps());
+
+    auto exitTurnInPlace = [&]() {
+        g_follow.turnInPlaceActive = false;
         g_follow.turnWatchActive = false;
-        linear = (g_safety.level() == SAFETY_DEGRADED) ? ROVER_FLOAT_SPEED : g_forwardSpeedMps;
-        angular = clampf(ROVER_V2_HEADING_KP_RADPS_PER_DEG * headingErr,
-                         -ROVER_V2_MAX_CORRECTION_RADPS,
-                         ROVER_V2_MAX_CORRECTION_RADPS);
+    };
+
+    if (!g_follow.turnInPlaceActive && absErr > ROVER_V2_TURN_IN_PLACE_DEG) {
+        // Вход в turn-in-place.
+        g_follow.turnInPlaceActive = true;
+        g_follow.turnWatchActive = true;
+        g_follow.turnWatchHeadingDeg = e.headingFiltDeg;
+        g_follow.turnWatchAbsErrorDeg = absErr;
+        g_follow.turnWatchCommandSign = (headingErr >= 0.0f) ? 1.0f : -1.0f;
+        g_follow.turnWatchSinceMs = millis();
+    }
+
+    if (g_follow.turnInPlaceActive) {
+        // Проверка выхода: ошибка упала + yaw rate осел.
+        const bool headingOk = absErr < ROVER_TURN_EXIT_DEG;
+        const bool rateOk    = (absYawRate < ROVER_TURN_SETTLE_RATE_DPS);
+        if (headingOk && rateOk) {
+            exitTurnInPlace();
+        } else {
+            // P-профиль: omega = clamp(KP*|err|, MIN, MAX) со знаком err.
+            const float mag = fabsf(ROVER_TURN_KP * headingErr);
+            const float clamped = clampf(mag, ROVER_TURN_MIN_RADPS, ROVER_V2_TURN_RADPS);
+            angular = (headingErr >= 0.0f ? clamped : -clamped);
+            linear = 0.0f;
+
+            // Watchdog от старого кода оставлен: если за ROVER_V2_TURN_WATCHDOG_MS
+            // направление/ошибка не улучшились — fault.
+            const uint32_t now = millis();
+            if ((now - g_follow.turnWatchSinceMs) > ROVER_V2_TURN_WATCHDOG_MS) {
+                const float signedDelta =
+                    wrapDeg180Local(e.headingFiltDeg - g_follow.turnWatchHeadingDeg);
+                const bool directionOk =
+                    signedDelta * g_follow.turnWatchCommandSign >= ROVER_V2_TURN_MIN_DELTA_DEG;
+                const bool errorImproved =
+                    absErr <= g_follow.turnWatchAbsErrorDeg - ROVER_V2_TURN_MIN_ERROR_IMPROVE_DEG;
+                if (!directionOk || !errorImproved) {
+                    exitTurnInPlace();
+                    followerFault(!directionOk ? "turn_wrong_direction_or_stuck"
+                                               : "turn_not_converging");
+                    return;
+                }
+                g_follow.turnWatchHeadingDeg = e.headingFiltDeg;
+                g_follow.turnWatchAbsErrorDeg = absErr;
+                g_follow.turnWatchSinceMs = now;
+            }
+        }
+    }
+
+    if (!g_follow.turnInPlaceActive) {
+        // === Drive-on-line (Stanley) ===
+        // Если headingErr большой (но < V2_TURN_IN_PLACE_DEG), притормаживаем.
+        const float headingRad = headingErr * (float)M_PI / 180.0f;
+        const float speedBase = (g_safety.level() == SAFETY_DEGRADED)
+                                ? ROVER_FLOAT_SPEED : g_forwardSpeedMps;
+        // linear снижается по закону 1 - errNorm^2, где errNorm = absErr/45°.
+        const float errNorm = absErr / 45.0f;
+        const float slowFactor = (errNorm >= 1.0f) ? 0.0f
+                                : (1.0f - errNorm * errNorm);
+        // Ramp-up на первых ~15 см сегмента: после corner handoff heading
+        // ещё качается, и если сразу дать full speed на первых сантиметрах,
+        // Stanley врезает жёсткий steer и cross-track сразу уходит в 0.2м.
+        // smoothstep 0->1 по along/RAMP_UP_M, не трогает ни turn, ни angular.
+        //
+        // FLOOR: DEBUG_RAMP_MIN_FACTOR — иначе на самом старте сегмента
+        // along=0 → smoothstep(0)=0 → linear=0 → ровер не едет → along
+        // не растёт → rampFactor=0 навсегда (deadlock). Минимум 0.45
+        // даёт ~0.05 м/с на старте (g_forwardSpeedMps=0.11 для LTEST).
+        float rampFactor = 1.0f;
+        if (along < DEBUG_RAMP_UP_M) {
+            const float u = along / DEBUG_RAMP_UP_M;     // 0..1
+            rampFactor = u * u * (3.0f - 2.0f * u);       // smoothstep
+            if (rampFactor < DEBUG_RAMP_MIN_FACTOR) {
+                rampFactor = DEBUG_RAMP_MIN_FACTOR;
+            }
+        }
+        // Сохраняем в debug-поля ДО обёртки в crosstrack-guard — чтобы
+        // по логу можно было отличить "slowFactor=0" от "rampFactor=0"
+        // от "мотор не поехал по gate" (три разные причины нуля).
+        g_follow.slowFactorDbg = slowFactor;
+        g_follow.rampFactorDbg = rampFactor;
+        g_follow.linearPreClamp = speedBase * slowFactor * rampFactor;
+        linear = g_follow.linearPreClamp;
+
+        // Stanley: heading gain + atan(k_ct * cross / (k_soft + |v|))
+        // + демпфирование по yawRate (rad/s).
+        const float yawRateRadps =
+            g_imu.yawRateDps() * (float)M_PI / 180.0f *
+            (IMU_YAW_RATE_SIGN == 0 ? 1 : (IMU_YAW_RATE_SIGN > 0 ? 1.0f : -1.0f));
+        const float v = linear;
+        const float crossTerm = atanf(ROVER_K_CROSSTRACK * cross /
+                                       (ROVER_STANLEY_SOFT_SPEED + fabsf(v)));
+        angular = ROVER_K_HEADING * headingRad + crossTerm
+                  - ROVER_K_D_YAWRATE * yawRateRadps;
+        const float angClamp = ROVER_V2_MAX_CORRECTION_RADPS;
+        if (angular >  angClamp) angular =  angClamp;
+        if (angular < -angClamp) angular = -angClamp;
+    }
+
+    // === Crosstrack guard ===
+    //   > SOFT_M  — снижаем скорость пропорционально превышению;
+    //   > HARD_M  — fault (crosstrack_exceeded), без терминального recovery-стэка.
+    const float absCross = fabsf(g_follow.crossTrack);
+    if (absCross > ROVER_CROSSTRACK_HARD_M) {
+        followerFault("crosstrack_exceeded");
+        return;
+    }
+    if (absCross > ROVER_CROSSTRACK_SOFT_M && linear > 0.0f) {
+        const float over = absCross - ROVER_CROSSTRACK_SOFT_M;
+        const float span = ROVER_CROSSTRACK_HARD_M - ROVER_CROSSTRACK_SOFT_M;
+        const float factor = 1.0f - clampf(over / span, 0.0f, 1.0f);
+        linear *= factor;
     }
 
     g_follow.linearMps = linear;
@@ -810,12 +1063,85 @@ static void stepFollower() {
 
     if (!checkFollowerProgress(e, linear)) return;
 
-    if (g_ws.navRequested() && g_route.isRunning() && g_safety.allowMotion()) {
+    g_follow.linearPostClamp = linear;
+    g_follow.headingValidDbg = e.headingValid;
+    g_follow.headingAgeDbg   = e.headingAgeMs;
+    g_follow.pvtAgeDbg       = e.pvtAgeMs;
+    g_follow.serialMotionDbg = g_serialMotion.active;
+
+    const bool navOk   = g_ws.navRequested();
+    const bool routeOk = g_route.isRunning();
+    const bool safeOk  = g_safety.allowMotion();
+    const bool canDrive = navOk && routeOk && safeOk;
+
+    if (canDrive) {
+        // SAFETY NET: даже если rampFactor/slowFactor дали 0 на самом
+        // старте сегмента, и пока робот реально едет к target (а не
+        // завершил), даём ненулевую скорость. Иначе ramp начинается с
+        // 0 → linear=0 → робот не едет → along не растёт → rampFactor
+        // остаётся 0 (deadlock). Это последний рубеж: основной floor
+        // rampFactor стоит выше через DEBUG_RAMP_MIN_FACTOR; этот
+        // слой — для случаев, когда slowFactor*=0 при absErr>=45°, но
+        // робот уже середине сегмента и должен ехать дальше.
+        if (linear <= 0.0f && !g_follow.turnInPlaceActive &&
+            g_route.isRunning() && g_follow.wpIdx < g_route.count()) {
+            const float absHErr = fabsf(headingErr);
+            // Только при "маленькой" heading-ошибке — иначе это уже
+            // turn-in-place, который смотрит отдельно.
+            if (absHErr < ROVER_V2_TURN_IN_PLACE_DEG &&
+                g_follow.distToTarget > (g_arrivalRadiusM + 0.02f)) {
+                // 0.06 м/с — гарантированно выше физического порога
+                // гусениц, чтобы ramp разморозился. После первого
+                // тика along > 0, smoothstep наберёт нормальное
+                // значение и этот слой не понадобится.
+                linear = 0.06f;
+                const float headingRadLocal = headingErr * (float)M_PI / 180.0f;
+                angular = clampf(ROVER_K_HEADING * headingRadLocal,
+                                 -ROVER_V2_MAX_CORRECTION_RADPS,
+                                 ROVER_V2_MAX_CORRECTION_RADPS);
+            }
+        }
+        g_follow.speedBlockedReason = nullptr;
+        g_follow.linearMps = linear;
+        g_follow.angularRadps = angular;
         g_motor.setLinearAngularSpeed(linear, angular, true);
     } else {
+        // Раньше это был silent zero — сейчас фиксируем конкретную причину
+        // и логируем не чаще раза в 500мс, чтобы не флудить Serial.
+        const char* why;
+        if      (!navOk)   why = "nav_not_requested";
+        else if (!routeOk) why = "route_not_running";
+        else if (!safeOk)  why = "safety_disallows_motion";
+        else               why = "unknown";
+        g_follow.speedBlockedReason = why;
         g_follow.linearMps = 0;
         g_follow.angularRadps = 0;
         g_motor.stopImmediately();
+
+        const uint32_t now = millis();
+        if (now - g_follow.lastBlockedLogMs > 500u) {
+            g_follow.lastBlockedLogMs = now;
+            Serial.printf("[FOLLOWER-BLOCKED] reason=%s navReq=%d routeRun=%d safeOK=%d "
+                          "safetyLevel=%d safetyReason=%s "
+                          "linearPreClamp=%.3f linearPostClamp=%.3f "
+                          "slowFactor=%.2f rampFactor=%.2f "
+                          "headingErr=%.1f absErr=%.1f cross=%.3f "
+                          "headingValid=%d headingAge=%u pvtAge=%u "
+                          "serialMotion=%d\n",
+                          why, (int)navOk, (int)routeOk, (int)safeOk,
+                          (int)g_safety.level(),
+                          g_safety.reason() ? g_safety.reason() : "-",
+                          (double)g_follow.linearPreClamp,
+                          (double)g_follow.linearPostClamp,
+                          (double)g_follow.slowFactorDbg,
+                          (double)g_follow.rampFactorDbg,
+                          (double)headingErr, (double)absErr,
+                          (double)g_follow.crossTrack,
+                          (int)g_follow.headingValidDbg,
+                          (unsigned)g_follow.headingAgeDbg,
+                          (unsigned)g_follow.pvtAgeDbg,
+                          (int)g_follow.serialMotionDbg);
+        }
     }
 }
 
@@ -841,7 +1167,7 @@ static constexpr float ALIGN_FORWARD_MPS       = 0.18f;
 // We always stop at 1.5 m (or earlier) so an over-shoot doesn't push the
 // robot outside the test field, but OK is also allowed to fire earlier if
 // we have enough high-confidence travel.
-static constexpr float ALIGN_MAX_DIST_M        = 1.5f;
+static constexpr float ALIGN_MAX_DIST_M        = 2.5f;
 static constexpr float ALIGN_MIN_TRAVEL_M      = 1.0f;   // accept-OK travel
 static constexpr uint32_t ALIGN_TIMEOUT_MS     = 15000u;
 // Below this we still accept but tag as not_enough_motion in diagnostics.
@@ -933,6 +1259,10 @@ struct AlignRun {
     // Monotonic counter of samples pushed this run. Used for the
     // per-sample debug log.
     uint32_t samplePushCount = 0;
+    // Alive-watchdog: момент последнего успешного push'а PVT. Если в
+    // DRIVE-фазе новых PVT не было дольше ALIGN_DRIVE_ALIVE_MS — ровер
+    // может ехать по инерции прошлой команды, поэтому abort.
+    uint32_t lastSamplePushedMs = 0;
 
     bool abortedByStop = false;
     bool abortedByRtk = false;
@@ -950,6 +1280,15 @@ static bool rtkAcceptableForAlign(const Estimate& e) {
 // Begin a new alignment run. Returns true if we transitioned to RUNNING and
 // the caller can expect g_heading to be updated once stepAlign() finishes.
 static bool autoAlignHeadingBegin(bool fromWebSocket) {
+    // Busy-guard: AUTO_ALIGN конкурирует за моторы с другими debug
+    // motion. Нельзя стартовать новый поверх активного.
+    if (g_serialMotion.active) {
+        g_heading.lastAlignError = "busy_serial_motion";
+        g_heading.alignState = AlignState::ERR;
+        Serial.printf("[BUSY] AUTO_ALIGN rejected: serialMotionSource=%s active\n",
+                      serialMotionSourceName(g_serialMotion.source));
+        return false;
+    }
     const auto& e0 = g_est.get();
     if (!rtkAcceptableForAlign(e0)) {
         g_heading.lastAlignError = "rtk_lost";
@@ -1000,6 +1339,7 @@ static bool autoAlignHeadingBegin(bool fromWebSocket) {
     g_align.endLogged = false;
     g_align.lastSeenPvtAgeMs = 0xFFFFFFFFu;
     g_align.samplePushCount = 0;
+    g_align.lastSamplePushedMs = 0;
     g_heading.alignStartedAtMs = g_align.startedAtMs;
     g_heading.alignState = AlignState::RUNNING;
     g_heading.lastAlignError = nullptr;
@@ -1376,12 +1716,27 @@ static void stepAlign(bool& stopMotorsOut, const char*& errOut) {
     g_align.lastSeenPvtAgeMs = age;
 
     if (!newPvt) {
-        // No new PVT this tick — keep the motor primed but skip sample.
+        // No new PVT this tick. Раньше код продолжал setLinearAngularSpeed(...)
+        // в DRIVE — если PVT реально пропал, ровер продолжал ехать по инерции
+        // прошлой команды. Теперь: если новых PVT не было дольше ALIVE_MS —
+        // abort. Это решает "ровер ехал молча после последнего sample n=22
+        // и не останавливался" (наблюдалось 2026-07-06 в полевом тесте).
         if (g_align.phase == AlignPhase::DRIVE) {
+            // Грубая защита: если цикл без свежего PVT длиннее ALIVE_MS —
+            // гарантированно abort. Мотор стопит alignAbort() сам.
+            constexpr uint32_t ALIGN_DRIVE_ALIVE_MS = 2000u;
+            if (now - g_align.lastSamplePushedMs > ALIGN_DRIVE_ALIVE_MS) {
+                alignAbort("pvt_dropped_in_drive", e, now);
+                stopMotorsOut = true;
+                errOut = "pvt_dropped_in_drive";
+                return;
+            }
             g_motor.setLinearAngularSpeed(ALIGN_FORWARD_MPS, 0.0f, true);
         }
         return;
     }
+    // Новый PVT пришёл — фиксируем момент для alive-watchdog'а выше.
+    g_align.lastSamplePushedMs = now;
     alignPushSample(e.x, e.y, e.hAcc, now);
 
     // Phase transitions and per-phase behaviour.
@@ -1632,7 +1987,19 @@ void loop() {
             g_gnss.lastHAccMm(), g_gnss.lastVAccMm(),
             g_gnss.lastGSpeedMmps(), g_gnss.lastHeadMotDe5(),
             g_gnss.lastFixType(), g_gnss.lastCarrierSol(), g_gnss.lastDiffSoln(),
-            g_gnss.lastNumSv(), g_gnss.lastPDop());
+            g_gnss.lastNumSv(), g_gnss.lastPDop(),
+            g_gnss.lastHeadAccDe5());
+    }
+    // RTCM транспорт → возраст в эстимейторе (раньше est.rtcmAgeMs зеркалил
+    // возраст PVT и телеметрия врала). Отмечаем каждый принятый UDP-пакет.
+    {
+        static uint32_t s_lastRtcmPkts = 0;
+        if (g_rtcm.packets() != s_lastRtcmPkts) {
+            s_lastRtcmPkts = g_rtcm.packets();
+            g_est.onRtcmInfo(now, (int)g_gnss.rtcm().lastType,
+                             (int)g_gnss.rtcm().msgCount,
+                             (int)g_gnss.rtcm().crcFail);
+        }
     }
     g_est.onImu(now, g_imu.yawRateDps(), g_imu.fresh() && g_imu.ageMs(now) < SAFE_IMU_AGE_MS,
                 g_imu.yawDeg(), g_imu.yawAbsoluteValid(),
@@ -1697,6 +2064,19 @@ void loop() {
         g_heading.alignState == AlignState::RUNNING &&
         !g_align.fromWebSocket;
     si.serialDebugMotion = serialAlignActive || g_serialMotion.active;
+
+    // rotatingInPlace: turn-in-place активен в follower'е, ИЛИ идёт
+    // угловой поворот (precision corner turn в LTEST/SQTEST имеет
+    // большую угловую скорость даже когда motor cmd=0 — гусеницы
+    // инерциально катятся). hAcc в эти моменты кратко прыгает до
+    // 2-3 см (нормальный F9P jitter на подвижной платформе, не потеря
+    // FIXED) — Safety делает короткий tolerance на spike.
+    //
+    // Доступ к g_precision/PrecisionPhase идёт через roverdbg::, потому
+    // что они объявлены в namespace roverdbg (см. ниже по файлу).
+    si.rotatingInPlace = g_follow.turnInPlaceActive ||
+        roverdbg::precisionIsRotating() ||
+        fabsf(g_imu.yawRateDps()) > 5.0f;
 
     // Relaxed PVT staleness threshold while alignment is running (in
     // either Serial or WebSocket mode). Normal navigation keeps the
@@ -1877,7 +2257,8 @@ void loop() {
                       "alignState=%s lastAlignHeading=%.1f lastAlignDist=%.3f "
                       "wsTelSent=%u wsTelDropped=%u "
                       "serialMotion=%d serialMotionSource=%s wsConn=%d safety=%d reason=%s "
-                      "imuAbsAge=%u imuRelYawAge=%u gyroAge=%u\n",
+                      "imuAbsAge=%u imuRelYawAge=%u gyroAge=%u "
+                      "odoL=%d odoR=%d gpsCourse=%.1f gpsCourseAcc=%.1f gpsCourseUsed=%d\n",
             (unsigned long)now, e.lat, e.lon, e.x, e.y,
             g_imu.yawDeg(), g_imu.rawYawDeg(), (int)g_imu.headingState(), (int)g_imu.yawSource(), g_imu.yawAbsoluteValid() ? 1 : 0,
             g_imu.yawFromMag() ? 1 : 0, g_imu.magNorm(),
@@ -1909,7 +2290,13 @@ void loop() {
             g_safety.reason(),
             (unsigned)g_imu.absYawAgeMs(now),
             (unsigned)g_imu.relYawAgeMs(now),
-            (unsigned)g_imu.gyroAgeMs(now));
+            (unsigned)g_imu.gyroAgeMs(now),
+            // Одометрия сырьём: проверить знаки (вперёд → оба положительные?)
+            // и масштаб kMeasToMps по фактической скорости.
+            g_motor.speedLeftMeas(), g_motor.speedRightMeas(),
+            (double)e.headingDeg,          // сырой GPS-курс
+            (double)e.gpsCourseAccDeg,     // headAcc, deg
+            e.gpsCourseUsed ? 1 : 0);      // курс скорректирован этим PVT
     }
 }
 
@@ -2121,12 +2508,30 @@ static bool goPrecheck() {
     return true;
 }
 
+// Busy-guard: любая debug-motion команда обязана отказаться, если
+// уже идёт другой serial/debug autonomous motion. Иначе пользователь
+// может запустить SQTEST поверх оборванного LTEST и получить два
+// активных follower'а одновременно.
+static bool serialMotionBusy() {
+    return g_serialMotion.active;
+}
+
 bool handleGoForward(float distanceM) {
+    if (serialMotionBusy()) {
+        Serial.printf("[BUSY] GO_FORWARD rejected: serialMotionSource=%s active\n",
+                      serialMotionSourceName(g_serialMotion.source));
+        return false;
+    }
     if (!goPrecheck()) return false;
     return startGoRoute("GO_FORWARD", distanceM, true);
 }
 
 bool handleGoNorth(float distanceM) {
+    if (serialMotionBusy()) {
+        Serial.printf("[BUSY] GO_NORTH rejected: serialMotionSource=%s active\n",
+                      serialMotionSourceName(g_serialMotion.source));
+        return false;
+    }
     if (!goPrecheck()) return false;
     return startGoRoute("GO_NORTH", distanceM, false);
 }
@@ -2204,11 +2609,25 @@ bool handleGoLShape(float firstM, float turnDeg, float secondM) {
     return true;
 }
 
-static constexpr float DEBUG_PRECISION_RADIUS_M = 0.15f;
+static constexpr float DEBUG_PRECISION_RADIUS_M = 0.25f;
+static constexpr float DEBUG_PRECISION_FINAL_RADIUS_M = 0.20f;
 static constexpr float DEBUG_PRECISION_SPEED_MPS = 0.11f;
 static constexpr float DEBUG_TURN_TOLERANCE_DEG = 7.0f;
 static constexpr uint32_t DEBUG_SETTLE_MS = 300u;
-static constexpr uint32_t DEBUG_TURN_HOLD_MS = 200u;
+static constexpr uint32_t DEBUG_TURN_HOLD_MS = 400u;
+static constexpr uint32_t DEBUG_POST_TURN_SETTLE_MS = 800u;
+// DEBUG_RAMP_UP_M — в RtkConfig.h (нужен stepFollower'у ниже по файлу).
+
+// === Precision debug turn PWM profile ===
+//
+// Танковая платформа на малых радиусах перелетает target heading на
+// полной угловой скорости (cmdL=-9 cmdR=9 = 1.5 wheels/sec). Делаем
+// ступенчатый профиль, чтобы робот не «проскакивал» цель и плавно
+// вставал в tolerance.
+static constexpr int PRECISION_TURN_PWM_MAX = 6;   // abs(err) > 60°
+static constexpr int PRECISION_TURN_PWM_MID = 5;   // 25..60°
+static constexpr int PRECISION_TURN_PWM_LOW = 4;   // 10..25°
+static constexpr int PRECISION_TURN_PWM_MIN = 3;   // < 10° (creep)
 static constexpr uint32_t SERIAL_SQUARE_TIMEOUT_MS = 70000u;
 
 enum class PrecisionPhase : uint8_t {
@@ -2216,6 +2635,7 @@ enum class PrecisionPhase : uint8_t {
     DRIVE,
     SETTLE,
     TURN,
+    POST_TURN_SETTLE,
 };
 
 struct PrecisionDebugMotion {
@@ -2230,7 +2650,15 @@ struct PrecisionDebugMotion {
     PrecisionPhase phase = PrecisionPhase::IDLE;
     uint32_t phaseStartedMs = 0;
     uint32_t headingOkSinceMs = 0;
+    int lastTurnPwm = 0;     // последняя PWM-ступень поворота (для лога при смене)
     const char* tag = "LTEST";
+    // Опорная точка нового сегмента, фиксируется ЗДЕСЬ когда ровер
+    // реально стоит после POST_TURN_SETTLE. Передаётся в uploadPrecisionSegment
+    // и прибивается к g_follow.startX/startY напрямую — иначе Stanley бы
+    // захватывал её на первом тике follower'а когда ровер ещё чуть-чуть
+    // дрейфует, и первые 1-2 sample'а уже давали cross-track 0.2м.
+    float segmentStartX = 0;
+    float segmentStartY = 0;
 };
 
 static PrecisionDebugMotion g_precision;
@@ -2239,11 +2667,25 @@ bool precisionDebugActive() {
     return g_precision.active;
 }
 
+// True если идёт corner turn / settle / post-turn-settle в LTEST/SQTEST.
+// В эти моменты hAcc кратко прыгает — Safety делает tolerance на spike.
+bool precisionIsRotating() {
+    if (!g_precision.active) return false;
+    return g_precision.phase == PrecisionPhase::TURN ||
+           g_precision.phase == PrecisionPhase::SETTLE ||
+           g_precision.phase == PrecisionPhase::POST_TURN_SETTLE;
+}
+
 static bool uploadPrecisionSegment(int segment) {
     const auto& e = g_est.get();
     if (!e.originSet) return false;
-    const float sx = e.x;
-    const float sy = e.y;
+    // Если в фазе POST_TURN_SETTLE уже зафиксировали опорную точку
+    // (g_precision.segmentStartX/Y), используем ЕЁ как start of segment.
+    // Иначе fallback на текущую позицию (первый сегмент LTEST/SQTEST).
+    const bool haveAnchor = (segment > 0) || g_precision.segmentStartX != 0.0f ||
+                            g_precision.segmentStartY != 0.0f;
+    const float sx = haveAnchor ? g_precision.segmentStartX : e.x;
+    const float sy = haveAnchor ? g_precision.segmentStartY : e.y;
     const float tx = g_precision.px[segment + 1];
     const float ty = g_precision.py[segment + 1];
     const float margin = 0.75f;
@@ -2253,6 +2695,14 @@ static bool uploadPrecisionSegment(int segment) {
     const float maxY = fmaxf(sy, ty) + margin;
 
     g_follow.reset();
+    // Если есть опорная точка — прибиваем её в follower заранее:
+    // g_follow.startCaptured=true и g_follow.startX/startY заданы явно,
+    // stepFollower() не будет "первого тика" захвата.
+    if (haveAnchor && segment > 0) {
+        g_follow.startX = sx;
+        g_follow.startY = sy;
+        g_follow.startCaptured = true;
+    }
     if (!g_route.beginUpload(1, e.originLat, e.originLon)) return false;
     g_route.addWaypoint(0, tx, ty);
     g_route.beginBoundary(4);
@@ -2268,6 +2718,22 @@ static bool uploadPrecisionSegment(int segment) {
     g_ws.requestDebugNavigation();
     g_precision.phase = PrecisionPhase::DRIVE;
     g_precision.phaseStartedMs = millis();
+    // anchor уже использован — обнуляем, чтобы следующий сегмент
+    // (если это не corner handoff) считал свой собственный anchor.
+    g_precision.segmentStartX = 0;
+    g_precision.segmentStartY = 0;
+
+    if (g_precision.square) {
+        Serial.printf("[SQTEST] DRIVE_SEGMENT corner=%d start=(%.3f,%.3f) "
+                      "target=(%.3f,%.3f)\n",
+                      segment + 1,
+                      (double)sx, (double)sy, (double)tx, (double)ty);
+    } else {
+        Serial.printf("[LTEST] DRIVE_SEGMENT logicalSegment=%d start=(%.3f,%.3f) "
+                      "target=(%.3f,%.3f)\n",
+                      segment,
+                      (double)sx, (double)sy, (double)tx, (double)ty);
+    }
     return true;
 }
 
@@ -2277,6 +2743,9 @@ static float precisionTargetHeading() {
     }
     return g_precision.finalHeading;
 }
+
+// Forward decl для фикса WP1_REACHED внутри finishPrecisionTurn.
+static void lShapeRecordWp1();
 
 static void beginPrecisionTurn(bool finalTurn) {
     const uint32_t now = millis();
@@ -2305,6 +2774,11 @@ static void finishPrecisionTurn(bool finalTurn, float err) {
     const auto& e = g_est.get();
     g_motor.stopImmediately();
     if (g_precision.square) {
+        // SQTEST: фиксируем turnErr сегмента (g_precision.segment = только
+        // что завершённый corner). corner N=segment+1 (1..4).
+        if (g_precision.segment >= 0 && g_precision.segment < 4) {
+            g_sqtest.segTurnErr[g_precision.segment] = err;
+        }
         Serial.printf("[SQTEST] CORNER_TURN_DONE corner=%d heading=%.1f err=%+.1f\n",
                       g_precision.segment + 1,
                       (double)e.headingFiltDeg,
@@ -2320,10 +2794,42 @@ static void finishPrecisionTurn(bool finalTurn, float err) {
                       (double)err);
     }
 
+    // DRIVE_SEGMENT_DONE — фиксируем длину/cross-track сегмента, который
+    // только что закончился. logicalSegment = g_precision.segment (старый,
+    // ещё не инкрементированный).
+    if (!g_precision.square) {
+        const int doneSeg = g_precision.segment;
+        if (doneSeg == 0) {
+            Serial.printf("[LTEST] DRIVE_SEGMENT_DONE logicalSegment=0 "
+                          "chord=%.3f pathLen=%.3f maxCross=%.3f\n",
+                          (double)g_ltest.firstPlan,
+                          (double)g_ltest.pathLen1,
+                          (double)g_ltest.maxCross1);
+        } else {
+            Serial.printf("[LTEST] DRIVE_SEGMENT_DONE logicalSegment=1 "
+                          "chord=%.3f pathLen=%.3f maxCross=%.3f\n",
+                          (double)g_ltest.secondPlan,
+                          (double)g_ltest.pathLen2,
+                          (double)g_ltest.maxCross2);
+        }
+    }
+
     if (finalTurn) {
+        // Последний сегмент завершён — фиксируем WP1, если это L-shape и
+        // мы только что прошли logical segment 0 (один раз за тест).
+        if (!g_precision.square) {
+            lShapeRecordWp1();
+        }
         g_precision.active = false;
         serialMotionEnd("arrived");
         return;
+    }
+
+    // Переход segment -> segment+1. До инкремента — это та точка, где
+    // logical segment 0 (p0->p1) только что завершён и робот фактически
+    // стоит на p1. Это идеальное место для WP1_REACHED в LTEST.
+    if (!g_precision.square && g_precision.segment == 0) {
+        lShapeRecordWp1();
     }
 
     g_precision.segment++;
@@ -2331,6 +2837,75 @@ static void finishPrecisionTurn(bool finalTurn, float err) {
         g_precision.active = false;
         serialMotionEnd("route_begin_failed");
     }
+}
+
+// LTEST DRIVE PATH TRACE
+//
+// Этот trace вызывается из stepFollower() раз в секунду во время LTEST
+// DRIVE-фазы и показывает ВСЕ поля, которые нужны для понимания, почему
+// linear = 0: navRequested / routeRunning / serialMotion / allowMotion /
+// speedBase / linearPreClamp / linearPostClamp / slowFactor / rampFactor /
+// turnInPlaceActive / headingErr / cross / sol / hAcc / pvtAge /
+// headingValid / headingAge / speedBlockedReason.
+//
+// Если строки НЕТ — stepFollower() вообще не вызывается (это будет
+// означать что LTEST DRIVE идёт по другому пути).
+// Если строка есть и все gate=true, но linPre=0 — баг в slow/ramp/turn
+// расчёте. Если linPre != 0 а linPost=0 — баг в crosstrack-soft/hard gate.
+// Если оба > 0, но мотор шлёт 0 — баг в Motor.cpp (не тот путь).
+void ltestDriveTraceTick() {
+    if (!g_precision.active) return;
+    if (g_precision.phase != PrecisionPhase::DRIVE) return;
+    static uint32_t s_lastMs = 0;
+    const uint32_t now = millis();
+    if ((now - s_lastMs) < 1000u) return;
+    s_lastMs = now;
+
+    const auto& e = g_est.get();
+    const bool navOk   = g_ws.navRequested();
+    const bool routeOk = g_route.isRunning();
+    const int  pauseOk = g_route.isPaused() ? 0 : 1;
+    const bool safeOk  = g_safety.allowMotion();
+    const int  canDrive = (navOk && routeOk && (pauseOk != 0) && safeOk) ? 1 : 0;
+    const float speedBase = (g_safety.level() == SAFETY_DEGRADED)
+                            ? ROVER_FLOAT_SPEED : g_forwardSpeedMps;
+    const char* block = g_follow.speedBlockedReason ? g_follow.speedBlockedReason : "-";
+    Serial.printf("[LTEST-DRIVE-TRACE] t=%u seg=%d/%d navReq=%d routeRun=%d "
+                  "paused=%d serialMotion=%d allowMotion=%d canDrive=%d "
+                  "speedBase=%.2f linPre=%.3f linPost=%.3f slow=%.2f ramp=%.2f "
+                  "turnIP=%d hErr=%+.1f cross=%+.3f "
+                  "sol=%d hAcc=%.3f pvtAge=%u rtcmAge=%lu eHValid=%d eHAge=%u "
+                  "block=%s\n",
+        (unsigned)now,
+        g_precision.segment, g_precision.segmentCount,
+        (int)navOk, (int)routeOk, pauseOk,
+        (int)g_serialMotion.active, (int)safeOk, canDrive,
+        (double)speedBase,
+        (double)g_follow.linearPreClamp,
+        (double)g_follow.linearPostClamp,
+        (double)g_follow.slowFactorDbg,
+        (double)g_follow.rampFactorDbg,
+        (int)g_follow.turnInPlaceActive,
+        (double)g_follow.headingErr,
+        (double)g_follow.crossTrack,
+        (int)e.sol, (double)e.hAcc,
+        (unsigned)e.pvtAgeMs,
+        (unsigned long)g_rtcm.transportAgeMs(now),
+        (int)e.headingValid,
+        (unsigned)e.headingAgeMs,
+        block);
+}
+
+// Гасит g_precision.active. Страховка от "LTEST-DRIVE-TRACE продолжает
+// писать после safety/stop". Вызывается ТОЛЬКО из serialMotionEnd().
+void precisionResetForSafetyEnd() {
+    if (!g_precision.active) return;
+    g_precision.active = false;
+    g_precision.phase = PrecisionPhase::IDLE;
+    g_precision.lastTurnPwm = 0;
+    // motorStop НЕ делаем: serialMotionEnd() уже зовёт g_motor.stopImmediately()
+    // через resetFollowerConfig() flow выше. Здесь только precision-state.
+    Serial.println("[PRECISION-RESET] g_precision.active=false (safety/stop end)");
 }
 
 void precisionDebugOnTick() {
@@ -2344,9 +2919,33 @@ void precisionDebugOnTick() {
         g_precision.phase = PrecisionPhase::SETTLE;
         g_precision.phaseStartedMs = now;
         if (g_precision.square) {
-            Serial.printf("[SQTEST] CORNER_REACHED corner=%d pos=(%.3f,%.3f) heading=%.1f\n",
-                          g_precision.segment + 1,
-                          (double)e.x, (double)e.y, (double)e.headingFiltDeg);
+            // SQTEST: фиксируем фактический угол и метрики предыдущего
+            // сегмента (только если это не первый corner = старт).
+            const int segIdx = g_precision.segment;   // 0..3 = сегмент
+            const int cornerIdx = segIdx + 1;          // 1..4 = corner
+            if (segIdx >= 0 && segIdx < 4) {
+                // cornerActualX/Y заполняется corner cornerIdx
+                // (corner 1 = конец сегмента 0 и т.д.)
+                g_sqtest.cornerActualX[segIdx] = e.x;
+                g_sqtest.cornerActualY[segIdx] = e.y;
+                const float cx = g_sqtest.pX[segIdx + 1];
+                const float cy = g_sqtest.pY[segIdx + 1];
+                const float err = lshapeDist2d(e.x, e.y, cx, cy);
+                g_sqtest.cornerErr[segIdx] = err;
+                // segment metrics: previous segment
+                g_sqtest.segMaxCross[segIdx] = g_sqtest.maxCross;
+                g_sqtest.segPathLen[segIdx] = g_sqtest.pathLen;
+                Serial.printf("[SQTEST] CORNER_REACHED corner=%d actual=(%.3f,%.3f) "
+                              "planned=(%.3f,%.3f) err=%.3f heading=%.1f\n",
+                              cornerIdx,
+                              (double)e.x, (double)e.y,
+                              (double)cx, (double)cy,
+                              (double)err, (double)e.headingFiltDeg);
+                Serial.printf("[SQTEST] SEGMENT_DONE idx=%d chord=%.3f path=%.3f maxCross=%.3f\n",
+                              cornerIdx, (double)g_sqtest.sidePlan,
+                              (double)g_sqtest.segPathLen[segIdx],
+                              (double)g_sqtest.segMaxCross[segIdx]);
+            }
         } else if (finalSegment) {
             Serial.printf("[LTEST] FINAL_SETTLE pos=(%.3f,%.3f) heading=%.1f settleMs=%u\n",
                           (double)e.x, (double)e.y, (double)e.headingFiltDeg,
@@ -2378,20 +2977,95 @@ void precisionDebugOnTick() {
             g_motor.setLinearAngularSpeed(0, 0, true);
             if (g_precision.headingOkSinceMs == 0) {
                 g_precision.headingOkSinceMs = now;
+                Serial.printf("[PRECISION_TURN] target=%.1f heading=%.1f err=%+.1f "
+                              "pwm=0 (in tolerance, starting stability hold)\n",
+                              (double)target, (double)e.headingFiltDeg,
+                              (double)err);
             }
             if ((now - g_precision.headingOkSinceMs) >= DEBUG_TURN_HOLD_MS) {
-                finishPrecisionTurn(finalTurn, err);
+                Serial.printf("[PRECISION_TURN] %s target=%.1f heading=%.1f err=%+.1f "
+                              "stableMs=%u\n",
+                              (finalTurn ? "FINAL_TURN_STABLE"
+                                         : (g_precision.square
+                                                ? "CORNER_TURN_STABLE"
+                                                : "CORNER_TURN_STABLE")),
+                              (double)target, (double)e.headingFiltDeg,
+                              (double)err,
+                              (unsigned)(now - g_precision.headingOkSinceMs));
+                // Переход в POST_TURN_SETTLE: motors=0, ждём ещё 300 мс
+                // чтобы механика успокоилась перед стартом следующего
+                // сегмента / поворота.
+                g_precision.phase = PrecisionPhase::POST_TURN_SETTLE;
+                g_precision.phaseStartedMs = now;
+                g_motor.stopImmediately();
             }
             return;
         }
         g_precision.headingOkSinceMs = 0;
-        const float angular = (err >= 0.0f ? 1.0f : -1.0f) * ROVER_V2_TURN_RADPS;
+        // Ступенчатый PWM профиль по абсолютной ошибке угла. cmdL/cmdR
+        // — это PWM в единицах мотора; в Motor::setLinearAngularSpeed()
+        // они нормируются на 0..1 через PWM/ROVER_INPUT_DIV.
+        int pwm;
+        if (absErr > 60.0f)        pwm = PRECISION_TURN_PWM_MAX;
+        else if (absErr > 25.0f)   pwm = PRECISION_TURN_PWM_MID;
+        else if (absErr > 10.0f)   pwm = PRECISION_TURN_PWM_LOW;
+        else                       pwm = PRECISION_TURN_PWM_MIN;
+        // Преобразуем PWM в angular rad/s: используем тот же калибровочный
+        // знаменатель, что и ROVER_V2_TURN_RADPS (≈1.5 рад/с при PWM=9).
+        const float turnGain = ROVER_V2_TURN_RADPS / 9.0f;
+        const float angular = (err >= 0.0f ? 1.0f : -1.0f) * turnGain * (float)pwm;
         g_motor.setLinearAngularSpeed(0, angular, true);
+        // Лог не на каждом тике — только когда PWM-ступень меняется.
+        if (pwm != g_precision.lastTurnPwm) {
+            Serial.printf("[PRECISION_TURN] target=%.1f heading=%.1f err=%+.1f pwm=%d\n",
+                          (double)target, (double)e.headingFiltDeg,
+                          (double)err, pwm);
+            g_precision.lastTurnPwm = pwm;
+        }
+    }
+
+    if (g_precision.phase == PrecisionPhase::POST_TURN_SETTLE) {
+        g_motor.stopImmediately();
+        const uint32_t dwell = now - g_precision.phaseStartedMs;
+        if (dwell == 0) {
+            const char* tag = g_precision.square ? "SQTEST" : "LTEST";
+            const int cornerIdx = g_precision.segment + 1;
+            Serial.printf("[%s] POST_TURN_SETTLE corner=%d settleMs=%u\n",
+                          tag, cornerIdx,
+                          (unsigned)DEBUG_POST_TURN_SETTLE_MS);
+        }
+        if (dwell >= DEBUG_POST_TURN_SETTLE_MS) {
+            const bool finalTurn = g_precision.segment >= g_precision.segmentCount - 1;
+            if (finalTurn) {
+                if (!g_precision.square) lShapeRecordWp1();
+                g_precision.active = false;
+                serialMotionEnd("arrived");
+                return;
+            }
+            if (!g_precision.square && g_precision.segment == 0) {
+                lShapeRecordWp1();
+            }
+            g_precision.segment++;
+            g_precision.lastTurnPwm = 0;
+            // Фиксируем ОПОРНУЮ точку нового сегмента ЗДЕСЬ, когда
+            // ровер уже стоит. uploadPrecisionSegment ниже возьмёт её
+            // вместо того, чтобы ждать первого PVT follower'а.
+            g_precision.segmentStartX = e.x;
+            g_precision.segmentStartY = e.y;
+            if (!uploadPrecisionSegment(g_precision.segment)) {
+                g_precision.active = false;
+                serialMotionEnd("route_begin_failed");
+            }
+        }
+        return;
     }
 }
 
+// LTEST DRIVE PATH TRACE — defined inside namespace roverdbg below.
+// (g_precision / PrecisionPhase are file-local and only visible inside
+// the namespace, so the body cannot live in global scope.)
+
 static bool startPrecisionLShapeDebug() {
-    g_precision = PrecisionDebugMotion{};
     g_precision.active = true;
     g_precision.square = false;
     g_precision.segmentCount = 2;
@@ -2455,7 +3129,7 @@ static bool startPrecisionSquareDebug(float sideM) {
                   (double)g_sqtest.pX[3], (double)g_sqtest.pY[3],
                   (double)g_sqtest.pX[4], (double)g_sqtest.pY[4]);
 
-    setFollowerConfig(DEBUG_PRECISION_RADIUS_M, DEBUG_PRECISION_RADIUS_M, DEBUG_PRECISION_SPEED_MPS);
+    setFollowerConfig(DEBUG_PRECISION_RADIUS_M, DEBUG_PRECISION_FINAL_RADIUS_M, DEBUG_PRECISION_SPEED_MPS);
     Serial.printf("[SQTEST] CONFIG arrivalRadius=%.2f finalRadius=%.2f speed=%.2f turnToleranceDeg=%.1f\n",
                   (double)g_arrivalRadiusM, (double)g_finalArrivalRadiusM,
                   (double)g_forwardSpeedMps, (double)DEBUG_TURN_TOLERANCE_DEG);
@@ -2483,6 +3157,12 @@ static bool startPrecisionSquareDebug(float sideM) {
 }
 
 String handleGoSquareDebugLine(float sideM) {
+    // Busy-guard: нельзя стартовать новый debug motion поверх активного.
+    if (g_serialMotion.active) {
+        Serial.printf("[BUSY] GO_SQUARE_DEBUG rejected: serialMotionSource=%s active\n",
+                      serialMotionSourceName(g_serialMotion.source));
+        return String("ERR,GO_SQUARE_DEBUG,busy_serial_motion");
+    }
     if (!isfinite(sideM) || sideM <= 0.05f || sideM > 5.0f) {
         Serial.printf("[GO_SQUARE_DEBUG] refusing: bad side=%.2f\n", (double)sideM);
         return String("ERR,GO_SQUARE_DEBUG,bad_args");
@@ -2508,22 +3188,53 @@ void squareFinish(const char* reason) {
     g_sqtest.finishedMs = millis();
     const float finalErr = lshapeDist2d(g_sqtest.finishX, g_sqtest.finishY,
                                         g_sqtest.pX[4], g_sqtest.pY[4]);
+    // closeLoop: расстояние от finish обратно к start. Для хорошего
+    // замкнутого квадрата должно быть близко к 0.
+    const float closeLoopErr = lshapeDist2d(g_sqtest.finishX, g_sqtest.finishY,
+                                            g_sqtest.startX, g_sqtest.startY);
     const float headingErr = NavMath::wrapDeg180(g_sqtest.headingFinish - g_sqtest.h0);
     const uint32_t durationMs = g_sqtest.finishedMs - g_sqtest.startedMs;
-    Serial.printf("[SQTEST] SUMMARY result=%s durationMs=%u side=%.3f finalErr=%.3f headingErr=%+.1f totalPath=%.3f maxCross=%.3f maxHeadingErr=%.1f\n",
+    Serial.printf("[SQTEST] SUMMARY result=%s durationMs=%u side=%.3f finalErr=%.3f closeLoopErr=%.3f headingErr=%+.1f totalPath=%.3f maxCross=%.3f maxHeadingErr=%.1f\n",
                   reason ? reason : "unknown", (unsigned)durationMs,
                   (double)g_sqtest.sidePlan, (double)finalErr,
-                  (double)headingErr, (double)g_sqtest.pathLen,
+                  (double)closeLoopErr, (double)headingErr,
+                  (double)g_sqtest.pathLen,
                   (double)g_sqtest.maxCross, (double)g_sqtest.maxHeadingErr);
-    Serial.printf("[SQTEST_CSV] result=%s,side=%.3f,finalErr=%.3f,headingErr=%+.1f,totalPath=%.3f,maxCross=%.3f,maxHeadingErr=%.1f,durationMs=%u\n",
+    // Per-segment summary.
+    for (int i = 0; i < 4; ++i) {
+        const char* tag = (i == 0) ? "SEG1" : (i == 1) ? "SEG2" :
+                         (i == 2) ? "SEG3" : "SEG4";
+        const float chordErr = g_sqtest.segPathLen[i] - g_sqtest.sidePlan;
+        Serial.printf("[SQTEST] SUMMARY_%s planned=%.3f path=%.3f chordErr=%+.3f maxCross=%.3f cornerErr=%.3f turnErr=%+.1f\n",
+                      tag,
+                      (double)g_sqtest.sidePlan,
+                      (double)g_sqtest.segPathLen[i],
+                      (double)chordErr,
+                      (double)g_sqtest.segMaxCross[i],
+                      (double)g_sqtest.cornerErr[i],
+                      isnan(g_sqtest.segTurnErr[i]) ? 0.0f
+                                                     : (double)g_sqtest.segTurnErr[i]);
+    }
+    Serial.printf("[SQTEST] SUMMARY closeLoopErr=%.3f finalHeadingErr=%+.1f\n",
+                  (double)closeLoopErr, (double)headingErr);
+    Serial.printf("[SQTEST_CSV] result=%s,side=%.3f,finalErr=%.3f,closeLoopErr=%.3f,headingErr=%+.1f,totalPath=%.3f,maxCross=%.3f,maxHeadingErr=%.1f,durationMs=%u,seg1Path=%.3f,seg2Path=%.3f,seg3Path=%.3f,seg4Path=%.3f,seg1Cross=%.3f,seg2Cross=%.3f,seg3Cross=%.3f,seg4Cross=%.3f\n",
                   reason ? reason : "unknown",
                   (double)g_sqtest.sidePlan,
                   (double)finalErr,
+                  (double)closeLoopErr,
                   (double)headingErr,
                   (double)g_sqtest.pathLen,
                   (double)g_sqtest.maxCross,
                   (double)g_sqtest.maxHeadingErr,
-                  (unsigned)durationMs);
+                  (unsigned)durationMs,
+                  (double)g_sqtest.segPathLen[0],
+                  (double)g_sqtest.segPathLen[1],
+                  (double)g_sqtest.segPathLen[2],
+                  (double)g_sqtest.segPathLen[3],
+                  (double)g_sqtest.segMaxCross[0],
+                  (double)g_sqtest.segMaxCross[1],
+                  (double)g_sqtest.segMaxCross[2],
+                  (double)g_sqtest.segMaxCross[3]);
 }
 
 // GO_L_SHAPE_DEBUG,<first>,<turn>,<second>
@@ -2536,6 +3247,12 @@ String handleGoLShapeDebugLine(float firstM, float turnDeg, float secondM) {
     // the dispatcher actually picked up.
     Serial.printf("[GO_L_SHAPE_DEBUG] parsed first=%.2f turn=%.1f second=%.2f\n",
                   (double)firstM, (double)turnDeg, (double)secondM);
+    // Busy-guard: нельзя стартовать новый debug motion поверх активного.
+    if (g_serialMotion.active) {
+        Serial.printf("[BUSY] GO_L_SHAPE_DEBUG rejected: serialMotionSource=%s active\n",
+                      serialMotionSourceName(g_serialMotion.source));
+        return String("ERR,GO_L_SHAPE_DEBUG,busy_serial_motion");
+    }
     // Validate args before touching g_ltest, route or serialMotion.
     if (!isfinite(firstM) || firstM <= 0.05f || firstM > 5.0f ||
         !isfinite(secondM) || secondM <= 0.05f || secondM > 5.0f ||
@@ -2585,12 +3302,10 @@ String handleGoLShapeDebugLine(float firstM, float turnDeg, float secondM) {
     // Tight precision mode for the duration of this test. Restored by
     // serialMotionEnd (which calls resetFollowerConfig) so the override
     // does not leak into the next regular route.
-    constexpr float LTEST_RADIUS_M  = 0.15f;
-    constexpr float LTEST_SPEED_MPS = 0.11f;  // ~33% slower than default, then -10% per request
-    setFollowerConfig(LTEST_RADIUS_M, LTEST_RADIUS_M, LTEST_SPEED_MPS);
-    Serial.printf("[LTEST] CONFIG arrivalRadius=%.2f finalRadius=%.2f speed=%.2f\n",
+    setFollowerConfig(DEBUG_PRECISION_RADIUS_M, DEBUG_PRECISION_FINAL_RADIUS_M, DEBUG_PRECISION_SPEED_MPS);
+    Serial.printf("[LTEST] CONFIG arrivalRadius=%.2f finalRadius=%.2f speed=%.2f turnToleranceDeg=%.1f\n",
                   (double)g_arrivalRadiusM, (double)g_finalArrivalRadiusM,
-                  (double)g_forwardSpeedMps);
+                  (double)g_forwardSpeedMps, (double)DEBUG_TURN_TOLERANCE_DEG);
 
     if (!startPrecisionLShapeDebug()) {
         g_ltest.active = false;
@@ -2751,40 +3466,59 @@ void lShapeOnTick() {
     const float x = e.x;
     const float y = e.y;
 
+    // Logical-segment source of truth. Когда активен precision-flow,
+    // каждый сегмент загружается отдельным одно-waypoint-маршрутом, и
+    // g_follow.wpIdx всегда 0. Поэтому раньше WP1_REACHED никогда не
+    // срабатывал (ждали перехода 0->1) — отсюда баг с wp1Err=0.865.
+    //
+    // Источник истины теперь — g_precision.segment:
+    //   - 0 => logical segment p0->p1 (сегмент 1 в LTEST-нотации)
+    //   - 1 => logical segment p1->p2 (сегмент 2 в LTEST-нотации)
+    // На время settle/turn-фаз робот стоит, метрики не должны
+    // скакать. Логируем только пока реально DRIVE.
+    int segLogical = 0;          // 0 или 1 — logical precision segment
+    bool drivingNow = false;
+    if (g_precision.active && !g_precision.square) {
+        segLogical = (g_precision.segment >= 1) ? 1 : 0;
+        drivingNow = (g_precision.phase == PrecisionPhase::DRIVE);
+    } else {
+        // Legacy path: g_ltest был запущен без precision (если что-то
+        // так пользуется). Fallback на старое правило wpIdx<=0.
+        segLogical = (g_follow.wpIdx <= 0) ? 0 : 1;
+        drivingNow = true;
+    }
+
     // Path length accumulation. Reject > 0.5 m single-step jumps as
     // RTK jitter rather than real motion.
-    if (!isnan(g_ltest.lastX) && !isnan(g_ltest.lastY)) {
+    if (drivingNow && !isnan(g_ltest.lastX) && !isnan(g_ltest.lastY)) {
         const float step = lshapeDist2d(g_ltest.lastX, g_ltest.lastY, x, y);
         if (step < 0.5f) {
             g_ltest.pathLen += step;
-            const int segIdx = (g_follow.wpIdx <= 0) ? 1 : 2;
-            (void)segIdx;  // currently wpIdx==0 for seg1, 1 for seg2
-            if (g_follow.wpIdx <= 0) g_ltest.pathLen1 += step;
-            else                     g_ltest.pathLen2 += step;
+            if (segLogical == 0) g_ltest.pathLen1 += step;
+            else                  g_ltest.pathLen2 += step;
         }
     }
     g_ltest.lastX = x;
     g_ltest.lastY = y;
 
-    // Cross-track maxima per segment.
-    const int seg = (g_follow.wpIdx <= 0) ? 1 : 2;
-    if (seg == 1) {
-        const float cross = fabsf(lshapeSignedCross(
-            g_ltest.p0x, g_ltest.p0y, g_ltest.p1x, g_ltest.p1y, x, y));
-        if (cross > g_ltest.maxCross1) g_ltest.maxCross1 = cross;
-    } else {
-        const float cross = fabsf(lshapeSignedCross(
-            g_ltest.p1x, g_ltest.p1y, g_ltest.p2x, g_ltest.p2y, x, y));
-        if (cross > g_ltest.maxCross2) g_ltest.maxCross2 = cross;
+    // Cross-track maxima per logical segment.
+    if (drivingNow) {
+        if (segLogical == 0) {
+            const float cross = fabsf(lshapeSignedCross(
+                g_ltest.p0x, g_ltest.p0y, g_ltest.p1x, g_ltest.p1y, x, y));
+            if (cross > g_ltest.maxCross1) g_ltest.maxCross1 = cross;
+        } else {
+            const float cross = fabsf(lshapeSignedCross(
+                g_ltest.p1x, g_ltest.p1y, g_ltest.p2x, g_ltest.p2y, x, y));
+            if (cross > g_ltest.maxCross2) g_ltest.maxCross2 = cross;
+        }
     }
 
-    // Heading error: target heading from the current (x,y) to the
-    // current segment's goal (p1 for seg 1, p2 for seg 2), vs the
-    // live estimator heading. `e.headingFiltDeg` for "current" is
-    // right because it's the filtered fusion of BNO085 + RTK align.
-    {
-        const float tx = (seg == 1) ? g_ltest.p1x : g_ltest.p2x;
-        const float ty = (seg == 1) ? g_ltest.p1y : g_ltest.p2y;
+    // Heading error: target heading from current (x,y) к текущей цели
+    // сегмента (p1 для seg 0, p2 для seg 1), vs live heading.
+    if (drivingNow) {
+        const float tx = (segLogical == 0) ? g_ltest.p1x : g_ltest.p2x;
+        const float ty = (segLogical == 0) ? g_ltest.p1y : g_ltest.p2y;
         const float targetH = NavMath::targetHeadingDeg(tx - x, ty - y);
         const float hErr = fabsf(NavMath::wrapDeg180(targetH - e.headingFiltDeg));
         if (hErr > g_ltest.maxHeadingErr) g_ltest.maxHeadingErr = hErr;
@@ -2805,68 +3539,77 @@ void lShapeOnTick() {
         if (ga > g_ltest.maxGyroAge)   g_ltest.maxGyroAge   = ga;
     }
 
-    // Waypoint transition 0 → 1.
-    const int wp = g_follow.wpIdx;
-    if (g_ltest.lastWpIndex == 0 && wp == 1) {
-        g_ltest.wp1X = x;
-        g_ltest.wp1Y = y;
-        g_ltest.headingWp1 = e.headingFiltDeg;
-        g_ltest.wp1Ms = now;
-        const float wx = g_ltest.wp1X, wy = g_ltest.wp1Y;
-        const float p1x = g_ltest.p1x, p1y = g_ltest.p1y;
-        const float wp1Err = lshapeDist2d(wx, wy, p1x, p1y);
-        const float firstChord = lshapeDist2d(g_ltest.startX, g_ltest.startY, wx, wy);
-        const float crossAt = lshapeSignedCross(
-            g_ltest.p0x, g_ltest.p0y, g_ltest.p1x, g_ltest.p1y, wx, wy);
-        Serial.printf("[LTEST] WP1_REACHED actual=(%.3f,%.3f) planned=(%.3f,%.3f) "
-                      "wp1Err=%.3f firstChord=%.3f firstPath=%.3f cross=%+.3f "
-                      "heading=%.1f\n",
-                      (double)wx, (double)wy, (double)p1x, (double)p1y,
-                      (double)wp1Err, (double)firstChord,
-                      (double)g_ltest.pathLen1, (double)crossAt,
-                      (double)g_ltest.headingWp1);
-    }
-    g_ltest.lastWpIndex = wp;
+    // NOTE: WP1_REACHED ловится НЕ тут (g_follow.wpIdx всегда 0 в
+    // precision-flow), а в finishPrecisionTurn() при переходе segment
+    // 0 -> 1. См. lShapeRecordWp1().
+
+    g_ltest.lastWpIndex = g_follow.wpIdx;
 
     // Optional periodic debug line.
     if (g_ltest.debug && (now - g_ltest.lastPrintMs) >= 200u) {
         g_ltest.lastPrintMs = now;
-        const int total = g_route.count();
-        int cur = wp;
-        if (total > 0 && cur < total) {
-            const float tx = g_follow.targetX;
-            const float ty = g_follow.targetY;
-            const float distT = lshapeDist2d(x, y, tx, ty);
-            const float targetH = NavMath::targetHeadingDeg(tx - x, ty - y);
-            const float hErr = NavMath::wrapDeg180(targetH - e.headingFiltDeg);
-            const float spd  = g_follow.linearMps;
-            Serial.printf("[LTEST] T t=%u wp=%d/%d seg=%d pos=(%.3f,%.3f) "
-                          "target=(%.3f,%.3f) dist=%.3f cross=%.3f heading=%.1f "
-                          "hErr=%+.1f speed=%.2f cmdL=%d cmdR=%d safety=%d reason=%s "
-                          "hAcc=%.3f pvtAge=%u rtcmAge=%u headingAge=%u "
-                          "relAge=%u gyroAge=%u\n",
-                          (unsigned)(now - g_ltest.startedMs),
-                          cur, total, seg,
-                          (double)x, (double)y,
-                          (double)tx, (double)ty,
-                          (double)distT,
-                          (double)((seg == 1)
-                              ? lshapeSignedCross(g_ltest.p0x, g_ltest.p0y, g_ltest.p1x, g_ltest.p1y, x, y)
-                              : lshapeSignedCross(g_ltest.p1x, g_ltest.p1y, g_ltest.p2x, g_ltest.p2y, x, y)),
-                          (double)e.headingFiltDeg,
-                          (double)hErr,
-                          (double)spd,
-                          g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
-                          (int)g_safety.level(),
-                          g_safety.reason() ? g_safety.reason() : "-",
-                          (double)e.hAcc,
-                          (unsigned)e.pvtAgeMs,
-                          (unsigned)g_rtcm.transportAgeMs(now),
-                          (unsigned)e.headingAgeMs,
-                          (unsigned)g_imu.relYawAgeMs(now),
-                          (unsigned)g_imu.gyroAgeMs(now));
-        }
+        const float tx = (segLogical == 0) ? g_ltest.p1x : g_ltest.p2x;
+        const float ty = (segLogical == 0) ? g_ltest.p1y : g_ltest.p2y;
+        const float distT = lshapeDist2d(x, y, tx, ty);
+        const float targetH = NavMath::targetHeadingDeg(tx - x, ty - y);
+        const float hErr = NavMath::wrapDeg180(targetH - e.headingFiltDeg);
+        const float spd  = g_follow.linearMps;
+        const float crossNow = (segLogical == 0)
+            ? lshapeSignedCross(g_ltest.p0x, g_ltest.p0y,
+                                g_ltest.p1x, g_ltest.p1y, x, y)
+            : lshapeSignedCross(g_ltest.p1x, g_ltest.p1y,
+                                g_ltest.p2x, g_ltest.p2y, x, y);
+        Serial.printf("[LTEST] T t=%u logicalSeg=%d driving=%d pos=(%.3f,%.3f) "
+                      "target=(%.3f,%.3f) dist=%.3f cross=%.3f heading=%.1f "
+                      "hErr=%+.1f speed=%.2f cmdL=%d cmdR=%d safety=%d reason=%s "
+                      "hAcc=%.3f pvtAge=%u rtcmAge=%u headingAge=%u "
+                      "relAge=%u gyroAge=%u\n",
+                      (unsigned)(now - g_ltest.startedMs),
+                      segLogical, (int)drivingNow,
+                      (double)x, (double)y,
+                      (double)tx, (double)ty,
+                      (double)distT, (double)crossNow,
+                      (double)e.headingFiltDeg,
+                      (double)hErr, (double)spd,
+                      g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
+                      (int)g_safety.level(),
+                      g_safety.reason() ? g_safety.reason() : "-",
+                      (double)e.hAcc,
+                      (unsigned)e.pvtAgeMs,
+                      (unsigned)g_rtcm.transportAgeMs(now),
+                      (unsigned)e.headingAgeMs,
+                      (unsigned)g_imu.relYawAgeMs(now),
+                      (unsigned)g_imu.gyroAgeMs(now));
     }
+}
+
+// Запись фактической WP1-позиции и лог [LTEST] WP1_REACHED.
+// Вызывается ИСКЛЮЧИТЕЛЬНО из finishPrecisionTurn() когда
+// g_precision.segment инкрементируется 0 -> 1 (завершение logical
+// segment p0->p1). Так WP1_REACHED срабатывает ровно один раз и
+// именно в точке прибытия на p1, а не на финальной точке p2.
+static void lShapeRecordWp1() {
+    if (!g_ltest.active) return;
+    if (!isnan(g_ltest.wp1X)) return; // уже зафиксирована
+    const auto& e = g_est.get();
+    const uint32_t now = millis();
+    g_ltest.wp1X = e.x;
+    g_ltest.wp1Y = e.y;
+    g_ltest.headingWp1 = e.headingFiltDeg;
+    g_ltest.wp1Ms = now;
+    const float wx = g_ltest.wp1X, wy = g_ltest.wp1Y;
+    const float p1x = g_ltest.p1x, p1y = g_ltest.p1y;
+    const float wp1Err = lshapeDist2d(wx, wy, p1x, p1y);
+    const float firstChord = lshapeDist2d(g_ltest.startX, g_ltest.startY, wx, wy);
+    const float crossAt = lshapeSignedCross(
+        g_ltest.p0x, g_ltest.p0y, g_ltest.p1x, g_ltest.p1y, wx, wy);
+    Serial.printf("[LTEST] WP1_REACHED actual=(%.3f,%.3f) planned=(%.3f,%.3f) "
+                  "wp1Err=%.3f firstChord=%.3f firstPath=%.3f cross=%+.3f "
+                  "heading=%.1f\n",
+                  (double)wx, (double)wy, (double)p1x, (double)p1y,
+                  (double)wp1Err, (double)firstChord,
+                  (double)g_ltest.pathLen1, (double)crossAt,
+                  (double)g_ltest.headingWp1);
 }
 
 void setLogEnabled(bool enabled) {

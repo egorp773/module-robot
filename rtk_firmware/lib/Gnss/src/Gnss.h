@@ -52,6 +52,7 @@ public:
     int32_t lastVAccMm()      const { return _vAcc; }
     int32_t lastGSpeedMmps()  const { return _gSp; }
     int32_t lastHeadMotDe5()  const { return _headMot; }
+    int32_t lastHeadAccDe5()  const { return _headAcc; }
     int     lastFixType()     const { return _fix; }
     int     lastCarrierSol()  const { return _carSol; }
     bool    lastDiffSoln()    const { return _diff; }
@@ -91,7 +92,7 @@ private:
     // raw PVT cache
     int32_t _latE7 = 0, _lonE7 = 0;
     int32_t _h = 0, _hAcc = 0, _vAcc = 0;
-    int32_t _gSp = 0, _headMot = 0;
+    int32_t _gSp = 0, _headMot = 0, _headAcc = 0;
     int     _fix = 0, _carSol = 0, _nSv = 0;
     bool    _diff = false;
     float   _pDop = 0;

@@ -23,6 +23,7 @@ void Gnss::capturePvt(const UBX_NAV_PVT_data_t *pvt) {
     _vAcc    = pvt->vAcc;
     _gSp     = pvt->gSpeed;
     _headMot = pvt->headMot;
+    _headAcc = (int32_t)pvt->headAcc;
     _fix     = pvt->fixType;
     // РЕАЛЬНЫЙ carrSoln из NAV-PVT flags (SparkFun 2.2.28 ОТДАЁТ его):
     //   carrSoln: 0 = none, 1 = float, 2 = fixed
@@ -43,17 +44,67 @@ void Gnss::capturePvt(const UBX_NAV_PVT_data_t *pvt) {
 bool Gnss::begin(HardwareSerial& serial, GnssRole role) {
     _serial = &serial;
     _role = role;
+    // Большой RX-буфер ДО begin(): на 115200 RTCM/PVT приходят пачками,
+    // дефолтных 256 байт не хватает при блокировках loop().
+    serial.setRxBufferSize(2048);
     serial.begin(F9P_BAUD, SERIAL_8N1, PIN_F9P_RX, PIN_F9P_TX);
 
-    // F9P может не ответить с первого раза (cold start, autobaud). Retry.
-    // НО! SparkFun _gnss.begin() часто возвращает false даже когда F9P жив —
-    // это особенность autobaud. Поэтому НЕ прерываем — пробуем настроить.
-    for (int i = 0; i < 5; ++i) {
-        if (_gnss.begin(serial)) {
-            Serial.println("[GNSS] F9P begin() OK");
-            break;
+    // === Автодетект бауда + подъём до F9P_RUN_BAUD ===
+    // После power-cycle F9P на дефолтных 38400; после soft-reset ESP32 чип
+    // уже может быть на F9P_RUN_BAUD (конфиг UART1 переживает reset ESP32).
+    // Пробуем оба, затем поднимаем UART1 до рабочего бауда — на 38400 канал
+    // забит RTCM-инжекцией и FIXED флапает.
+    const uint32_t kBauds[2] = { F9P_RUN_BAUD, F9P_BAUD };
+    bool connected = false;
+    uint32_t activeBaud = F9P_BAUD;
+    for (int attempt = 0; attempt < 3 && !connected; ++attempt) {
+        for (uint32_t b : kBauds) {
+            serial.updateBaudRate(b);
+            delay(50);
+            if (_gnss.begin(serial)) {
+                connected = true;
+                activeBaud = b;
+                Serial.printf("[GNSS] F9P begin() OK @%lu\n", (unsigned long)b);
+                break;
+            }
         }
-        delay(300);
+        if (!connected) delay(250);
+    }
+    if (!connected) {
+        // SparkFun begin() иногда фейлит даже на живом чипе — не прерываемся,
+        // пробуем настроить вслепую на дефолтном бауде.
+        Serial.println("[GNSS] F9P begin() failed @115200/38400 — continue blind @38400");
+        serial.updateBaudRate(F9P_BAUD);
+        activeBaud = F9P_BAUD;
+    }
+
+    if (activeBaud != F9P_RUN_BAUD) {
+        // CFG-PRT: UART1 → F9P_RUN_BAUD. ACK может потеряться при смене бауда,
+        // поэтому подтверждаем повторным begin() на новой скорости.
+        _gnss.setSerialRate(F9P_RUN_BAUD, COM_PORT_UART1);
+        delay(100);
+        serial.updateBaudRate(F9P_RUN_BAUD);
+        delay(50);
+        bool ok = false;
+        for (int i = 0; i < 3 && !ok; ++i) {
+            ok = _gnss.begin(serial);
+            if (!ok) delay(150);
+        }
+        if (ok) {
+            Serial.printf("[GNSS] UART1 baud -> %u OK\n", (unsigned)F9P_RUN_BAUD);
+        } else {
+            // Не подтвердилось — возможно чип остался на 38400. Откат.
+            serial.updateBaudRate(F9P_BAUD);
+            delay(50);
+            if (_gnss.begin(serial)) {
+                Serial.println("[GNSS] baud change not confirmed, staying @38400");
+            } else {
+                // Ни там ни там не отвечает — остаёмся на RUN (write-only режим
+                // всё равно позволит инжектить RTCM, если чип переключился).
+                serial.updateBaudRate(F9P_RUN_BAUD);
+                Serial.println("[GNSS] baud state unknown, assuming F9P_RUN_BAUD");
+            }
+        }
     }
 
     g_pvtTarget = this;
@@ -142,6 +193,7 @@ void Gnss::captureNavPvtPayload(const uint8_t *p, uint16_t len) {
     _vAcc    = (int32_t)rdU32(p + 44);
     _gSp     = rdI32(p + 60);
     _headMot = rdI32(p + 64);
+    _headAcc = (int32_t)rdU32(p + 72);   // headAcc, deg * 1e-5 (точность headMot)
     _fix     = p[20];
     bool fixOk = (flags & 0x01) != 0;
     int carr = (flags >> 6) & 0x03;

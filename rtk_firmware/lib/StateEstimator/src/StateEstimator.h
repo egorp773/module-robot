@@ -29,6 +29,9 @@ struct Estimate {
     ImuYawSource yawSource = ImuYawSource::NONE;
     bool    yawIsAbsolute = false;
     bool    headingUsedByEstimator = false;
+    // GPS course-over-ground fusion диагностика
+    bool    gpsCourseUsed = false;    // последний PVT скорректировал курс EKF
+    float   gpsCourseAccDeg = 999;    // headAcc последнего PVT, градусы
     // quality
     SolType sol = SOL_INVALID;
     int     numSv = 0;
@@ -56,13 +59,16 @@ class StateEstimator {
 public:
     void begin();
 
-    // apply new raw PVT message
+    // apply new raw PVT message.
+    // headAcc_deg_e5 — точность headMot (deg*1e-5); дефолт = "нет данных",
+    // GPS-course fusion при этом не выполняется.
     void onPvt(uint32_t nowMs,
                int32_t lat_e7, int32_t lon_e7, int32_t height_mm,
                int32_t hAcc_mm, int32_t vAcc_mm,
                int32_t gSpeed_mmps, int32_t headMot_deg_e5,
                int fixType, int carrierSol, bool diffSoln,
-               int numSv, float pDop);
+               int numSv, float pDop,
+               int32_t headAcc_deg_e5 = 18000000);
 
     // apply new RXM-RTCM info (F9P decode side)
     void onRtcmInfo(uint32_t nowMs, int lastType, int msgCount, int crcFail);
@@ -121,6 +127,7 @@ private:
     uint32_t _lastFixMs = 0;
     uint32_t _lastAcceptedPositionMs = 0;
     uint32_t _lastHeadingMs = 0;
+    uint32_t _lastRtcmMs = 0;
     uint32_t _seededAtMs = 0;       // millis() момента seed'а; в первые 3 сек не верим GPS-course
 
     // EKF

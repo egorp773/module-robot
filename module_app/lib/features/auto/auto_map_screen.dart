@@ -14,30 +14,11 @@ import '../manual/manual_control_screen.dart';
 import '../home/home_screen.dart' show batteryPercentProvider;
 
 String? _navStartBlockReason(WifiConnectionState wifi) {
-  final carrier = wifi.gpsCarrier?.toLowerCase();
-  final hAccReady = wifi.gpsAccuracy != null && wifi.gpsAccuracy! <= 20;
-  final rtkReady = carrier == 'fixed' && hAccReady;
-  final pvtFresh = wifi.gpsAgeMs != null && wifi.gpsAgeMs! <= 1000;
-  final rtcmFresh = wifi.rtcmAgeMs != null && wifi.rtcmAgeMs! <= 1000;
-  final imuReady =
-      wifi.imuFresh == true && wifi.imuAgeMs != null && wifi.imuAgeMs! <= 200;
-  final motorReady = wifi.motorFeedback == true;
-  if (rtkReady &&
-      hAccReady &&
-      pvtFresh &&
-      rtcmFresh &&
-      imuReady &&
-      motorReady) {
-    return null;
-  }
-  return [
-    if (!rtkReady) 'RTK is not fixed at <= 20 mm',
-    if (!hAccReady) 'hAcc is above 20 mm',
-    if (!pvtFresh) 'PVT is stale',
-    if (!rtcmFresh) 'RTCM is stale',
-    if (!imuReady) 'IMU is stale or absent',
-    if (!motorReady) 'motor controller feedback is absent',
-  ].join('; ');
+  // Deprecated top-level. Оставлено как no-op shim на случай, если
+  // где-то в коде осталась ссылка; реальный гейт теперь внутри
+  // _AutoMapScreenState и использует единые с Start-flow пороги
+  // (RTK fixed + hAcc<=50мм + pvtAge<=300мс).
+  return null;
 }
 
 class AutoMapScreen extends ConsumerStatefulWidget {
@@ -59,6 +40,16 @@ class _AlignInfo {
     required this.lastAlignDist,
     required this.lastAlignHAcc,
   });
+}
+
+/// Нормализованные boundary + forbidden для firmware safety.
+/// И boundary, и forbidden обязательны: firmware Route::endUpload()
+/// требует _boundaryReady=true и _forbidReady=true. Если forbidden
+/// пуст — всё равно шлём пустой блок (FORBID_BEGIN,0 .. FORBID_END).
+class _SafetyGeometry {
+  final List<Offset> boundary;
+  final List<List<Offset>> forbidden;
+  const _SafetyGeometry({required this.boundary, required this.forbidden});
 }
 
 class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
@@ -92,7 +83,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   String? _routeWorkflowError;
   NavRunTracker? _navRunTracker;
 
-  // Состояние для управления картой
+    // Состояние для управления картой
   double _zoom = 1.0;
   Offset _pan = Offset.zero;
 
@@ -176,14 +167,19 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     // "from nowhere" (the saved point) instead of from the robot. So for
     // GPS maps we trust only the live position, and refuse to build a
     // route if the rover hasn't sent one yet.
+    //
+    // hAcc/pvtAge гейты — единые с Start-flow (см. _preflightReason и
+    // _startMaxHAccMm / _startMaxPvtAgeMs). Раньше здесь было жёсткое
+    // 20мм / 1000мс, что расходилось со Start (50мм / 300мс) и приводило
+    // к тому, что "Build route" и "Start" видели разные "готов" состояния.
     if (map.coordinateType == 'gps') {
       if (map.refLat == null || map.refLon == null) return null;
       if (wifi.gpsLat == null || wifi.gpsLon == null) return null;
       if (wifi.gpsCarrier?.toLowerCase() != 'fixed' ||
           wifi.gpsAccuracy == null ||
-          wifi.gpsAccuracy! > 20 ||
+          wifi.gpsAccuracy! > _startMaxHAccMm ||
           wifi.gpsAgeMs == null ||
-          wifi.gpsAgeMs! > 1000) {
+          wifi.gpsAgeMs! > _startMaxPvtAgeMs) {
         return null;
       }
       final geometry = GpsDisplayGeometry(
@@ -462,97 +458,32 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         return;
       }
 
-      final boundaryPolygons = map.zones
-          .map((poly) => _normalizedPolygon(poly.points))
-          .where((points) => points.length >= 3)
-          .toList(growable: false);
-
-      if (boundaryPolygons.length != 1) {
-        const msg =
-            'Route upload blocked: firmware safety requires exactly one green boundary zone.';
-        setState(() => _routeWorkflowError = msg);
-        _showNotice(
-          ref,
-          title: 'Boundary zone required',
-          message: msg,
-          kind: NoticeKind.danger,
-        );
+      // Подготовка boundary/forbidden ДО загрузки. Helper сам разошлёт
+      // boundary и обязательный пустой forbidden (FORBID_BEGIN,0/...
+      // FORBID_END) — firmware требует _forbidReady=true.
+      final safety = _prepareSafetyGeometry(map);
+      if (safety == null) {
+        // _prepareSafetyGeometry уже показал notice и записал причину.
         return;
       }
 
-      final boundaryPoints = boundaryPolygons.single;
-      if (boundaryPoints.length > _maxBoundaryPoints) {
-        const msg =
-            'Boundary zone is too complex for firmware safety: max $_maxBoundaryPoints points.';
-        setState(() => _routeWorkflowError = msg);
-        _showNotice(
-          ref,
-          title: 'Boundary too complex',
-          message: msg,
-          kind: NoticeKind.danger,
-        );
-        return;
-      }
-
-      final forbiddenPolygons = map.forbiddens
-          .map((poly) => _normalizedPolygon(poly.points))
-          .where((points) => points.length >= 3)
-          .toList(growable: false);
-
-      if (forbiddenPolygons.length > _maxForbiddenPolygons ||
-          forbiddenPolygons
-              .any((points) => points.length > _maxForbiddenPoints)) {
-        const msg =
-            'Forbidden zones exceed firmware limits: max $_maxForbiddenPolygons zones, '
-            '$_maxForbiddenPoints points each.';
-        setState(() => _routeWorkflowError = msg);
-        _showNotice(
-          ref,
-          title: 'Forbidden zones too complex',
-          message: msg,
-          kind: NoticeKind.danger,
-        );
-        return;
-      }
-
-      final routeCtrl = ref.read(wifiConnectionProvider.notifier);
       setState(() => _routeWorkflowError = 'Sending route: 0/${_route.length}');
-      await routeCtrl.sendRouteBegin(
-        _route.length,
-        originLat: map.refLat!,
-        originLon: map.refLon!,
+      await _uploadRouteWithSafetyGeometry(
+        ref: ref,
+        map: map,
+        route: _route,
+        boundary: safety.boundary,
+        forbidden: safety.forbidden,
+        onProgress: (done, total) {
+          if (mounted) {
+            setState(() {
+              _routeSendProgress = done;
+              _routeWorkflowError =
+                  'Sending route: $_routeSendProgress/$total';
+            });
+          }
+        },
       );
-      for (var i = 0; i < _route.length; i++) {
-        final p = _route[i];
-        await routeCtrl.sendRoutePoint(i, p.dx, p.dy);
-        if (mounted) {
-          setState(() {
-            _routeSendProgress = i + 1;
-            _routeWorkflowError =
-                'Sending route: $_routeSendProgress/${_route.length}';
-          });
-        }
-      }
-      await routeCtrl.sendRouteBoundaryBegin(boundaryPoints.length);
-      for (var i = 0; i < boundaryPoints.length; i++) {
-        final p = boundaryPoints[i];
-        await routeCtrl.sendRouteBoundaryPoint(i, p.dx, p.dy);
-      }
-      await routeCtrl.sendRouteBoundaryEnd();
-
-      await routeCtrl.sendForbiddenBeginAck(
-        forbiddenPolygons.length,
-        forbiddenPolygons.map((poly) => poly.length).toList(growable: false),
-      );
-      for (var polyIdx = 0; polyIdx < forbiddenPolygons.length; polyIdx++) {
-        final poly = forbiddenPolygons[polyIdx];
-        for (var pointIdx = 0; pointIdx < poly.length; pointIdx++) {
-          final p = poly[pointIdx];
-          await routeCtrl.sendForbiddenPointAck(polyIdx, pointIdx, p.dx, p.dy);
-        }
-      }
-      await routeCtrl.sendForbiddenEndAck();
-      await routeCtrl.sendRouteEnd(_route.length);
 
       setState(() {
         _routeSent = true;
@@ -563,7 +494,9 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         ref,
         title: 'Route sent',
         message:
-            'Robot received ${_route.length} waypoints, boundary, and forbidden zones.',
+            'Robot received ${_route.length} waypoints, '
+            '${safety.boundary.length} boundary points, '
+            '${safety.forbidden.length} forbidden polygons.',
         kind: NoticeKind.info,
       );
     } catch (e) {
@@ -707,7 +640,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
             '(лимит $_maxRouteWaypoints)');
       }
 
-      // === 6. Upload route
+      // === 6. Upload route (waypoints + boundary + forbidden)
       final freshRoute = cleaningRoute.path;
       setState(() {
         _route = freshRoute;
@@ -718,6 +651,20 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         _routeWorkflowError =
             'Uploading route: 0/${freshRoute.length}';
       });
+
+      // Boundary + forbidden — обязательная часть firmware safety
+      // (Route::endUpload() требует _boundaryReady и _forbidReady=true).
+      // Шлём через общий helper, чтобы Send route и Start-flow не
+      // расходились.
+      final safety = _prepareSafetyGeometry(map);
+      if (safety == null) {
+        // _prepareSafetyGeometry уже выставил _routeWorkflowError и notice;
+        // выходим без NAV_START.
+        return;
+      }
+
+      final forbiddenPointsTotal =
+          safety.forbidden.fold<int>(0, (s, p) => s + p.length);
       ref.read(wifiConnectionProvider.notifier).addLocalLog(
           'ROUTE_PREVIEW origin=(${map.refLat!.toStringAsFixed(7)},'
           '${map.refLon!.toStringAsFixed(7)}) '
@@ -726,7 +673,10 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           'wp0=(${freshRoute.first.dx.toStringAsFixed(3)},'
           '${freshRoute.first.dy.toStringAsFixed(3)}) '
           'totalWaypoints=${freshRoute.length} '
-          'totalDistance=${cleaningRoute.totalDistance.toStringAsFixed(2)}');
+          'totalDistance=${cleaningRoute.totalDistance.toStringAsFixed(2)} '
+          'boundaryPoints=${safety.boundary.length} '
+          'forbiddenPolygons=${safety.forbidden.length} '
+          'forbiddenPointsTotal=$forbiddenPointsTotal');
 
       await ctrl.sendRouteBegin(freshRoute.length,
           originLat: map.refLat!, originLon: map.refLon!);
@@ -738,15 +688,39 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
               'Uploading route: ${i + 1}/${freshRoute.length}');
         }
       }
-      // Boundary / forbidden в MVP-режиме не шлём — карта уже была
-      // сохранена без них, а текущий flow их не требует.
+      // Boundary (exactly one green zone) + forbidden (>=0 polygons, всегда
+      // шлём хотя бы FORBID_BEGIN,0 .. FORBID_END, чтобы firmware получил
+      // _forbidReady=true).
+      await ctrl.sendRouteBoundaryBegin(safety.boundary.length);
+      for (var i = 0; i < safety.boundary.length; i++) {
+        final p = safety.boundary[i];
+        await ctrl.sendRouteBoundaryPoint(i, p.dx, p.dy);
+      }
+      await ctrl.sendRouteBoundaryEnd();
+
+      await ctrl.sendForbiddenBeginAck(
+        safety.forbidden.length,
+        safety.forbidden
+            .map((poly) => poly.length)
+            .toList(growable: false),
+      );
+      for (var polyIdx = 0; polyIdx < safety.forbidden.length; polyIdx++) {
+        final poly = safety.forbidden[polyIdx];
+        for (var pointIdx = 0; pointIdx < poly.length; pointIdx++) {
+          final p = poly[pointIdx];
+          await ctrl.sendForbiddenPointAck(polyIdx, pointIdx, p.dx, p.dy);
+        }
+      }
+      await ctrl.sendForbiddenEndAck();
       await ctrl.sendRouteEnd(freshRoute.length);
 
       if (!mounted) return;
       setState(() {
         _routeSent = true;
         _routeWorkflowError =
-            'Route uploaded OK (${freshRoute.length} wp). Starting nav…';
+            'Route uploaded OK (${freshRoute.length} wp, '
+            'boundary=${safety.boundary.length}, '
+            'forbidden=${safety.forbidden.length}). Starting nav…';
       });
 
       // === 7. NAV_START
@@ -805,10 +779,120 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     }
     if (_maxStartOutsideBoundaryMeters <= 0 &&
         _currentRobotStart(map, wifi) == null) {
-      return 'Текущая позиция робота не внутри рабочей зоны — '
-          'переместите его в зону или увеличьте maxStartOutsideBoundaryMeters';
+      // Не путаем: _currentRobotStart() падает в основном из-за GPS/RTK/
+      // hAcc/pvtAge гейтов, а не из-за выхода за полигон зоны. Говорим
+      // точную причину.
+      return 'Не удалось получить live RTK-позицию робота для этой '
+          'GPS-карты (RTK не fixed / hAcc > ${_startMaxHAccMm.toStringAsFixed(0)}мм '
+          '/ pvtAge > ${_startMaxPvtAgeMs}мс).';
     }
     return null;
+  }
+
+  // === Старый gate для UI (кнопки Start/Resume). Унифицирован с
+  // _preflightReason: единые пороги 50мм/300мс, без требования
+  // BNO-abs / motor feedback (heading идёт через RTK auto-align). ===
+  String? _navStartBlockReason(WifiConnectionState wifi) {
+    // Делегируем в преflight, чтобы UI и Start-flow видели одну
+    // и ту же картину "готов / не готов".
+    return _preflightReason(wifi);
+  }
+
+  // === Boundary + forbidden helper (общий для Send route и Start-flow) ===
+  //
+  // firmware Route::endUpload() требует _boundaryReady=true и
+  // _forbidReady=true. Поэтому ВСЕГДА шлём boundary (ровно одна зона) и
+  // хотя бы FORBID_BEGIN,0 .. FORBID_END для пустого списка.
+  _SafetyGeometry? _prepareSafetyGeometry(ManualMapState map) {
+    final boundaryPolygons = map.zones
+        .map((poly) => _normalizedPolygon(poly.points))
+        .where((points) => points.length >= 3)
+        .toList(growable: false);
+    if (boundaryPolygons.length != 1) {
+      const msg =
+          'Route upload blocked: firmware safety requires exactly one '
+          'green boundary zone.';
+      _routeWorkflowError = msg;
+      _showNotice(ref,
+          title: 'Boundary zone required', message: msg,
+          kind: NoticeKind.danger);
+      return null;
+    }
+    final boundary = boundaryPolygons.single;
+    if (boundary.length > _maxBoundaryPoints) {
+      final msg =
+          'Boundary zone is too complex for firmware safety: '
+          'max $_maxBoundaryPoints points.';
+      _routeWorkflowError = msg;
+      _showNotice(ref,
+          title: 'Boundary too complex', message: msg,
+          kind: NoticeKind.danger);
+      return null;
+    }
+
+    final forbidden = map.forbiddens
+        .map((poly) => _normalizedPolygon(poly.points))
+        .where((points) => points.length >= 3)
+        .toList(growable: false);
+    if (forbidden.length > _maxForbiddenPolygons ||
+        forbidden.any((p) => p.length > _maxForbiddenPoints)) {
+      final msg =
+          'Forbidden zones exceed firmware limits: max '
+          '$_maxForbiddenPolygons zones, $_maxForbiddenPoints points each.';
+      _routeWorkflowError = msg;
+      _showNotice(ref,
+          title: 'Forbidden zones too complex', message: msg,
+          kind: NoticeKind.danger);
+      return null;
+    }
+
+    return _SafetyGeometry(boundary: boundary, forbidden: forbidden);
+  }
+
+  // === Общий upload: ROUTE_BEGIN + ROUTE_WP*N + (boundary) + (forbidden)
+  // + ROUTE_END. Любой ACK-ERR бросает, и вызывающий код решает,
+  // отправлять ли NAV_START. ===
+  Future<void> _uploadRouteWithSafetyGeometry({
+    required WidgetRef ref,
+    required ManualMapState map,
+    required List<Offset> route,
+    required List<Offset> boundary,
+    required List<List<Offset>> forbidden,
+    required void Function(int done, int total) onProgress,
+  }) async {
+    final ctrl = ref.read(wifiConnectionProvider.notifier);
+    await ctrl.sendRouteBegin(
+      route.length,
+      originLat: map.refLat!,
+      originLon: map.refLon!,
+    );
+    for (var i = 0; i < route.length; i++) {
+      final p = route[i];
+      await ctrl.sendRoutePoint(i, p.dx, p.dy);
+      onProgress(i + 1, route.length);
+    }
+    // Boundary: exactly one polygon.
+    await ctrl.sendRouteBoundaryBegin(boundary.length);
+    for (var i = 0; i < boundary.length; i++) {
+      final p = boundary[i];
+      await ctrl.sendRouteBoundaryPoint(i, p.dx, p.dy);
+    }
+    await ctrl.sendRouteBoundaryEnd();
+    // Forbidden: 0..N полигонов. Всегда шлём begin/end, чтобы firmware
+    // получил _forbidReady=true.
+    await ctrl.sendForbiddenBeginAck(
+      forbidden.length,
+      forbidden.map((p) => p.length).toList(growable: false),
+    );
+    for (var polyIdx = 0; polyIdx < forbidden.length; polyIdx++) {
+      final poly = forbidden[polyIdx];
+      for (var pointIdx = 0; pointIdx < poly.length; pointIdx++) {
+        final p = poly[pointIdx];
+        await ctrl.sendForbiddenPointAck(polyIdx, pointIdx, p.dx, p.dy);
+      }
+    }
+    await ctrl.sendForbiddenEndAck();
+    await ctrl.sendRouteEnd(route.length);
   }
 
   // === Модал перед auto-align (см. требование шаг 4) ===

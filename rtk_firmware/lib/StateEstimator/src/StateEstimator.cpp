@@ -20,6 +20,7 @@ void StateEstimator::begin() {
     _haveLastFix = false;
     _lastAcceptedPositionMs = 0;
     _lastHeadingMs = 0;
+    _lastRtcmMs = 0;
     _ekf.begin();
     _lastPredictMs = 0;
     _lastSpeedLMps = 0;
@@ -148,7 +149,8 @@ void StateEstimator::onPvt(uint32_t nowMs,
                             int32_t hAcc_mm, int32_t vAcc_mm,
                             int32_t gSpeed_mmps, int32_t headMot_deg_e5,
                             int fixType, int carrierSol, bool diffSoln,
-                            int numSv, float pDop) {
+                            int numSv, float pDop,
+                            int32_t headAcc_deg_e5) {
     double newLat = (double)lat_e7 * 1e-7;
     double newLon = (double)lon_e7 * 1e-7;
 
@@ -172,7 +174,7 @@ void StateEstimator::onPvt(uint32_t nowMs,
     bool reliablePosition =
         fixType >= 3 &&
         ((est.sol == SOL_FIXED && est.hAcc <= SAFE_HACC_FIXED_M) ||
-         (est.sol == SOL_FLOAT && est.hAcc <= 0.05f));
+         (est.sol == SOL_FLOAT && est.hAcc <= SAFE_HACC_FLOAT_M));
     bool accept = reliablePosition;
     if (reliablePosition && _haveLastFix && est.originSet) {
         float px, py, nx, ny;
@@ -219,15 +221,34 @@ void StateEstimator::onPvt(uint32_t nowMs,
     }
     // если outlier — позицию НЕ двигаем (dead-reckoning держит прошлую), но fix-метку обновили выше нет
 
-    // --- Курс: raw GPS course only for telemetry ---
-    // U-blox headMot is course-over-ground. At rover speed it is often dominated
-    // by RTK position jitter, so it must not correct EKF heading for now.
-    est.headingDeg = (float)headMot_deg_e5 * 1e-5f;   // сырой GPS-курс только для телеметрии
+    // --- Курс: raw GPS course для телеметрии ---
+    est.headingDeg = (float)headMot_deg_e5 * 1e-5f;
     est.headingDeg = ImuMath::normalizeDeg360(est.headingDeg);
+    est.gpsCourseAccDeg = (float)headAcc_deg_e5 * 1e-5f;
 
-    // GPS course-over-ground fusion is intentionally disabled for now.
-    // At low rover speed headMot is dominated by RTK position jitter; heading is
-    // corrected from IMU absolute yaw in onImu().
+    // --- GPS course-over-ground → EKF heading update ---
+    // Без этого курс после RTK-align держится ТОЛЬКО на интеграле гироскопа
+    // и дрейфует (1-3°/мин) → cross-track растёт → «кривая» езда.
+    // Защита от шума на стоянке: фьюзим только когда
+    //   * позиция принята (accept) и решение FLOAT/FIXED,
+    //   * реальная скорость >= GPS_COURSE_FUSE_MIN_MPS,
+    //   * headAcc валиден и не хуже GPS_COURSE_FUSE_MAX_ACC_DEG.
+    // Ковариация — честная, из headAcc (1-sigma), поэтому слабый course
+    // почти не тянет, а уверенный (быстрое прямое движение) — тянет сильно.
+    // Mahalanobis-гейт внутри updateHeading отсекает выбросы.
+    est.gpsCourseUsed = false;
+    if (_headingSeeded && accept &&
+        (est.sol == SOL_FIXED || est.sol == SOL_FLOAT) &&
+        est.speedMps >= GPS_COURSE_FUSE_MIN_MPS) {
+        const float courseAccDeg = est.gpsCourseAccDeg;
+        if (courseAccDeg > 0.01f && courseAccDeg <= GPS_COURSE_FUSE_MAX_ACC_DEG) {
+            const float courseRad = est.headingDeg * 0.01745329f;
+            const float sigmaRad  = courseAccDeg * 0.01745329f;
+            float cov = sigmaRad * sigmaRad;
+            if (cov < 0.0012f) cov = 0.0012f;   // floor ~2°
+            est.gpsCourseUsed = _ekf.updateHeading(courseRad, cov, true);
+        }
+    }
 
     // PVT may publish the current EKF value, but must not make an IMU-derived
     // heading look fresh. GPS course fusion is disabled.
@@ -242,7 +263,8 @@ void StateEstimator::onPvt(uint32_t nowMs,
 }
 
 void StateEstimator::onRtcmInfo(uint32_t nowMs, int lastType, int msgCount, int crcFail) {
-    (void)nowMs; (void)lastType; (void)msgCount; (void)crcFail;
+    (void)lastType; (void)msgCount; (void)crcFail;
+    _lastRtcmMs = nowMs;
     est.rtcmAgeMs = 0;
 }
 
@@ -274,9 +296,9 @@ void StateEstimator::tick(uint32_t nowMs) {
     est.pvtAgeMs = p;
     est.acceptedPositionAgeMs = (_lastAcceptedPositionMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastAcceptedPositionMs);
     est.headingAgeMs = (_lastHeadingMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastHeadingMs);
-    if (est.rtcmAgeMs != 0xFFFFFFFFu) {
-        est.rtcmAgeMs = p;
-    }
+    // БАГФИКС: раньше rtcmAgeMs зеркалил возраст PVT (est.rtcmAgeMs = p) —
+    // телеметрия врала. Теперь считается от реального последнего RTCM-пакета.
+    est.rtcmAgeMs = (_lastRtcmMs == 0) ? 0xFFFFFFFFu : (nowMs - _lastRtcmMs);
 
     // EKF.predict на каждом tick (50Гц) с текущим IMU rate. Это держит heading
     // и dead-reckoning между PVT-пакетами и во время их отсутствия.
