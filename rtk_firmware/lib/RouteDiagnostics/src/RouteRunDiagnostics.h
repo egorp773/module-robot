@@ -52,14 +52,42 @@ struct CornerSnapshots {
     PoseSample cornerApproachBrakeStart;
     PoseSample cornerPhysicalStopBeforeTurn;
     PoseSample turnStart;
+    PoseSample firstBrake;
+    float firstBrakeYawRateDps = NAN;
+    PoseSample firstPhysicalStop;
+    PoseSample lastCorrectionStart;
     PoseSample turnPhysicalStop;
     PoseSample nextSegmentInterceptStart;
+    float finalTurnErrorDeg = NAN;
 
     void reset() { *this = CornerSnapshots{}; }
 
     float turnActualDeg() const {
         if (!turnStart.valid || !turnPhysicalStop.valid) return NAN;
         return wrapDeg180(turnPhysicalStop.headingDeg - turnStart.headingDeg);
+    }
+
+    float mainTurnActualDeg() const {
+        if (!turnStart.valid || !firstPhysicalStop.valid) return NAN;
+        return wrapDeg180(firstPhysicalStop.headingDeg - turnStart.headingDeg);
+    }
+
+    float correctionTotalDeg() const {
+        if (!firstPhysicalStop.valid || !turnPhysicalStop.valid) return NAN;
+        return wrapDeg180(turnPhysicalStop.headingDeg -
+                          firstPhysicalStop.headingDeg);
+    }
+
+    bool captureLatestPhysicalStop(float x, float y, float headingDeg,
+                                   float finalErrorDeg) {
+        if (!std::isfinite(x) || !std::isfinite(y) ||
+            !std::isfinite(headingDeg)) return false;
+        turnPhysicalStop.x = x;
+        turnPhysicalStop.y = y;
+        turnPhysicalStop.headingDeg = headingDeg;
+        turnPhysicalStop.valid = true;
+        finalTurnErrorDeg = finalErrorDeg;
+        return true;
     }
 
     float turnPositionChordM() const {

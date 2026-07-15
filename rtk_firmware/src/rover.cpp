@@ -243,6 +243,7 @@ struct RouteObserverState {
     routediag::SegmentPathMetrics segmentMetrics;
     routediag::CornerSnapshots cornerSnapshots;
     uint32_t lastPhysicalStopLogMs = 0;
+    uint32_t lastTurnControlLogMs = 0;
     bool warnedToolFootprint = false;
 
     void reset() {
@@ -696,9 +697,12 @@ static bool executorStateUsesReverse(routeexec::ExecutorState state) {
 }
 
 static bool executorStateRotating(routeexec::ExecutorState state) {
-    return state == routeexec::ExecutorState::TURN_TO_NEXT ||
-           state == routeexec::ExecutorState::CORNER_MISSED_INTERCEPT ||
-           state == routeexec::ExecutorState::RECOVERY_TURN ||
+    return state == routeexec::ExecutorState::TURN_BREAKAWAY ||
+           state == routeexec::ExecutorState::TURN_ROTATE ||
+           state == routeexec::ExecutorState::TURN_BRAKE ||
+           state == routeexec::ExecutorState::TURN_EVALUATE ||
+           state == routeexec::ExecutorState::TURN_CORRECTION_BREAKAWAY ||
+           state == routeexec::ExecutorState::TURN_CORRECTION ||
            state == routeexec::ExecutorState::BRAKE ||
            state == routeexec::ExecutorState::WAIT_PHYSICAL_STOP ||
            state == routeexec::ExecutorState::HEADING_STABLE;
@@ -2039,6 +2043,12 @@ static FollowerControllerMode executorControllerMode(
             return FollowerControllerMode::ENDPOINT_RECOVERY;
         case routeexec::ExecutorState::TURN_TO_NEXT:
         case routeexec::ExecutorState::CORNER_MISSED_INTERCEPT:
+        case routeexec::ExecutorState::TURN_BREAKAWAY:
+        case routeexec::ExecutorState::TURN_ROTATE:
+        case routeexec::ExecutorState::TURN_BRAKE:
+        case routeexec::ExecutorState::TURN_EVALUATE:
+        case routeexec::ExecutorState::TURN_CORRECTION_BREAKAWAY:
+        case routeexec::ExecutorState::TURN_CORRECTION:
             return FollowerControllerMode::TURN_IN_PLACE;
         default:
             return FollowerControllerMode::STANLEY;
@@ -2050,7 +2060,15 @@ static FollowerTurnState executorTurnState(routeexec::ExecutorState state) {
         case routeexec::ExecutorState::TURN_TO_NEXT:
         case routeexec::ExecutorState::CORNER_MISSED_INTERCEPT:
         case routeexec::ExecutorState::RECOVERY_TURN:
+        case routeexec::ExecutorState::TURN_BREAKAWAY:
+        case routeexec::ExecutorState::TURN_ROTATE:
+        case routeexec::ExecutorState::TURN_CORRECTION_BREAKAWAY:
+        case routeexec::ExecutorState::TURN_CORRECTION:
             return FollowerTurnState::TURN;
+        case routeexec::ExecutorState::TURN_BRAKE:
+            return FollowerTurnState::BRAKE;
+        case routeexec::ExecutorState::TURN_EVALUATE:
+            return FollowerTurnState::STABLE;
         case routeexec::ExecutorState::BRAKE:
         case routeexec::ExecutorState::FINAL_STOP:
             return FollowerTurnState::BRAKE;
@@ -2199,6 +2217,63 @@ static void logRouteTransition(const routeexec::RouteExecutorOutput& out,
         out.state == routeexec::ExecutorState::TERMINAL_APPROACH;
     const bool segmentChanged = driveState &&
         (int)out.segmentIndex != g_routeObserver.lastLoggedSegment;
+    const bool plannedCornerLifecycle =
+        out.transitionPurpose ==
+            routeexec::RouteTransitionPurpose::PLANNED_CORNER;
+    auto syncTurnSnapshots = [&](routediag::CornerSnapshots& snapshots) {
+        if (isfinite(out.turnStartHeadingDeg)) {
+            routediag::captureOnce(snapshots.turnStart,
+                                   out.turnStartPosition.x,
+                                   out.turnStartPosition.y,
+                                   out.turnStartHeadingDeg);
+            routediag::captureOnce(snapshots.cornerPhysicalStopBeforeTurn,
+                                   out.turnStartPosition.x,
+                                   out.turnStartPosition.y,
+                                   out.turnStartHeadingDeg);
+        }
+        if (isfinite(out.turnFirstBrakeHeadingDeg)) {
+            if (routediag::captureOnce(snapshots.firstBrake,
+                                       e.x, e.y,
+                                       out.turnFirstBrakeHeadingDeg)) {
+                snapshots.firstBrakeYawRateDps =
+                    out.turnFirstBrakeYawRateDps;
+            }
+        }
+        if (isfinite(out.turnFirstPhysicalStopHeadingDeg)) {
+            routediag::captureOnce(snapshots.firstPhysicalStop,
+                                   out.turnFirstPhysicalStopPosition.x,
+                                   out.turnFirstPhysicalStopPosition.y,
+                                   out.turnFirstPhysicalStopHeadingDeg);
+        }
+        if (isfinite(out.turnLastCorrectionStartHeadingDeg)) {
+            snapshots.lastCorrectionStart.x = e.x;
+            snapshots.lastCorrectionStart.y = e.y;
+            snapshots.lastCorrectionStart.headingDeg =
+                out.turnLastCorrectionStartHeadingDeg;
+            snapshots.lastCorrectionStart.valid = true;
+        }
+        if (isfinite(out.turnLastPhysicalStopHeadingDeg)) {
+            snapshots.captureLatestPhysicalStop(
+                out.turnLastPhysicalStopPosition.x,
+                out.turnLastPhysicalStopPosition.y,
+                out.turnLastPhysicalStopHeadingDeg,
+                out.turnFinalErrorDeg);
+        }
+    };
+    if (plannedCornerLifecycle) {
+        syncTurnSnapshots(g_routeObserver.cornerSnapshots);
+        if (g_ltest.active) {
+            syncTurnSnapshots(g_ltest.cornerSnapshots);
+            if (g_ltest.cornerSnapshots.turnPhysicalStop.valid) {
+                g_ltest.cornerAfterTurnX =
+                    g_ltest.cornerSnapshots.turnPhysicalStop.x;
+                g_ltest.cornerAfterTurnY =
+                    g_ltest.cornerSnapshots.turnPhysicalStop.y;
+                g_ltest.headingAfterCorner =
+                    g_ltest.cornerSnapshots.turnPhysicalStop.headingDeg;
+            }
+        }
+    }
     if (!out.stateChanged && !segmentChanged && !out.workActionPending) return;
     const bool enteredSegmentStop =
         out.state == routeexec::ExecutorState::BRAKE ||
@@ -2211,9 +2286,6 @@ static void logRouteTransition(const routeexec::RouteExecutorOutput& out,
         out.oldState == routeexec::ExecutorState::INTERCEPT_NEXT_LINE ||
         out.oldState == routeexec::ExecutorState::TERMINAL_APPROACH ||
         out.oldState == routeexec::ExecutorState::RECOVERY_APPROACH;
-    const bool plannedCornerLifecycle =
-        out.transitionPurpose ==
-            routeexec::RouteTransitionPurpose::PLANNED_CORNER;
     const bool finalArrivalLifecycle =
         out.transitionPurpose ==
             routeexec::RouteTransitionPurpose::FINAL_ARRIVAL;
@@ -2290,7 +2362,7 @@ static void logRouteTransition(const routeexec::RouteExecutorOutput& out,
     }
 
     if (out.stateChanged && plannedCornerLifecycle &&
-        out.state == routeexec::ExecutorState::TURN_TO_NEXT) {
+        out.state == routeexec::ExecutorState::TURN_BREAKAWAY) {
         const bool firstTurnStart = routediag::captureOnce(
             g_routeObserver.cornerSnapshots.turnStart,
             e.x, e.y, e.headingFiltDeg);
@@ -2515,6 +2587,28 @@ static void logRouteTransition(const routeexec::RouteExecutorOutput& out,
     (void)now;
 }
 
+static void logTurnControl(const routeexec::RouteExecutorOutput& out,
+                           const routeexec::RouteExecutorInput& input,
+                           uint32_t now) {
+    if (out.turnPhase == routeexec::TurnPhase::NONE) return;
+    if (!out.stateChanged &&
+        now - g_routeObserver.lastTurnControlLogMs < 200u) return;
+    Serial.printf(
+        "[TURN_CONTROL] turnTarget=%.1f turnError=%+.1f turnDirection=%+d "
+        "yawRate=%+.2f predictedStopAngle=%.1f turnPhase=%s "
+        "turnCommandPercent=%d correctionAttempt=%u breakawayActive=%d "
+        "cmdL=%d cmdR=%d measL=%d measR=%d\n",
+        (double)out.turnTargetDeg, (double)out.turnErrorDeg,
+        out.turnDirection, (double)input.yawRateDps,
+        (double)out.turnPredictedStopAngleDeg,
+        routeexec::turnPhaseName(out.turnPhase), out.turnCommandPercent,
+        (unsigned)out.turnCorrectionAttempt,
+        out.turnBreakawayActive ? 1 : 0,
+        input.commandLeft, input.commandRight,
+        input.measuredLeft, input.measuredRight);
+    g_routeObserver.lastTurnControlLogMs = now;
+}
+
 static void stepRouteExecutor() {
     const uint32_t now = millis();
     const auto& e = g_est.get();
@@ -2548,7 +2642,8 @@ static void stepRouteExecutor() {
         out.interceptTarget.x - e.x, out.interceptTarget.y - e.y);
     g_follow.steeringTargetDeg = out.steeringTargetDeg;
     g_follow.steeringErrorDeg = out.steeringErrorDeg;
-    g_follow.headingErr = out.steeringErrorDeg;
+    g_follow.headingErr = out.turnPhase != routeexec::TurnPhase::NONE
+        ? out.turnErrorDeg : out.steeringErrorDeg;
     g_follow.turnTargetDeg = out.latchedTurnTargetDeg;
     g_follow.endpointRecoveryAttempt = out.recoveryAttempt;
     g_follow.endpointRecoveryActive =
@@ -2568,6 +2663,7 @@ static void stepRouteExecutor() {
 
     updateRouteObserverOnNewPvt(out, e);
     logRouteTransition(out, e, now);
+    logTurnControl(out, input, now);
 
     if (out.stateChanged && out.state == routeexec::ExecutorState::FAULT &&
         out.faultReason != nullptr &&
@@ -5709,6 +5805,14 @@ void lShapeFinish(const char* reason) {
         ? g_ltest.cornerSnapshots.turnPhysicalStop.headingDeg : NAN;
     const float turnActual = turnSnapshotsValid
         ? g_ltest.cornerSnapshots.turnActualDeg() : NAN;
+    const float mainTurnActual = turnSnapshotsValid
+        ? g_ltest.cornerSnapshots.mainTurnActualDeg() : NAN;
+    const float correctionTotal = turnSnapshotsValid
+        ? g_ltest.cornerSnapshots.correctionTotalDeg() : NAN;
+    const float finalStoppedHeading = turnSnapshotsValid
+        ? g_ltest.cornerSnapshots.turnPhysicalStop.headingDeg : NAN;
+    const float finalTurnError = turnSnapshotsValid
+        ? g_ltest.cornerSnapshots.finalTurnErrorDeg : NAN;
     const float turnError = turnSnapshotsValid
         ? NavMath::wrapDeg180(turnActual - g_ltest.turnPlan) : NAN;
     const float cornerShift = turnSnapshotsValid
@@ -5849,11 +5953,17 @@ void lShapeFinish(const char* reason) {
                   (double)finalError);
     Serial.printf("[LTEST] SUMMARY_TURN planned=%.1f actual=%+.1f err=%+.1f "
                   "headingBeforeCorner=%.1f headingAfterCorner=%.1f "
+                  "mainTurnActual=%+.1f correctionTotal=%+.1f "
+                  "finalStoppedHeading=%.1f finalTurnError=%+.1f "
                   "finalHeading=%.1f maxHeadingErr=%.1f\n",
                   (double)g_ltest.turnPlan,
                   (double)turnActual, (double)turnError,
                   (double)headingBeforeCorner,
                   (double)headingAfterCorner,
+                  (double)mainTurnActual,
+                  (double)correctionTotal,
+                  (double)finalStoppedHeading,
+                  (double)finalTurnError,
                   (double)g_ltest.headingFinish,
                   (double)g_ltest.maxHeadingErr);
     Serial.printf("[LTEST] SUMMARY_TURN_EVENTS "
@@ -5886,6 +5996,19 @@ void lShapeFinish(const char* reason) {
                       .nextSegmentInterceptStart.y,
                   (double)g_ltest.cornerSnapshots
                       .nextSegmentInterceptStart.headingDeg);
+    Serial.printf("[LTEST] SUMMARY_TURN_CONTROL "
+                  "firstBrakeHeading=%.1f firstBrakeYawRate=%+.2f "
+                  "firstPhysicalStop=(%.3f,%.3f,%.1f) "
+                  "lastCorrectionStartHeading=%.1f "
+                  "lastPhysicalStopHeading=%.1f finalTurnError=%+.1f\n",
+                  (double)g_ltest.cornerSnapshots.firstBrake.headingDeg,
+                  (double)g_ltest.cornerSnapshots.firstBrakeYawRateDps,
+                  (double)g_ltest.cornerSnapshots.firstPhysicalStop.x,
+                  (double)g_ltest.cornerSnapshots.firstPhysicalStop.y,
+                  (double)g_ltest.cornerSnapshots.firstPhysicalStop.headingDeg,
+                  (double)g_ltest.cornerSnapshots.lastCorrectionStart.headingDeg,
+                  (double)finalStoppedHeading,
+                  (double)finalTurnError);
     Serial.printf("[LTEST] SUMMARY_QUALITY totalPath=%.3f maxCross=%.3f maxHeadingErr=%.1f "
                   "maxHAcc=%.3f maxPvtAge=%u maxRtcmAge=%u maxHeadingAge=%u "
                   "maxRelYawAge=%u maxGyroAge=%u\n",

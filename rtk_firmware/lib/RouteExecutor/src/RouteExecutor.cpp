@@ -80,7 +80,23 @@ RouteExecutorConfig::RouteExecutorConfig()
       turnRateLowRadps(0.4222222f),
       turnRateMinRadps(0.3166667f),
       turnSettleYawRateDps(3.0f),
-      turnTimeoutMs(7000u),
+      turnTimeoutMs(18000u),
+      turnEstimatedAngularDecelDegps2(45.0f),
+      turnBrakeMarginDeg(2.0f),
+      turnPredictedStopMinDeg(2.0f),
+      turnPredictedStopMaxDeg(25.0f),
+      turnSlowdownEnterDeg(35.0f),
+      turnAngularPercentPerRadps(9.12f),
+      turnFarCommandPercent(7),
+      turnSlowCommandPercent(6),
+      turnBreakawayPercent(6),
+      turnBreakawayBoostPercent(7),
+      turnBreakawayBoostAfterMs(350u),
+      turnBreakawayMaxMs(900u),
+      turnBreakawayYawRateThresholdDps(4.0f),
+      turnBreakawayResponseStableMs(120u),
+      turnMaxCorrectionAttempts(4u),
+      turnCorrectionMinImprovementDeg(1.0f),
       physicalStopMotorThreshold(3),
       physicalStopYawRateDps(3.0f),
       physicalStopPvtDisplacementM(0.040f),
@@ -147,6 +163,16 @@ RouteExecutorOutput::RouteExecutorOutput()
       steeringResponseHeadingDeltaDeg(0.0f),
       steeringResponseObservationCount(0u),
       steeringResponseWrongDirection(false),
+      turnPhase(TurnPhase::NONE), turnTargetDeg(NAN), turnErrorDeg(NAN),
+      turnDirection(0), turnPredictedStopAngleDeg(0.0f),
+      turnCommandPercent(0), turnCorrectionAttempt(0u),
+      turnBreakawayActive(false), turnStartPosition(),
+      turnStartHeadingDeg(NAN), turnFirstBrakeHeadingDeg(NAN),
+      turnFirstBrakeYawRateDps(NAN), turnFirstPhysicalStopPosition(),
+      turnFirstPhysicalStopHeadingDeg(NAN),
+      turnLastCorrectionStartHeadingDeg(NAN),
+      turnLastPhysicalStopPosition(),
+      turnLastPhysicalStopHeadingDeg(NAN), turnFinalErrorDeg(NAN),
       invariantViolation(false) {}
 
 const char* executorStateName(ExecutorState state) {
@@ -158,6 +184,13 @@ const char* executorStateName(ExecutorState state) {
         case ExecutorState::APPROACH_TRANSITION: return "APPROACH_TRANSITION";
         case ExecutorState::BRAKE: return "BRAKE";
         case ExecutorState::WAIT_PHYSICAL_STOP: return "WAIT_PHYSICAL_STOP";
+        case ExecutorState::TURN_BREAKAWAY: return "TURN_BREAKAWAY";
+        case ExecutorState::TURN_ROTATE: return "TURN_ROTATE";
+        case ExecutorState::TURN_BRAKE: return "TURN_BRAKE";
+        case ExecutorState::TURN_EVALUATE: return "TURN_EVALUATE";
+        case ExecutorState::TURN_CORRECTION_BREAKAWAY:
+            return "TURN_CORRECTION_BREAKAWAY";
+        case ExecutorState::TURN_CORRECTION: return "TURN_CORRECTION";
         case ExecutorState::TURN_TO_NEXT: return "TURN_TO_NEXT";
         case ExecutorState::HEADING_STABLE: return "HEADING_STABLE";
         case ExecutorState::INTERCEPT_NEXT_LINE: return "INTERCEPT_NEXT_LINE";
@@ -197,6 +230,21 @@ const char* waypointTypeName(WaypointType type) {
     return "PASS_THROUGH";
 }
 
+const char* turnPhaseName(TurnPhase phase) {
+    switch (phase) {
+        case TurnPhase::BREAKAWAY: return "TURN_BREAKAWAY";
+        case TurnPhase::ROTATE: return "TURN_ROTATE";
+        case TurnPhase::BRAKE: return "TURN_BRAKE";
+        case TurnPhase::WAIT_PHYSICAL_STOP: return "WAIT_PHYSICAL_STOP";
+        case TurnPhase::EVALUATE: return "TURN_EVALUATE";
+        case TurnPhase::CORRECTION_BREAKAWAY:
+            return "TURN_CORRECTION_BREAKAWAY";
+        case TurnPhase::CORRECTION: return "TURN_CORRECTION";
+        case TurnPhase::HEADING_STABLE: return "HEADING_STABLE";
+        default: return "NONE";
+    }
+}
+
 RouteExecutor::RouteExecutor()
     : state_(ExecutorState::IDLE), previousState_(ExecutorState::IDLE),
       result_(ExecutorResult::NONE), faultReason_(nullptr),
@@ -209,8 +257,20 @@ RouteExecutor::RouteExecutor()
       physicalStableSinceMs_(0u), physicalStopAnchor_(),
       physicalStopHeadingDeg_(0.0f), physicalStopPvtId_(0u),
       turnTargetDeg_(0.0f), turnTargetLatched_(false), turnDirection_(0),
-      pendingTurnDirection_(0), turnCorrections_(0u),
+      turnCorrections_(0u),
       turnStableReferenceDeg_(0.0f), turnStartedMs_(0u),
+      turnPhaseStartedMs_(0u), turnBreakawayResponseSinceMs_(0u),
+      turnContextState_(ExecutorState::TURN_TO_NEXT),
+      turnCycleIsCorrection_(false), turnErrorBeforeCycleDeg_(0.0f),
+      turnPredictedStopAngleDeg_(0.0f), turnCommandPercent_(0),
+      turnStartPosition_(), turnStartHeadingDeg_(NAN),
+      turnFirstBrakeValid_(false), turnFirstBrakeHeadingDeg_(NAN),
+      turnFirstBrakeYawRateDps_(NAN),
+      turnFirstPhysicalStopValid_(false), turnFirstPhysicalStopPosition_(),
+      turnFirstPhysicalStopHeadingDeg_(NAN),
+      turnLastCorrectionStartHeadingDeg_(NAN),
+      turnLastPhysicalStopPosition_(),
+      turnLastPhysicalStopHeadingDeg_(NAN), turnFinalErrorDeg_(NAN),
       scheduledTurnTargetDeg_(0.0f),
       scheduledTurnState_(ExecutorState::TURN_TO_NEXT),
       scheduledStableNext_(StableNext::NONE),
@@ -257,9 +317,26 @@ bool RouteExecutor::start(const RoutePlan& plan,
     stableNext_ = StableNext::NONE;
     physicalStableSinceMs_ = 0u;
     turnTargetLatched_ = false;
-    turnDirection_ = pendingTurnDirection_ = 0;
+    turnDirection_ = 0;
     turnCorrections_ = 0u;
     turnStartedMs_ = 0u;
+    turnPhaseStartedMs_ = 0u;
+    turnBreakawayResponseSinceMs_ = 0u;
+    turnCycleIsCorrection_ = false;
+    turnErrorBeforeCycleDeg_ = 0.0f;
+    turnPredictedStopAngleDeg_ = 0.0f;
+    turnCommandPercent_ = 0;
+    turnStartPosition_ = input.position;
+    turnStartHeadingDeg_ = NAN;
+    turnFirstBrakeValid_ = false;
+    turnFirstBrakeHeadingDeg_ = NAN;
+    turnFirstBrakeYawRateDps_ = NAN;
+    turnFirstPhysicalStopValid_ = false;
+    turnFirstPhysicalStopHeadingDeg_ = NAN;
+    turnLastCorrectionStartHeadingDeg_ = NAN;
+    turnLastPhysicalStopPosition_ = LocalPoint();
+    turnLastPhysicalStopHeadingDeg_ = NAN;
+    turnFinalErrorDeg_ = NAN;
     scheduledTurnTargetDeg_ = steeringTargetDeg_;
     scheduledTurnState_ = ExecutorState::TURN_TO_NEXT;
     scheduledStableNext_ = StableNext::NONE;
@@ -312,8 +389,11 @@ void RouteExecutor::stop(const char* reason) {
     physicalStableSinceMs_ = 0u;
     turnTargetLatched_ = false;
     turnDirection_ = 0;
-    pendingTurnDirection_ = 0;
     turnCorrections_ = 0u;
+    turnPhaseStartedMs_ = 0u;
+    turnBreakawayResponseSinceMs_ = 0u;
+    turnCycleIsCorrection_ = false;
+    turnCommandPercent_ = 0;
     recoveryAttempt_ = 0u;
     recoverySegmentIndex_ = static_cast<size_t>(-1);
     recoveryGoalReached_ = false;
@@ -353,6 +433,9 @@ void RouteExecutor::resume(uint32_t nowMs) {
     if (steeringTargetAtMs_ != 0u)
         steeringTargetAtMs_ += pausedDuration;
     if (turnStartedMs_ != 0u) turnStartedMs_ += pausedDuration;
+    if (turnPhaseStartedMs_ != 0u) turnPhaseStartedMs_ += pausedDuration;
+    if (turnBreakawayResponseSinceMs_ != 0u)
+        turnBreakawayResponseSinceMs_ += pausedDuration;
     if (recoveryMotionStartedMs_ != 0u)
         recoveryMotionStartedMs_ += pausedDuration;
     if (progressSinceMs_ != 0u) progressSinceMs_ += pausedDuration;
@@ -595,11 +678,96 @@ void RouteExecutor::startTurn(float targetDeg,
     turnTargetLatched_ = true;
     const float error = wrapHeadingErrorDeg(turnTargetDeg_ - input.headingDeg);
     turnDirection_ = error >= 0.0f ? 1 : -1;
-    pendingTurnDirection_ = 0;
-    if (resetCorrections) turnCorrections_ = 0u;
-    if (resetCorrections) turnStartedMs_ = input.nowMs;
+    turnContextState_ = turnState;
+    if (resetCorrections) {
+        turnCorrections_ = 0u;
+        turnStartedMs_ = input.nowMs;
+        turnStartPosition_ = input.position;
+        turnStartHeadingDeg_ = input.headingDeg;
+        turnFirstBrakeValid_ = false;
+        turnFirstPhysicalStopValid_ = false;
+        turnFirstBrakeHeadingDeg_ = NAN;
+        turnFirstBrakeYawRateDps_ = NAN;
+        turnFirstPhysicalStopHeadingDeg_ = NAN;
+        turnLastCorrectionStartHeadingDeg_ = NAN;
+        turnLastPhysicalStopHeadingDeg_ = NAN;
+        turnFinalErrorDeg_ = error;
+    }
+    turnCycleIsCorrection_ = !resetCorrections;
+    turnErrorBeforeCycleDeg_ = std::fabs(error);
+    turnPhaseStartedMs_ = input.nowMs;
+    turnBreakawayResponseSinceMs_ = 0u;
+    physicalStableSinceMs_ = 0u;
+    turnPredictedStopAngleDeg_ = 0.0f;
+    turnCommandPercent_ = 0;
     stableNext_ = stableNext;
-    setState(turnState, input.nowMs);
+    setState(resetCorrections ? ExecutorState::TURN_BREAKAWAY
+                              : ExecutorState::TURN_CORRECTION_BREAKAWAY,
+             input.nowMs);
+    updateTurnBreakaway(input);
+}
+
+float RouteExecutor::turnAngularForPercent(int percent) const {
+    const float scale = config_.turnAngularPercentPerRadps > 0.01f
+        ? config_.turnAngularPercentPerRadps : 1.0f;
+    return static_cast<float>(percent) / scale;
+}
+
+float RouteExecutor::predictedTurnStopAngleDeg(
+        const RouteExecutorInput& input, float errorDeg) const {
+    (void)errorDeg;
+    const float decel = config_.turnEstimatedAngularDecelDegps2 > 1.0f
+        ? config_.turnEstimatedAngularDecelDegps2 : 1.0f;
+    const float yaw = std::fabs(input.yawRateDps);
+    const float prediction = yaw * yaw / (2.0f * decel) +
+                             config_.turnBrakeMarginDeg;
+    return clampFloat(prediction, config_.turnPredictedStopMinDeg,
+                      config_.turnPredictedStopMaxDeg);
+}
+
+void RouteExecutor::updateTurnBreakaway(const RouteExecutorInput& input) {
+    if (elapsedMillis(input.nowMs, turnStartedMs_) > config_.turnTimeoutMs) {
+        fail("turn_not_converging", input.nowMs);
+        return;
+    }
+    const uint32_t elapsed = elapsedMillis(input.nowMs, turnPhaseStartedMs_);
+    if (elapsed > config_.turnBreakawayMaxMs) {
+        fail("turn_motor_no_response", input.nowMs);
+        return;
+    }
+    const bool response = input.yawRateDps *
+            static_cast<float>(turnDirection_) >=
+        config_.turnBreakawayYawRateThresholdDps;
+    if (response) {
+        if (turnBreakawayResponseSinceMs_ == 0u)
+            turnBreakawayResponseSinceMs_ = input.nowMs;
+        if (elapsedMillis(input.nowMs, turnBreakawayResponseSinceMs_) >=
+            config_.turnBreakawayResponseStableMs) {
+            setState(turnCycleIsCorrection_ ? ExecutorState::TURN_CORRECTION
+                                            : ExecutorState::TURN_ROTATE,
+                     input.nowMs);
+            updateTurn(input, state_);
+            return;
+        }
+    } else {
+        turnBreakawayResponseSinceMs_ = 0u;
+    }
+    turnCommandPercent_ = elapsed >= config_.turnBreakawayBoostAfterMs
+        ? config_.turnBreakawayBoostPercent : config_.turnBreakawayPercent;
+    output_.motion = MotionKind::TURN_IN_PLACE;
+    output_.linearMps = 0.0f;
+    output_.angularRadps = static_cast<float>(turnDirection_) *
+                           turnAngularForPercent(turnCommandPercent_);
+}
+
+void RouteExecutor::beginTurnBrake(const RouteExecutorInput& input) {
+    if (!turnFirstBrakeValid_) {
+        turnFirstBrakeValid_ = true;
+        turnFirstBrakeHeadingDeg_ = input.headingDeg;
+        turnFirstBrakeYawRateDps_ = input.yawRateDps;
+    }
+    turnCommandPercent_ = 0;
+    enterBrake(StopNext::TURN_EVALUATE, input, ExecutorState::TURN_BRAKE);
 }
 
 void RouteExecutor::updateTurn(const RouteExecutorInput& input,
@@ -611,32 +779,71 @@ void RouteExecutor::updateTurn(const RouteExecutorInput& input,
     }
     const float error = wrapHeadingErrorDeg(turnTargetDeg_ - input.headingDeg);
     const float absError = std::fabs(error);
-    if (absError <= config_.turnToleranceDeg) {
-        enterBrake(StopNext::TURN_SETTLE, input);
+    turnPredictedStopAngleDeg_ = predictedTurnStopAngleDeg(input, error);
+    const int errorDirection = error >= 0.0f ? 1 : -1;
+    const bool yawTowardTarget = input.yawRateDps *
+            static_cast<float>(errorDirection) >
+        config_.turnSettleYawRateDps;
+    const bool predictedBrake = yawTowardTarget &&
+        absError <= turnPredictedStopAngleDeg_;
+    const bool overshot = errorDirection != turnDirection_;
+    if (absError <= config_.turnToleranceDeg || predictedBrake || overshot) {
+        beginTurnBrake(input);
         return;
     }
-    const int requestedDirection = error >= 0.0f ? 1 : -1;
-    if (requestedDirection != turnDirection_) {
-        pendingTurnDirection_ = requestedDirection;
-        if (++turnCorrections_ > 4u) {
+    turnCommandPercent_ = absError > config_.turnSlowdownEnterDeg
+        ? config_.turnFarCommandPercent : config_.turnSlowCommandPercent;
+    output_.motion = MotionKind::TURN_IN_PLACE;
+    output_.linearMps = 0.0f;
+    output_.angularRadps = static_cast<float>(turnDirection_) *
+                           turnAngularForPercent(turnCommandPercent_);
+    (void)turnState;
+}
+
+void RouteExecutor::beginTurnCorrection(const RouteExecutorInput& input,
+                                        float errorDeg) {
+    turnDirection_ = errorDeg >= 0.0f ? 1 : -1;
+    turnCycleIsCorrection_ = true;
+    turnErrorBeforeCycleDeg_ = std::fabs(errorDeg);
+    turnLastCorrectionStartHeadingDeg_ = input.headingDeg;
+    turnPhaseStartedMs_ = input.nowMs;
+    turnBreakawayResponseSinceMs_ = 0u;
+    turnPredictedStopAngleDeg_ = 0.0f;
+    turnCommandPercent_ = 0;
+    setState(ExecutorState::TURN_CORRECTION_BREAKAWAY, input.nowMs);
+}
+
+void RouteExecutor::updateTurnEvaluate(const RouteExecutorInput& input) {
+    const float stoppedHeading = std::isfinite(turnLastPhysicalStopHeadingDeg_)
+        ? turnLastPhysicalStopHeadingDeg_ : input.headingDeg;
+    const float error = wrapHeadingErrorDeg(turnTargetDeg_ - stoppedHeading);
+    const float absError = std::fabs(error);
+    turnFinalErrorDeg_ = error;
+    if (turnCycleIsCorrection_) {
+        if (turnCorrections_ < UINT8_MAX) ++turnCorrections_;
+        const bool improved = absError <= config_.turnToleranceDeg ||
+            absError <= turnErrorBeforeCycleDeg_ -
+                            config_.turnCorrectionMinImprovementDeg;
+        if (!improved) {
             fail("turn_not_converging", input.nowMs);
             return;
         }
-        enterBrake(StopNext::TURN_SETTLE, input);
+    }
+    if (absError <= config_.turnToleranceDeg) {
+        turnCycleIsCorrection_ = false;
+        turnStableReferenceDeg_ = input.headingDeg;
+        physicalStableSinceMs_ = 0u;
+        physicalStopAnchor_ = input.position;
+        physicalStopHeadingDeg_ = input.headingDeg;
+        setState(ExecutorState::HEADING_STABLE, input.nowMs);
         return;
     }
-    float rate = config_.turnRateMinRadps;
-    if (absError > 60.0f) rate = config_.turnRateMaxRadps;
-    else if (absError > 25.0f) rate = config_.turnRateMidRadps;
-    else if (absError > 10.0f) rate = config_.turnRateLowRadps;
-    if (absError < 15.0f) {
-        rate -= 0.012f * std::fabs(input.yawRateDps);
-        if (rate < config_.turnRateMinRadps) rate = config_.turnRateMinRadps;
+    if (turnCorrections_ >= config_.turnMaxCorrectionAttempts) {
+        fail("turn_not_converging", input.nowMs);
+        return;
     }
-    output_.motion = MotionKind::TURN_IN_PLACE;
-    output_.linearMps = 0.0f;
-    output_.angularRadps = static_cast<float>(turnDirection_) * rate;
-    (void)turnState;
+    beginTurnCorrection(input, error);
+    updateTurnBreakaway(input);
 }
 
 void RouteExecutor::updateHeadingStable(const RouteExecutorInput& input) {
@@ -646,19 +853,11 @@ void RouteExecutor::updateHeadingStable(const RouteExecutorInput& input) {
         input.headingDeg - turnStableReferenceDeg_));
     if (std::fabs(error) > config_.turnToleranceDeg ||
         drift > config_.physicalStopHeadingDriftDeg) {
-        if (++turnCorrections_ > 4u) {
+        if (turnCorrections_ >= config_.turnMaxCorrectionAttempts) {
             fail("turn_not_converging", input.nowMs);
             return;
         }
-        const ExecutorState correctionState =
-            stableNext_ == StableNext::RECOVERY_APPROACH
-                ? ExecutorState::RECOVERY_TURN
-                : (transitionPurpose_ ==
-                           RouteTransitionPurpose::CORNER_MISSED_INTERCEPT
-                       ? ExecutorState::CORNER_MISSED_INTERCEPT
-                       : ExecutorState::TURN_TO_NEXT);
-        startTurn(turnTargetDeg_, correctionState,
-                  stableNext_, input, false);
+        beginTurnCorrection(input, error);
         return;
     }
     switch (stableNext_) {
@@ -951,6 +1150,60 @@ void RouteExecutor::populateOutput(const RouteExecutorInput& input) {
         steeringResponseObservationCount_;
     output_.steeringResponseWrongDirection =
         steeringResponseWrongDirection_;
+    switch (state_) {
+        case ExecutorState::TURN_BREAKAWAY:
+            output_.turnPhase = TurnPhase::BREAKAWAY;
+            break;
+        case ExecutorState::TURN_ROTATE:
+            output_.turnPhase = TurnPhase::ROTATE;
+            break;
+        case ExecutorState::TURN_BRAKE:
+            output_.turnPhase = TurnPhase::BRAKE;
+            break;
+        case ExecutorState::TURN_EVALUATE:
+            output_.turnPhase = TurnPhase::EVALUATE;
+            break;
+        case ExecutorState::TURN_CORRECTION_BREAKAWAY:
+            output_.turnPhase = TurnPhase::CORRECTION_BREAKAWAY;
+            break;
+        case ExecutorState::TURN_CORRECTION:
+            output_.turnPhase = TurnPhase::CORRECTION;
+            break;
+        case ExecutorState::HEADING_STABLE:
+            output_.turnPhase = TurnPhase::HEADING_STABLE;
+            break;
+        case ExecutorState::WAIT_PHYSICAL_STOP:
+            if (stopNext_ == StopNext::TURN_EVALUATE)
+                output_.turnPhase = TurnPhase::WAIT_PHYSICAL_STOP;
+            break;
+        case ExecutorState::FAULT:
+            if (turnTargetLatched_ && std::isfinite(turnLastPhysicalStopHeadingDeg_))
+                output_.turnPhase = TurnPhase::EVALUATE;
+            break;
+        default:
+            break;
+    }
+    output_.turnTargetDeg = turnTargetLatched_ ? turnTargetDeg_ : NAN;
+    output_.turnErrorDeg = turnTargetLatched_
+        ? wrapHeadingErrorDeg(turnTargetDeg_ - input.headingDeg) : NAN;
+    output_.turnDirection = turnDirection_;
+    output_.turnPredictedStopAngleDeg = turnPredictedStopAngleDeg_;
+    output_.turnCommandPercent = turnCommandPercent_;
+    output_.turnCorrectionAttempt = turnCorrections_;
+    output_.turnBreakawayActive =
+        output_.turnPhase == TurnPhase::BREAKAWAY ||
+        output_.turnPhase == TurnPhase::CORRECTION_BREAKAWAY;
+    output_.turnStartPosition = turnStartPosition_;
+    output_.turnStartHeadingDeg = turnStartHeadingDeg_;
+    output_.turnFirstBrakeHeadingDeg = turnFirstBrakeHeadingDeg_;
+    output_.turnFirstBrakeYawRateDps = turnFirstBrakeYawRateDps_;
+    output_.turnFirstPhysicalStopPosition = turnFirstPhysicalStopPosition_;
+    output_.turnFirstPhysicalStopHeadingDeg = turnFirstPhysicalStopHeadingDeg_;
+    output_.turnLastCorrectionStartHeadingDeg =
+        turnLastCorrectionStartHeadingDeg_;
+    output_.turnLastPhysicalStopPosition = turnLastPhysicalStopPosition_;
+    output_.turnLastPhysicalStopHeadingDeg = turnLastPhysicalStopHeadingDeg_;
+    output_.turnFinalErrorDeg = turnFinalErrorDeg_;
     output_.finalArrivalPending =
         state_ == ExecutorState::FINAL_STOP ||
         (state_ == ExecutorState::WAIT_PHYSICAL_STOP &&
@@ -1043,9 +1296,10 @@ RouteExecutorOutput RouteExecutor::update(const RouteExecutorInput& input) {
         populateOutput(input);
         return output_;
     }
-    if ((state_ == ExecutorState::TURN_TO_NEXT ||
-         state_ == ExecutorState::CORNER_MISSED_INTERCEPT ||
-         state_ == ExecutorState::RECOVERY_TURN) &&
+    if ((state_ == ExecutorState::TURN_BREAKAWAY ||
+         state_ == ExecutorState::TURN_ROTATE ||
+         state_ == ExecutorState::TURN_CORRECTION_BREAKAWAY ||
+         state_ == ExecutorState::TURN_CORRECTION) &&
         !input.turnPathAllowed) {
         fail("turn_footprint_blocked", input.nowMs);
         populateOutput(input);
@@ -1180,6 +1434,7 @@ RouteExecutorOutput RouteExecutor::update(const RouteExecutorInput& input) {
         }
         case ExecutorState::BRAKE:
         case ExecutorState::FINAL_STOP:
+        case ExecutorState::TURN_BRAKE:
             setState(ExecutorState::WAIT_PHYSICAL_STOP, input.nowMs);
             break;
         case ExecutorState::WAIT_PHYSICAL_STOP:
@@ -1193,39 +1448,34 @@ RouteExecutorOutput RouteExecutor::update(const RouteExecutorInput& input) {
             if (!updatePhysicalStop(input)) break;
             switch (stopNext_) {
                 case StopNext::START_TURN:
-                    startTurn(scheduledTurnTargetDeg_,
-                              scheduledTurnState_,
-                              scheduledStableNext_, input);
+                    if (!input.turnPathAllowed)
+                        fail("turn_footprint_blocked", input.nowMs);
+                    else
+                        startTurn(scheduledTurnTargetDeg_,
+                                  scheduledTurnState_,
+                                  scheduledStableNext_, input);
                     break;
                 case StopNext::TURN_NEXT:
                     if (segmentIndex_ + 1u >= plan_.segmentCount())
                         fail("route_state_critical", input.nowMs);
+                    else if (!input.turnPathAllowed)
+                        fail("turn_footprint_blocked", input.nowMs);
                     else
                         startTurn(plan_.segment(segmentIndex_ + 1u).plannedHeadingDeg,
                                   ExecutorState::TURN_TO_NEXT,
                                   StableNext::NEXT_SEGMENT_INTERCEPT, input);
                     break;
-                case StopNext::TURN_SETTLE:
-                    if (pendingTurnDirection_ != 0) {
-                        turnDirection_ = pendingTurnDirection_;
-                        pendingTurnDirection_ = 0;
-                        setState(
-                            stableNext_ == StableNext::RECOVERY_APPROACH
-                                ? ExecutorState::RECOVERY_TURN
-                                : (transitionPurpose_ ==
-                                           RouteTransitionPurpose::
-                                               CORNER_MISSED_INTERCEPT
-                                       ? ExecutorState::
-                                             CORNER_MISSED_INTERCEPT
-                                       : ExecutorState::TURN_TO_NEXT),
-                                  input.nowMs);
-                    } else {
-                        turnStableReferenceDeg_ = input.headingDeg;
-                        physicalStableSinceMs_ = 0u;
-                        physicalStopAnchor_ = input.position;
-                        physicalStopHeadingDeg_ = input.headingDeg;
-                        setState(ExecutorState::HEADING_STABLE, input.nowMs);
+                case StopNext::TURN_EVALUATE:
+                    turnLastPhysicalStopPosition_ = input.position;
+                    turnLastPhysicalStopHeadingDeg_ = input.headingDeg;
+                    turnFinalErrorDeg_ = wrapHeadingErrorDeg(
+                        turnTargetDeg_ - input.headingDeg);
+                    if (!turnFirstPhysicalStopValid_) {
+                        turnFirstPhysicalStopValid_ = true;
+                        turnFirstPhysicalStopPosition_ = input.position;
+                        turnFirstPhysicalStopHeadingDeg_ = input.headingDeg;
                     }
+                    setState(ExecutorState::TURN_EVALUATE, input.nowMs);
                     break;
                 case StopNext::START_INTERCEPT:
                     acquireSegment(input.nowMs, true);
@@ -1239,11 +1489,15 @@ RouteExecutorOutput RouteExecutor::update(const RouteExecutorInput& input) {
                     setState(ExecutorState::RECOVERY_REVERSE, input.nowMs);
                     break;
                 case StopNext::RECOVERY_TURN:
-                    computedRecoveryBearingDeg_ = bearingDeg(
-                        input.position, recoveryGoal_);
-                    startTurn(computedRecoveryBearingDeg_,
-                              ExecutorState::RECOVERY_TURN,
-                              StableNext::RECOVERY_APPROACH, input);
+                    if (!input.turnPathAllowed) {
+                        fail("turn_footprint_blocked", input.nowMs);
+                    } else {
+                        computedRecoveryBearingDeg_ = bearingDeg(
+                            input.position, recoveryGoal_);
+                        startTurn(computedRecoveryBearingDeg_,
+                                  ExecutorState::RECOVERY_TURN,
+                                  StableNext::RECOVERY_APPROACH, input);
+                    }
                     break;
                 case StopNext::RECOVERY_EVALUATE:
                     setState(ExecutorState::RECOVERY_EVALUATE,
@@ -1253,6 +1507,10 @@ RouteExecutorOutput RouteExecutor::update(const RouteExecutorInput& input) {
                     if (segmentIndex_ + 1u >= plan_.segmentCount() ||
                         !input.nextSegmentPathAllowed) {
                         fail("transition_missed", input.nowMs);
+                        break;
+                    }
+                    if (!input.turnPathAllowed) {
+                        fail("turn_footprint_blocked", input.nowMs);
                         break;
                     }
                     const size_t nextIndex = segmentIndex_ + 1u;
@@ -1283,14 +1541,21 @@ RouteExecutorOutput RouteExecutor::update(const RouteExecutorInput& input) {
                     break;
             }
             break;
+        case ExecutorState::TURN_BREAKAWAY:
+        case ExecutorState::TURN_CORRECTION_BREAKAWAY:
+            updateTurnBreakaway(input);
+            break;
+        case ExecutorState::TURN_ROTATE:
+        case ExecutorState::TURN_CORRECTION:
+            updateTurn(input, state_);
+            break;
+        case ExecutorState::TURN_EVALUATE:
+            updateTurnEvaluate(input);
+            break;
         case ExecutorState::TURN_TO_NEXT:
-            updateTurn(input, ExecutorState::TURN_TO_NEXT);
-            break;
         case ExecutorState::CORNER_MISSED_INTERCEPT:
-            updateTurn(input, ExecutorState::CORNER_MISSED_INTERCEPT);
-            break;
         case ExecutorState::RECOVERY_TURN:
-            updateTurn(input, ExecutorState::RECOVERY_TURN);
+            fail("route_state_critical", input.nowMs);
             break;
         case ExecutorState::HEADING_STABLE:
             updateHeadingStable(input);

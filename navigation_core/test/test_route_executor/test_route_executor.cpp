@@ -99,6 +99,10 @@ RouteExecutorConfig fastConfig() {
     config.recoveryReverseMaxM = 0.10f;
     config.recoveryApproachMaxM = 0.50f;
     config.recoveryMaxAttempts = 3u;
+    config.turnBreakawayResponseStableMs = 1u;
+    config.turnBreakawayBoostAfterMs = 5u;
+    config.turnBreakawayMaxMs = 20u;
+    config.turnTimeoutMs = 1000u;
     return config;
 }
 
@@ -150,7 +154,8 @@ RouteExecutorOutput finishPhysicalStop(RouteExecutor& executor,
                                        const RouteExecutorConfig& config) {
     RouteExecutorOutput output = executor.lastOutput();
     if (executor.state() == ExecutorState::BRAKE ||
-        executor.state() == ExecutorState::FINAL_STOP) {
+        executor.state() == ExecutorState::FINAL_STOP ||
+        executor.state() == ExecutorState::TURN_BRAKE) {
         output = tick(executor, input);
     }
     EXPECT_EQ(executor.state(), ExecutorState::WAIT_PHYSICAL_STOP);
@@ -160,17 +165,40 @@ RouteExecutorOutput finishPhysicalStop(RouteExecutor& executor,
     return output;
 }
 
+RouteExecutorOutput brakeTurnAtTarget(RouteExecutor& executor,
+                                      RouteExecutorInput& input,
+                                      const RouteExecutorConfig& config,
+                                      float targetHeadingDeg) {
+    RouteExecutorOutput output = executor.lastOutput();
+    EXPECT_TRUE(executor.state() == ExecutorState::TURN_BREAKAWAY ||
+                executor.state() ==
+                    ExecutorState::TURN_CORRECTION_BREAKAWAY);
+    if (executor.state() != ExecutorState::TURN_BREAKAWAY &&
+        executor.state() != ExecutorState::TURN_CORRECTION_BREAKAWAY) {
+        return output;
+    }
+    input.yawRateDps = output.turnDirection * 5.0f;
+    output = tick(executor, input);
+    input.headingDeg = targetHeadingDeg;
+    output = tick(executor, input,
+                  config.turnBreakawayResponseStableMs + 1u);
+    EXPECT_EQ(output.state, ExecutorState::TURN_BRAKE);
+    input.yawRateDps = 0.0f;
+    output = finishPhysicalStop(executor, input, config);
+    EXPECT_EQ(output.state, ExecutorState::TURN_EVALUATE);
+    output = tick(executor, input);
+    EXPECT_EQ(output.state, ExecutorState::HEADING_STABLE);
+    return output;
+}
+
 void advanceCornerToIntercept(RouteExecutor& executor,
                               RouteExecutorInput& input,
                               const RouteExecutorConfig& config,
                               float nextHeadingDeg) {
     ASSERT_EQ(executor.state(), ExecutorState::BRAKE);
     RouteExecutorOutput output = finishPhysicalStop(executor, input, config);
-    ASSERT_EQ(output.state, ExecutorState::TURN_TO_NEXT);
-    input.headingDeg = nextHeadingDeg;
-    output = tick(executor, input);
-    ASSERT_EQ(output.state, ExecutorState::BRAKE);
-    output = finishPhysicalStop(executor, input, config);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
+    output = brakeTurnAtTarget(executor, input, config, nextHeadingDeg);
     ASSERT_EQ(output.state, ExecutorState::HEADING_STABLE);
     output = tick(executor, input);
     ASSERT_EQ(output.state, ExecutorState::HEADING_STABLE);
@@ -314,7 +342,7 @@ TEST(RouteTransition, MissedCornerStopsBeforeBoundedNextLineIntercept) {
     // Only after a physical stop may the executor turn toward/intercept the
     // next immutable line. It never treats the missed corner as reached.
     output = finishPhysicalStop(executor, input, config);
-    EXPECT_EQ(output.state, ExecutorState::CORNER_MISSED_INTERCEPT);
+    EXPECT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
     EXPECT_EQ(output.segmentIndex, 1u);
     EXPECT_EQ(output.transitionPurpose,
               RouteTransitionPurpose::CORNER_MISSED_INTERCEPT);
@@ -354,13 +382,13 @@ TEST(RouteRecovery, TurnTargetIsLatchedForWholeAttempt) {
     const RouteExecutorConfig config = fastConfig();
     enterAutomaticEndpointRecovery(executor, input, config);
     RouteExecutorOutput output = finishPhysicalStop(executor, input, config);
-    ASSERT_EQ(output.state, ExecutorState::RECOVERY_TURN);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
     ASSERT_TRUE(std::isfinite(output.latchedTurnTargetDeg));
     const float latched = output.latchedTurnTargetDeg;
 
     input.position = LocalPoint(1.25f, 0.28f);
     output = tick(executor, input);
-    EXPECT_EQ(output.state, ExecutorState::RECOVERY_TURN);
+    EXPECT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
     EXPECT_FLOAT_EQ(output.latchedTurnTargetDeg, latched);
 }
 
@@ -370,14 +398,12 @@ TEST(RouteRecovery, AttemptCounterChangesOnlyAfterStopTurnStopApproachEvaluate) 
     const RouteExecutorConfig config = fastConfig();
     enterAutomaticEndpointRecovery(executor, input, config);
     RouteExecutorOutput output = finishPhysicalStop(executor, input, config);
-    ASSERT_EQ(output.state, ExecutorState::RECOVERY_TURN);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
     ASSERT_EQ(output.recoveryAttempt, 0u);
 
-    input.headingDeg = output.latchedTurnTargetDeg;
-    output = tick(executor, input);
-    ASSERT_EQ(output.state, ExecutorState::BRAKE);
+    output = brakeTurnAtTarget(executor, input, config,
+                               output.latchedTurnTargetDeg);
     EXPECT_EQ(output.recoveryAttempt, 0u);
-    output = finishPhysicalStop(executor, input, config);
     ASSERT_EQ(output.state, ExecutorState::HEADING_STABLE);
     output = tick(executor, input);
     ASSERT_EQ(output.state, ExecutorState::HEADING_STABLE);
@@ -408,7 +434,7 @@ TEST(RouteTurn, LargeHeadingErrorBrakesBeforeTurnAndTimesOutBoundedly) {
     ASSERT_EQ(output.state, ExecutorState::BRAKE);
     EXPECT_EQ(output.motion, MotionKind::STOP);
     output = finishPhysicalStop(executor, input, config);
-    ASSERT_EQ(output.state, ExecutorState::TURN_TO_NEXT);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
     output = tick(executor, input, 6u);
     EXPECT_EQ(output.state, ExecutorState::FAULT);
     EXPECT_STREQ(output.faultReason, "turn_not_converging");
@@ -422,15 +448,256 @@ TEST(RouteTurn, BlockedSweptFootprintFaultsBeforeTurnCommand) {
     ASSERT_TRUE(executor.start(plan, config, input));
     EXPECT_EQ(tick(executor, input).state, ExecutorState::ACQUIRE_SEGMENT);
     ASSERT_EQ(tick(executor, input).state, ExecutorState::BRAKE);
-    RouteExecutorOutput output = finishPhysicalStop(executor, input, config);
-    ASSERT_EQ(output.state, ExecutorState::TURN_TO_NEXT);
-    EXPECT_EQ(output.motion, MotionKind::STOP);
-
-    input.turnPathAllowed = false;
+    RouteExecutorOutput output = tick(executor, input);
+    ASSERT_EQ(output.state, ExecutorState::WAIT_PHYSICAL_STOP);
     output = tick(executor, input);
+    ASSERT_EQ(output.state, ExecutorState::WAIT_PHYSICAL_STOP);
+    input.turnPathAllowed = false;
+    output = tick(executor, input, config.physicalStopStableMs + 1u);
     EXPECT_EQ(output.state, ExecutorState::FAULT);
     EXPECT_EQ(output.motion, MotionKind::STOP);
     EXPECT_STREQ(output.faultReason, "turn_footprint_blocked");
+}
+
+RouteExecutorOutput enterHeadingReacquireTurn(
+        RouteExecutor& executor, RouteExecutorInput& input,
+        const RouteExecutorConfig& config) {
+    const RoutePlan plan = straightPlan();
+    EXPECT_TRUE(executor.start(plan, config, input));
+    tick(executor, input);
+    RouteExecutorOutput output = tick(executor, input);
+    EXPECT_EQ(output.state, ExecutorState::BRAKE);
+    output = finishPhysicalStop(executor, input, config);
+    EXPECT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
+    return output;
+}
+
+RouteExecutorOutput advanceBreakawayToRotate(
+        RouteExecutor& executor, RouteExecutorInput& input,
+        const RouteExecutorConfig& config) {
+    RouteExecutorOutput output = executor.lastOutput();
+    input.yawRateDps = output.turnDirection * 5.0f;
+    output = tick(executor, input);
+    output = tick(executor, input,
+                  config.turnBreakawayResponseStableMs + 1u);
+    EXPECT_TRUE(output.state == ExecutorState::TURN_ROTATE ||
+                output.state == ExecutorState::TURN_CORRECTION);
+    return output;
+}
+
+RouteExecutorOutput stopMainTurnWithFieldOvershoot(
+        RouteExecutor& executor, RouteExecutorInput& input,
+        const RouteExecutorConfig& config) {
+    RouteExecutorOutput output = advanceBreakawayToRotate(
+        executor, input, config);
+    input.headingDeg = 78.8f;
+    input.yawRateDps = 37.0f;
+    output = tick(executor, input);
+    EXPECT_EQ(output.state, ExecutorState::TURN_BRAKE);
+    input.headingDeg = 98.9f;
+    input.yawRateDps = 0.0f;
+    tick(executor, input);  // TURN_BRAKE -> WAIT_PHYSICAL_STOP.
+    tick(executor, input);  // Coast changed heading; establish stop anchor.
+    output = finishPhysicalStop(executor, input, config);
+    EXPECT_EQ(output.state, ExecutorState::TURN_EVALUATE);
+    output = tick(executor, input);
+    EXPECT_EQ(output.state, ExecutorState::TURN_CORRECTION_BREAKAWAY);
+    return output;
+}
+
+TEST(RouteTurnFieldControl, HighYawRateBrakesBeforeHeadingTolerance) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    const RouteExecutorConfig config = fastConfig();
+    enterHeadingReacquireTurn(executor, input, config);
+    advanceBreakawayToRotate(executor, input, config);
+
+    input.headingDeg = 78.8f;  // 11.2 deg remains to the 90 deg target.
+    input.yawRateDps = 37.0f;
+    const RouteExecutorOutput output = tick(executor, input);
+    EXPECT_EQ(output.state, ExecutorState::TURN_BRAKE);
+    EXPECT_GT(std::fabs(output.turnErrorDeg), config.turnToleranceDeg);
+    EXPECT_GT(output.turnPredictedStopAngleDeg,
+              std::fabs(output.turnErrorDeg));
+    EXPECT_NEAR(output.turnPredictedStopAngleDeg,
+                37.0f * 37.0f /
+                        (2.0f * config.turnEstimatedAngularDecelDegps2) +
+                    config.turnBrakeMarginDeg,
+                1e-4f);
+}
+
+TEST(RouteTurnFieldControl, LowYawRateAndLargeErrorKeepsRotating) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    const RouteExecutorConfig config = fastConfig();
+    enterHeadingReacquireTurn(executor, input, config);
+    advanceBreakawayToRotate(executor, input, config);
+    input.headingDeg = 20.0f;
+    input.yawRateDps = 1.0f;
+    const RouteExecutorOutput output = tick(executor, input);
+    EXPECT_EQ(output.state, ExecutorState::TURN_ROTATE);
+    EXPECT_EQ(output.motion, MotionKind::TURN_IN_PLACE);
+    EXPECT_EQ(output.turnCommandPercent, config.turnFarCommandPercent);
+}
+
+TEST(RouteTurnFieldControl, BrakeCannotCompleteBeforePhysicalStop) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    const RouteExecutorConfig config = fastConfig();
+    enterHeadingReacquireTurn(executor, input, config);
+    advanceBreakawayToRotate(executor, input, config);
+    input.headingDeg = 86.0f;
+    input.yawRateDps = 20.0f;
+    RouteExecutorOutput output = tick(executor, input);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BRAKE);
+    EXPECT_EQ(output.motion, MotionKind::STOP);
+    output = tick(executor, input);
+    EXPECT_EQ(output.state, ExecutorState::WAIT_PHYSICAL_STOP);
+    EXPECT_NE(output.state, ExecutorState::HEADING_STABLE);
+}
+
+TEST(RouteTurnFieldControl, OvershootStartsBoundedReverseBreakawayAfterStop) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    const RouteExecutorConfig config = fastConfig();
+    enterHeadingReacquireTurn(executor, input, config);
+    const RouteExecutorOutput output = stopMainTurnWithFieldOvershoot(
+        executor, input, config);
+    EXPECT_EQ(output.turnDirection, -1);
+    EXPECT_TRUE(output.turnBreakawayActive);
+    EXPECT_EQ(output.turnCorrectionAttempt, 0u);
+    EXPECT_EQ(output.motion, MotionKind::TURN_IN_PLACE);
+    EXPECT_LT(output.angularRadps, 0.0f);
+    EXPECT_EQ(output.turnCommandPercent, config.turnBreakawayPercent);
+}
+
+TEST(RouteTurnFieldControl, FivePercentWithoutYawResponseIsNotSuccess) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    const RouteExecutorConfig config = fastConfig();
+    enterHeadingReacquireTurn(executor, input, config);
+    input.commandLeft = -5;
+    input.commandRight = 5;
+    input.yawRateDps = 0.0f;
+    const RouteExecutorOutput output = tick(executor, input, 4u);
+    EXPECT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
+    EXPECT_EQ(output.turnCommandPercent, config.turnBreakawayPercent);
+    EXPECT_FALSE(output.physicalStopReady);
+}
+
+TEST(RouteTurnFieldControl, SixPercentBreakawayEndsOnSustainedYawResponse) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    const RouteExecutorConfig config = fastConfig();
+    RouteExecutorOutput output = enterHeadingReacquireTurn(
+        executor, input, config);
+    EXPECT_EQ(output.turnCommandPercent, config.turnBreakawayPercent);
+    input.yawRateDps = output.turnDirection *
+                       config.turnBreakawayYawRateThresholdDps;
+    tick(executor, input);
+    output = tick(executor, input,
+                  config.turnBreakawayResponseStableMs + 1u);
+    EXPECT_EQ(output.state, ExecutorState::TURN_ROTATE);
+    EXPECT_FALSE(output.turnBreakawayActive);
+}
+
+TEST(RouteTurnFieldControl, MissingBreakawayResponseHasDedicatedFault) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    RouteExecutorConfig config = fastConfig();
+    config.turnBreakawayMaxMs = 10u;
+    enterHeadingReacquireTurn(executor, input, config);
+    input.yawRateDps = 0.0f;
+    const RouteExecutorOutput output = tick(executor, input, 11u);
+    EXPECT_EQ(output.state, ExecutorState::FAULT);
+    EXPECT_STREQ(output.faultReason, "turn_motor_no_response");
+}
+
+TEST(RouteTurnFieldControl, DirectionCannotReverseBeforePhysicalStop) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    const RouteExecutorConfig config = fastConfig();
+    enterHeadingReacquireTurn(executor, input, config);
+    advanceBreakawayToRotate(executor, input, config);
+    input.headingDeg = 98.9f;
+    input.yawRateDps = 20.0f;
+    RouteExecutorOutput output = tick(executor, input);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BRAKE);
+    EXPECT_EQ(output.motion, MotionKind::STOP);
+    EXPECT_EQ(output.turnDirection, 1);
+    output = tick(executor, input);
+    EXPECT_EQ(output.state, ExecutorState::WAIT_PHYSICAL_STOP);
+    EXPECT_EQ(output.motion, MotionKind::STOP);
+    EXPECT_EQ(output.turnDirection, 1);
+}
+
+TEST(RouteTurnFieldControl, CorrectionCountChangesOnlyAfterEvaluate) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    const RouteExecutorConfig config = fastConfig();
+    enterHeadingReacquireTurn(executor, input, config);
+    RouteExecutorOutput output = stopMainTurnWithFieldOvershoot(
+        executor, input, config);
+    EXPECT_EQ(output.turnCorrectionAttempt, 0u);
+    advanceBreakawayToRotate(executor, input, config);
+    input.headingDeg = 91.0f;
+    input.yawRateDps = -10.0f;
+    output = tick(executor, input);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BRAKE);
+    input.yawRateDps = 0.0f;
+    output = finishPhysicalStop(executor, input, config);
+    EXPECT_EQ(output.turnCorrectionAttempt, 0u);
+    output = tick(executor, input);
+    EXPECT_EQ(output.turnCorrectionAttempt, 1u);
+    EXPECT_EQ(output.state, ExecutorState::HEADING_STABLE);
+}
+
+TEST(RouteTurnFieldControl, CorrectionsAreBoundedAndKeepFailureSnapshots) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    RouteExecutorConfig config = fastConfig();
+    config.turnMaxCorrectionAttempts = 1u;
+    enterHeadingReacquireTurn(executor, input, config);
+    RouteExecutorOutput output = stopMainTurnWithFieldOvershoot(
+        executor, input, config);
+    advanceBreakawayToRotate(executor, input, config);
+    input.headingDeg = 97.5f;
+    input.yawRateDps = -30.0f;
+    output = tick(executor, input);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BRAKE);
+    input.yawRateDps = 0.0f;
+    output = finishPhysicalStop(executor, input, config);
+    ASSERT_EQ(output.state, ExecutorState::TURN_EVALUATE);
+    EXPECT_NEAR(output.turnLastPhysicalStopHeadingDeg, 97.5f, 1e-5f);
+    input.headingDeg = 96.0f;  // EVALUATE must use the latched stop snapshot.
+    output = tick(executor, input);
+    EXPECT_EQ(output.state, ExecutorState::FAULT);
+    EXPECT_STREQ(output.faultReason, "turn_not_converging");
+    EXPECT_EQ(output.turnCorrectionAttempt, 1u);
+    EXPECT_TRUE(std::isfinite(output.turnStartHeadingDeg));
+    EXPECT_TRUE(std::isfinite(output.turnFirstBrakeHeadingDeg));
+    EXPECT_TRUE(std::isfinite(output.turnFirstPhysicalStopHeadingDeg));
+    EXPECT_TRUE(std::isfinite(output.turnLastPhysicalStopHeadingDeg));
+    EXPECT_TRUE(std::isfinite(output.turnFinalErrorDeg));
+    EXPECT_NEAR(output.turnLastPhysicalStopHeadingDeg, 97.5f, 1e-5f);
+    EXPECT_NEAR(output.turnFinalErrorDeg, -7.5f, 1e-5f);
+}
+
+TEST(RouteTurnFieldControl, TurnErrorIsNotOldLineHeadingError) {
+    const RoutePlan plan = cornerPlan();
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput();
+    const RouteExecutorConfig config = fastConfig();
+    startFollowing(executor, plan, config, input);
+    input.position = LocalPoint(1.0f, 0.0f);
+    ASSERT_EQ(tick(executor, input).state, ExecutorState::BRAKE);
+    const RouteExecutorOutput output = finishPhysicalStop(
+        executor, input, config);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
+    EXPECT_NEAR(output.turnTargetDeg, 0.0f, 1e-5f);
+    EXPECT_NEAR(output.turnErrorDeg, -90.0f, 1e-5f);
+    EXPECT_NEAR(output.steeringErrorDeg, 0.0f, 1e-5f);
+    EXPECT_NE(output.turnErrorDeg, output.steeringErrorDeg);
 }
 
 TEST(RouteSteeringWatchdog,
@@ -565,10 +832,9 @@ TEST(RouteRecovery, LargeApproachHeadingChangeStopsAndEvaluatesAttempt) {
     const RouteExecutorConfig config = fastConfig();
     enterAutomaticEndpointRecovery(executor, input, config);
     RouteExecutorOutput output = finishPhysicalStop(executor, input, config);
-    ASSERT_EQ(output.state, ExecutorState::RECOVERY_TURN);
-    input.headingDeg = output.latchedTurnTargetDeg;
-    ASSERT_EQ(tick(executor, input).state, ExecutorState::BRAKE);
-    output = finishPhysicalStop(executor, input, config);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
+    output = brakeTurnAtTarget(executor, input, config,
+                               output.latchedTurnTargetDeg);
     ASSERT_EQ(output.state, ExecutorState::HEADING_STABLE);
     ASSERT_EQ(tick(executor, input).state, ExecutorState::HEADING_STABLE);
     output = tick(executor, input, config.physicalStopStableMs + 1u);
@@ -596,10 +862,9 @@ TEST(RouteRecovery, AttemptLimitSurvivesReentryOnSamePlannedSegment) {
     executor.requestRecovery("test_recovery");
     ASSERT_EQ(tick(executor, input).state, ExecutorState::BRAKE);
     RouteExecutorOutput output = finishPhysicalStop(executor, input, config);
-    ASSERT_EQ(output.state, ExecutorState::RECOVERY_TURN);
-    input.headingDeg = output.latchedTurnTargetDeg;
-    ASSERT_EQ(tick(executor, input).state, ExecutorState::BRAKE);
-    output = finishPhysicalStop(executor, input, config);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
+    output = brakeTurnAtTarget(executor, input, config,
+                               output.latchedTurnTargetDeg);
     ASSERT_EQ(output.state, ExecutorState::HEADING_STABLE);
     ASSERT_EQ(tick(executor, input).state, ExecutorState::HEADING_STABLE);
     output = tick(executor, input, config.physicalStopStableMs + 1u);
@@ -611,11 +876,10 @@ TEST(RouteRecovery, AttemptLimitSurvivesReentryOnSamePlannedSegment) {
     ASSERT_EQ(output.state, ExecutorState::RECOVERY_EVALUATE);
     output = tick(executor, input);
     ASSERT_EQ(output.recoveryAttempt, 1u);
-    ASSERT_EQ(output.state, ExecutorState::RECOVERY_TURN);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
 
-    input.headingDeg = output.latchedTurnTargetDeg;
-    ASSERT_EQ(tick(executor, input).state, ExecutorState::BRAKE);
-    output = finishPhysicalStop(executor, input, config);
+    output = brakeTurnAtTarget(executor, input, config,
+                               output.latchedTurnTargetDeg);
     ASSERT_EQ(output.state, ExecutorState::HEADING_STABLE);
     ASSERT_EQ(tick(executor, input).state, ExecutorState::HEADING_STABLE);
     output = tick(executor, input, config.physicalStopStableMs + 1u);
@@ -633,10 +897,9 @@ TEST(RouteRecovery, FinalRadiusWinsOverBlockedObsoleteRecoveryPath) {
     const RouteExecutorConfig config = fastConfig();
     enterAutomaticEndpointRecovery(executor, input, config);
     RouteExecutorOutput output = finishPhysicalStop(executor, input, config);
-    ASSERT_EQ(output.state, ExecutorState::RECOVERY_TURN);
-    input.headingDeg = output.latchedTurnTargetDeg;
-    ASSERT_EQ(tick(executor, input).state, ExecutorState::BRAKE);
-    output = finishPhysicalStop(executor, input, config);
+    ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
+    output = brakeTurnAtTarget(executor, input, config,
+                               output.latchedTurnTargetDeg);
     ASSERT_EQ(output.state, ExecutorState::HEADING_STABLE);
     ASSERT_EQ(tick(executor, input).state, ExecutorState::HEADING_STABLE);
     output = tick(executor, input, config.physicalStopStableMs + 1u);

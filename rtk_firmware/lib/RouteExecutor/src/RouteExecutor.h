@@ -16,6 +16,12 @@ enum class ExecutorState : uint8_t {
     APPROACH_TRANSITION,
     BRAKE,
     WAIT_PHYSICAL_STOP,
+    TURN_BREAKAWAY,
+    TURN_ROTATE,
+    TURN_BRAKE,
+    TURN_EVALUATE,
+    TURN_CORRECTION_BREAKAWAY,
+    TURN_CORRECTION,
     TURN_TO_NEXT,
     HEADING_STABLE,
     INTERCEPT_NEXT_LINE,
@@ -44,6 +50,18 @@ enum class MotionKind : uint8_t {
     DRIVE,
     TURN_IN_PLACE,
     REVERSE,
+};
+
+enum class TurnPhase : uint8_t {
+    NONE = 0,
+    BREAKAWAY,
+    ROTATE,
+    BRAKE,
+    WAIT_PHYSICAL_STOP,
+    EVALUATE,
+    CORRECTION_BREAKAWAY,
+    CORRECTION,
+    HEADING_STABLE,
 };
 
 enum class RouteTransitionPurpose : uint8_t {
@@ -76,6 +94,22 @@ struct RouteExecutorConfig {
     float turnRateMinRadps;
     float turnSettleYawRateDps;
     uint32_t turnTimeoutMs;
+    float turnEstimatedAngularDecelDegps2;
+    float turnBrakeMarginDeg;
+    float turnPredictedStopMinDeg;
+    float turnPredictedStopMaxDeg;
+    float turnSlowdownEnterDeg;
+    float turnAngularPercentPerRadps;
+    int turnFarCommandPercent;
+    int turnSlowCommandPercent;
+    int turnBreakawayPercent;
+    int turnBreakawayBoostPercent;
+    uint32_t turnBreakawayBoostAfterMs;
+    uint32_t turnBreakawayMaxMs;
+    float turnBreakawayYawRateThresholdDps;
+    uint32_t turnBreakawayResponseStableMs;
+    uint8_t turnMaxCorrectionAttempts;
+    float turnCorrectionMinImprovementDeg;
 
     int physicalStopMotorThreshold;
     float physicalStopYawRateDps;
@@ -198,6 +232,24 @@ struct RouteExecutorOutput {
     float steeringResponseHeadingDeltaDeg;
     uint8_t steeringResponseObservationCount;
     bool steeringResponseWrongDirection;
+    TurnPhase turnPhase;
+    float turnTargetDeg;
+    float turnErrorDeg;
+    int turnDirection;
+    float turnPredictedStopAngleDeg;
+    int turnCommandPercent;
+    uint8_t turnCorrectionAttempt;
+    bool turnBreakawayActive;
+    LocalPoint turnStartPosition;
+    float turnStartHeadingDeg;
+    float turnFirstBrakeHeadingDeg;
+    float turnFirstBrakeYawRateDps;
+    LocalPoint turnFirstPhysicalStopPosition;
+    float turnFirstPhysicalStopHeadingDeg;
+    float turnLastCorrectionStartHeadingDeg;
+    LocalPoint turnLastPhysicalStopPosition;
+    float turnLastPhysicalStopHeadingDeg;
+    float turnFinalErrorDeg;
     bool invariantViolation;
 
     RouteExecutorOutput();
@@ -206,6 +258,7 @@ struct RouteExecutorOutput {
 const char* executorStateName(ExecutorState state);
 const char* executorResultName(ExecutorResult result);
 const char* waypointTypeName(WaypointType type);
+const char* turnPhaseName(TurnPhase phase);
 
 class RouteExecutor {
 public:
@@ -240,7 +293,7 @@ private:
         NONE = 0,
         START_TURN,
         TURN_NEXT,
-        TURN_SETTLE,
+        TURN_EVALUATE,
         START_INTERCEPT,
         FINAL_COMPLETE,
         RECOVERY_REVERSE,
@@ -269,7 +322,14 @@ private:
                    const RouteExecutorInput& input,
                    bool resetCorrections = true);
     void updateTurn(const RouteExecutorInput& input,
-                    ExecutorState turnState);
+                     ExecutorState turnState);
+    void updateTurnBreakaway(const RouteExecutorInput& input);
+    void updateTurnEvaluate(const RouteExecutorInput& input);
+    void beginTurnBrake(const RouteExecutorInput& input);
+    void beginTurnCorrection(const RouteExecutorInput& input, float errorDeg);
+    float predictedTurnStopAngleDeg(const RouteExecutorInput& input,
+                                    float errorDeg) const;
+    float turnAngularForPercent(int percent) const;
     void updateHeadingStable(const RouteExecutorInput& input);
     void beginRecovery(const RouteExecutorInput& input,
                        const char* reason);
@@ -330,10 +390,28 @@ private:
     float turnTargetDeg_;
     bool turnTargetLatched_;
     int turnDirection_;
-    int pendingTurnDirection_;
     uint8_t turnCorrections_;
     float turnStableReferenceDeg_;
     uint32_t turnStartedMs_;
+    uint32_t turnPhaseStartedMs_;
+    uint32_t turnBreakawayResponseSinceMs_;
+    ExecutorState turnContextState_;
+    bool turnCycleIsCorrection_;
+    float turnErrorBeforeCycleDeg_;
+    float turnPredictedStopAngleDeg_;
+    int turnCommandPercent_;
+    LocalPoint turnStartPosition_;
+    float turnStartHeadingDeg_;
+    bool turnFirstBrakeValid_;
+    float turnFirstBrakeHeadingDeg_;
+    float turnFirstBrakeYawRateDps_;
+    bool turnFirstPhysicalStopValid_;
+    LocalPoint turnFirstPhysicalStopPosition_;
+    float turnFirstPhysicalStopHeadingDeg_;
+    float turnLastCorrectionStartHeadingDeg_;
+    LocalPoint turnLastPhysicalStopPosition_;
+    float turnLastPhysicalStopHeadingDeg_;
+    float turnFinalErrorDeg_;
     float scheduledTurnTargetDeg_;
     ExecutorState scheduledTurnState_;
     StableNext scheduledStableNext_;
