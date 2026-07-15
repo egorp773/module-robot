@@ -32,6 +32,8 @@ struct Estimate {
     // GPS course-over-ground fusion диагностика
     bool    gpsCourseUsed = false;    // последний PVT скорректировал курс EKF
     float   gpsCourseAccDeg = 999;    // headAcc последнего PVT, градусы
+    float   gpsCourseWindowDistM = 0;
+    uint32_t gpsCourseWindowMs = 0;
     // quality
     SolType sol = SOL_INVALID;
     int     numSv = 0;
@@ -46,7 +48,8 @@ struct Estimate {
     uint32_t acceptedPositionAgeMs = 0xFFFFFFFFu;
     uint16_t rejectedPositionFixes = 0;
     // filtered position (local x,y) — для nav
-    float   x = 0, y = 0;
+    float   rawAntennaX = 0, rawAntennaY = 0;
+    float   x = 0, y = 0;   // corrected robot control point
     // filtered heading (low-pass, freeze when stationary)
     float   headingFiltDeg = 0;
     uint32_t lastUpdateMs = 0;
@@ -68,7 +71,8 @@ public:
                int32_t gSpeed_mmps, int32_t headMot_deg_e5,
                int fixType, int carrierSol, bool diffSoln,
                int numSv, float pDop,
-               int32_t headAcc_deg_e5 = 18000000);
+               int32_t headAcc_deg_e5 = 18000000,
+               uint32_t pvtIntervalMs = 0);
 
     // apply new RXM-RTCM info (F9P decode side)
     void onRtcmInfo(uint32_t nowMs, int lastType, int msgCount, int crcFail);
@@ -92,6 +96,11 @@ public:
     bool setOrigin(double lat, double lon);
     void clearOrigin() { est.originSet = false; }
     void seedHeadingDeg(float headingDeg, ImuYawSource yawSource = ImuYawSource::NONE);   // абсолютная калибровка курса (CAL_HEADING)
+    void setFieldSafetyMode(bool enabled) { _fieldSafetyMode = enabled; }
+    void setAntennaOffsets(float forwardM, float leftM);
+    void setAntennaCorrectionEnabled(bool enabled);
+    void setGpsCourseMotionContext(bool rotatingInPlace,
+                                   float commandedLinearMps);
 
     const Estimate& get() const { return est; }
 
@@ -119,6 +128,12 @@ private:
     static constexpr float kMaxJumpBaseM     = 0.50f;   // допуск + v*dt
     static constexpr float kMaxJumpVFactor   = 2.0f;
 
+    bool headingMeasurementPlausible(uint32_t nowMs, float candidateDeg,
+                                     const char* source, float yawRateDps,
+                                     float measurementDtSec = -1.0f,
+                                     float gyroExpectedDeg = NAN);
+    void updateControlPoint();
+
     bool     _originLocked = false;
     bool     _headingSeeded = false;
     uint32_t _lastImuMs = 0;
@@ -129,6 +144,20 @@ private:
     uint32_t _lastHeadingMs = 0;
     uint32_t _lastRtcmMs = 0;
     uint32_t _seededAtMs = 0;       // millis() момента seed'а; в первые 3 сек не верим GPS-course
+    bool _fieldSafetyMode = false;
+    float _antennaForwardOffsetM = 0;
+    float _antennaLeftOffsetM = 0;
+    bool _antennaCorrectionEnabled = true;
+    uint32_t _lastHeadingOutputMs = 0;
+    uint32_t _lastHeadingJumpLogMs = 0;
+    bool _courseRotatingInPlace = false;
+    float _courseCommandedLinearMps = 0;
+    bool _courseWindowValid = false;
+    float _courseWindowStartX = 0;
+    float _courseWindowStartY = 0;
+    uint32_t _courseWindowStartMs = 0;
+    uint32_t _courseWindowAccumMs = 0;
+    float _courseGyroAccumDeg = 0;
 
     // EKF
     RtkEkf _ekf;

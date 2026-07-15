@@ -83,6 +83,28 @@
 
 // ---------------- Rover behaviour ----------------
 #define ROVER_WHEELBASE_M   0.38f
+// RTK antenna lever arm relative to the robot control point.
+// +forward is toward the nose, +left is toward the left track.
+// Keep at zero until both distances are measured on the real chassis.
+#define ROVER_ANTENNA_FORWARD_OFFSET_M (-0.04f)
+#define ROVER_ANTENNA_LEFT_OFFSET_M    0.01f
+
+// Conservative body footprint measured from the corrected robot control
+// point.  Keep the tool footprint separate: its forward overhang has not been
+// measured yet, so automatic reverse recovery must remain disabled until all
+// four tool extents are configured explicitly.
+#define ROVER_BODY_FOOTPRINT_FRONT_M 0.275f
+#define ROVER_BODY_FOOTPRINT_REAR_M  0.275f
+#define ROVER_BODY_FOOTPRINT_LEFT_M  0.275f
+#define ROVER_BODY_FOOTPRINT_RIGHT_M 0.275f
+
+#define ROVER_TOOL_FOOTPRINT_CONFIGURED 0
+// Unconfigured placeholders, deliberately not estimates.  They are ignored
+// while ROVER_TOOL_FOOTPRINT_CONFIGURED is zero.
+#define ROVER_TOOL_FOOTPRINT_FRONT_M 0.0f
+#define ROVER_TOOL_FOOTPRINT_REAR_M  0.0f
+#define ROVER_TOOL_FOOTPRINT_LEFT_M  0.0f
+#define ROVER_TOOL_FOOTPRINT_RIGHT_M 0.0f
 // Длина гусеницы по внешнему краю (примерно): 42 + 18 + 42 + 18 = 120 см,
 // но эффективная рабочая длина (без скольжения) грубо ~0.6м. Калибруется
 // по одометрии: на 1 оборот шкива гусеница проходит ~wheel_circumference.
@@ -96,11 +118,13 @@
 // layer. Field testing established that as the normal straight-drive command.
 // Autonomous 0.18 m/s therefore maps to ~9%; the hard 0.25 m/s cap maps to 12%.
 #define ROVER_AUTO_MAX_PERCENT 12
+#define ROVER_AUTO_MIN_EFFECTIVE_LEFT_PERCENT  5
+#define ROVER_AUTO_MIN_EFFECTIVE_RIGHT_PERCENT 5
 #define ROVER_MAX_SPEED_MPS  0.25f
 // FLOAT едет с той же скоростью что и FIXED (на FLOAT hAcc уже ~2см, безопасно) —
 // чтобы автономка ехала одинаково как ручной 16% независимо от RTK-режима.
 #define ROVER_FLOAT_SPEED    0.15f
-#define ROVER_DEGRADED_SPEED 0.04f
+#define ROVER_DEGRADED_SPEED 0.07f
 #define ROVER_HOLD_SPEED     0.02f
 // Hoverboard-keepalive: если idle (нет команд) дольше этого времени —
 // шлём 3% команды на 2 сек чтобы плата не уходила в сон.
@@ -209,6 +233,20 @@
 #define SAFE_IMU_AGE_MS     200
 #define SAFE_NAV_TIMEOUT_MS 8000
 #define SAFE_REJECTED_POSITION_FIXES_MAX 5
+#define FIELD_RECOVERY_STABLE_MS 2000u
+#define FIELD_SKY_BAD_HOLD_MS 3000u
+#define FIELD_PVT_DEGRADED_MS 1000u
+#define FIELD_PVT_HOLD_MS 3000u
+#define FIELD_PVT_ESTOP_MS 6000u
+#define FIELD_HEADING_HOLD_MS 3000u
+#define FIELD_HEADING_ESTOP_MS 5000u
+#define FIELD_POSITION_HOLD_MS 3000u
+#define FIELD_POSITION_ESTOP_MS 6000u
+#define FIELD_HACC_FIXED_M 0.08f
+#define FIELD_HACC_FLOAT_M 0.10f
+#define FIELD_GPS_JUMP_CONSECUTIVE 3u
+#define MOTOR_FEEDBACK_TIMEOUT_MS 500u
+#define MOTOR_BOARD_OVERTEMP_C 90.0f
 // 5 см вместо 2 см: F9P в честном FIXED рутинно репортит hAcc 1.4-2.5 см,
 // и на подвижной платформе кратко прыгает до 3-4 см. Гейт 2 см ронял
 // follower в HOLD (rtk_fixed_hacc) посреди сегмента без реальной потери FIXED.

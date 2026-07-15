@@ -55,6 +55,20 @@ String clearHeadingTrustLine();
 String navStartAutoAlignLine();
 String navStartAutoAlignLineWs();
 String handleNavStartLine();
+String handleNavPauseLine();
+String handleNavResumeLine();
+String queueNavStartLineWs();
+String queueNavPauseLineWs();
+String queueNavResumeLineWs();
+String queueNavStopLineWs();
+String queueStopLineWs();
+void queueWsDisconnectStop();
+String queueGoForwardWs(float distanceM);
+String queueGoNorthWs(float distanceM);
+String queueGoLShapeWs(float firstM, float turnDeg, float secondM,
+                       bool debug);
+String queueGoSquareDebugWs(float sideM);
 String handleStopLine();
+bool routeExecutorActive();
 
 }  // namespace roverdbg

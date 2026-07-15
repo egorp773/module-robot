@@ -1,6 +1,7 @@
 // Motor.cpp - Hoverboard UART driver. Протокол 1:1 из sound/sound.ino (рабочий). MIT.
 
 #include "Motor.h"
+#include "MotorCommandMath.h"
 
 int16_t Motor::clamp16(int32_t v, int16_t lo, int16_t hi) {
     if (v < lo) return lo;
@@ -28,6 +29,10 @@ void Motor::begin(HardwareSerial& serial, float wheelBaseM, uint8_t rxPin, uint8
     _commandGeneration = 0;
     _fbIdx = 0; _fbPrev = 0; _fbP = nullptr;
     _haveFeedback = false;
+    _lastFeedbackMs = 0;
+    _feedbackFault = false;
+    _hardwareFault = false;
+    _commandFault = false;
     _batVoltsFilt = 0.0f;
 }
 
@@ -60,12 +65,14 @@ void Motor::sendHover(int16_t steer, int16_t speed) {
     _serial->write((uint8_t*)&cmd, sizeof(cmd));
 }
 
-// left/right (-70..70%) -> speed/steer (домен платы) — формула из sound.ino drive()
+// Legacy left/right hoverboard virtual channels -> packet axes.  The sign contract and
+// pure/tested mapping live in MotorCommandMath.h; the UART packet itself is
+// unchanged from the proven sound/sound.ino drive() implementation.
 static void pctToHover(int leftPct, int rightPct, int16_t& speedOut, int16_t& steerOut) {
-    int32_t speedT = (int32_t)(leftPct + rightPct) * (int32_t)HOVER_MAX_CMD / (2 * HOVER_MAX_PERCENT);
-    int32_t steerT = (int32_t)(rightPct - leftPct) * (int32_t)HOVER_MAX_CMD / (2 * HOVER_MAX_PERCENT);
-    speedOut = (int16_t)speedT;
-    steerOut = (int16_t)steerT;
+    const motorcmd::HoverAxes axes = motorcmd::hoverChannelsToAxes(
+        leftPct, rightPct, HOVER_MAX_CMD, HOVER_MAX_PERCENT);
+    speedOut = (int16_t)axes.speed;
+    steerOut = (int16_t)axes.steer;
 }
 
 void Motor::setManualPercent(int leftPct, int rightPct) {
@@ -88,20 +95,47 @@ void Motor::setManualPercent(int leftPct, int rightPct) {
 
 void Motor::setLinearAngularSpeed(float linearMps, float angularRadps, bool useRamp) {
     (void)useRamp;  // slew всегда применяется в loop()
-    // On this rover left < right turns the body clockwise. The navigation
-    // heading convention is also clockwise-positive, so positive angularRadps
-    // must command left slower than right.
-    float vL = linearMps - angularRadps * _wheelBase * 0.5f;
-    float vR = linearMps + angularRadps * _wheelBase * 0.5f;
-    if (linearMps > 0.0f && (vL < 0.0f || vR < 0.0f)) {
-        float minWheel = linearMps * 0.15f;
-        if (vL < minWheel) vL = minWheel;
-        if (vR < minWheel) vR = minWheel;
+    if (!isfinite(linearMps) || !isfinite(angularRadps)) {
+        taskENTER_CRITICAL(&_mux);
+        _commandFault = true;
+        _targetSpeed = _targetSteer = 0;
+        _cmdSpeed = _cmdSteer = 0;
+        _curLeftPct = _curRightPct = 0;
+        _commandGeneration++;
+        taskEXIT_CRITICAL(&_mux);
+        return;
     }
-    // м/с -> проценты: ROVER_MAX_SPEED_MPS соответствует HOVER_MAX_PERCENT
-    float scale = (float)ROVER_AUTO_MAX_PERCENT / ROVER_MAX_SPEED_MPS;
-    int leftPct  = (int)roundf(vL * scale);
-    int rightPct = (int)roundf(vR * scale);
+    // Compass-frame command contract is mode-aware because these legacy
+    // hoverboard left/right values are virtual channels, not normalized
+    // physical track velocities.  Positive angular increases heading in both
+    // modes, using the separately field-proven DRIVE and TURN adapters.
+    const float scale =
+        (float)ROVER_AUTO_MAX_PERCENT / ROVER_MAX_SPEED_MPS;
+    const bool translationalDrive = fabsf(linearMps) > 0.001f;
+    const motorcmd::MotionMixMode mixMode = translationalDrive
+        ? motorcmd::MotionMixMode::DRIVE
+        : motorcmd::MotionMixMode::TURN_IN_PLACE;
+    const motorcmd::CommandMix mixed =
+        motorcmd::mixEffectiveCompassCommandPercent(
+            linearMps, angularRadps, _wheelBase, scale,
+            ROVER_AUTO_MIN_EFFECTIVE_LEFT_PERCENT,
+            ROVER_AUTO_MIN_EFFECTIVE_RIGHT_PERCENT,
+            ROVER_AUTO_MAX_PERCENT, mixMode);
+    int leftPct = mixed.effective.left;
+    int rightPct = mixed.effective.right;
+    const uint32_t deadbandNow = millis();
+    if ((leftPct != mixed.requested.left ||
+         rightPct != mixed.requested.right) &&
+        (deadbandNow - _lastDeadbandLogMs) >= 750u) {
+        Serial.printf("[MOTOR_DEADBAND] requestedL=%d requestedR=%d "
+                      "appliedL=%d appliedR=%d measL=%d measR=%d "
+                      "feedbackAge=%u\n",
+                      mixed.requested.left, mixed.requested.right,
+                      leftPct, rightPct,
+                      speedLeftMeas(), speedRightMeas(),
+                      (unsigned)feedbackAgeMs(deadbandNow));
+        _lastDeadbandLogMs = deadbandNow;
+    }
     leftPct  = (int)clamp16(leftPct,  -ROVER_AUTO_MAX_PERCENT, ROVER_AUTO_MAX_PERCENT);
     rightPct = (int)clamp16(rightPct, -ROVER_AUTO_MAX_PERCENT, ROVER_AUTO_MAX_PERCENT);
     int16_t sp, st;
@@ -134,6 +168,21 @@ void Motor::enable(bool en) {
     _enabled = true;
 }
 
+void Motor::clearSafetyFaults() {
+    taskENTER_CRITICAL(&_mux);
+    _feedbackFault = false;
+    _hardwareFault = false;
+    _commandFault = false;
+    taskEXIT_CRITICAL(&_mux);
+}
+
+uint32_t Motor::feedbackAgeMs(uint32_t nowMs) const {
+    const uint32_t last = _lastFeedbackMs;
+    if (last == 0) return 0xFFFFFFFFu;
+    if (nowMs < last) return 0;
+    return nowMs - last;
+}
+
 void Motor::loop(uint32_t nowMs) {
     receiveFeedback();
 
@@ -157,6 +206,20 @@ void Motor::loop(uint32_t nowMs) {
     int16_t  cmdSteer = _cmdSteer;
     uint32_t generation = _commandGeneration;
     taskEXIT_CRITICAL(&_mux);
+
+    const bool nonZeroTarget = tgtSpeed != 0 || tgtSteer != 0 ||
+                               cmdSpeed != 0 || cmdSteer != 0;
+    if (en && nonZeroTarget && feedbackAgeMs(nowMs) > MOTOR_FEEDBACK_TIMEOUT_MS) {
+        // Independent motor-thread failsafe: stop before the main loop has a
+        // chance to evaluate Safety. A fresh valid frame clears this fault.
+        tgtSpeed = 0;
+        tgtSteer = 0;
+        _feedbackFault = true;
+    }
+    if (_hardwareFault || _commandFault) {
+        tgtSpeed = 0;
+        tgtSteer = 0;
+    }
 
     // failsafe: давно не было новой команды -> цель в ноль (плавно через slew)
     if (en && lastSet != 0 && (nowMs - lastSet) > HOVER_CMD_TIMEOUT_MS) {
@@ -204,7 +267,18 @@ void Motor::receiveFeedback() {
             if (_fbNew.start == HOVER_START_FRAME && cs == _fbNew.checksum) {
                 memcpy(&_fb, &_fbNew, sizeof(HoverFeedback));
                 _haveFeedback = true;
+                _lastFeedbackMs = millis();
+                _feedbackFault = false;
                 float v = _fb.batVoltage * HOVER_BAT_VOLT_SCALE;
+                const float tempC = _fb.boardTemp * 0.1f;
+                // The stock feedback protocol has no dedicated fault word.
+                // Invalid power telemetry and board over-temperature are the
+                // hardware-fault signals available on this UART protocol.
+                if (!isfinite(v) || !isfinite(tempC) || v < 15.0f ||
+                    v > 60.0f || tempC < -40.0f ||
+                    tempC >= MOTOR_BOARD_OVERTEMP_C) {
+                    _hardwareFault = true;
+                }
                 if (_batVoltsFilt <= 0.01f) _batVoltsFilt = v;       // первый замер
                 else _batVoltsFilt += 0.25f * (v - _batVoltsFilt);   // low-pass
             }

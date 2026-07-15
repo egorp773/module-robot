@@ -16,6 +16,7 @@ void Gnss::pvtCallback(UBX_NAV_PVT_data_t *pvt) {
 
 void Gnss::capturePvt(const UBX_NAV_PVT_data_t *pvt) {
     if (!pvt) return;
+    taskENTER_CRITICAL(&_pvtMux);
     _latE7   = pvt->lat;
     _lonE7   = pvt->lon;
     _h       = pvt->height;
@@ -37,8 +38,14 @@ void Gnss::capturePvt(const UBX_NAV_PVT_data_t *pvt) {
     _nSv     = pvt->numSV;
     _pDop    = pvt->pDOP * 0.01f;
     _hasFreshPvt = true;
-    _lastPvtMs = millis();
+    const uint32_t now = millis();
+    _lastPvtIntervalMs = _lastPvtMs == 0 ? 0 : now - _lastPvtMs;
+    _lastPvtITowDeltaMs = _lastPvtITow == 0xFFFFFFFFu ? 0
+                                                       : pvt->iTOW - _lastPvtITow;
+    _lastPvtMs = now;
     _lastPvtITow = pvt->iTOW;
+    _pvtCount++;
+    taskEXIT_CRITICAL(&_pvtMux);
 }
 
 bool Gnss::begin(HardwareSerial& serial, GnssRole role) {
@@ -46,8 +53,9 @@ bool Gnss::begin(HardwareSerial& serial, GnssRole role) {
     _role = role;
     // Большой RX-буфер ДО begin(): на 115200 RTCM/PVT приходят пачками,
     // дефолтных 256 байт не хватает при блокировках loop().
-    serial.setRxBufferSize(2048);
+    const bool rxBufferOk = serial.setRxBufferSize(8192);
     serial.begin(F9P_BAUD, SERIAL_8N1, PIN_F9P_RX, PIN_F9P_TX);
+    Serial.printf("[GNSS] UART RX buffer=8192 result=%d\n", rxBufferOk ? 1 : 0);
 
     // === Автодетект бауда + подъём до F9P_RUN_BAUD ===
     // После power-cycle F9P на дефолтных 38400; после soft-reset ESP32 чип
@@ -108,15 +116,24 @@ bool Gnss::begin(HardwareSerial& serial, GnssRole role) {
     }
 
     g_pvtTarget = this;
-    _gnss.setNavigationFrequency(_role == GNSS_ROVER ? 5 : 1);
+    const bool navRateOk = _gnss.setNavigationFrequency(_role == GNSS_ROVER ? 5 : 1);
+    Serial.printf("[GNSS] navigation frequency request=%uHz result=%d\n",
+                  (unsigned)(_role == GNSS_ROVER ? 5 : 1), navRateOk ? 1 : 0);
 
     if (_role == GNSS_ROVER) {
         bool inOk = _gnss.setPortInput(COM_PORT_UART1, COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_RTCM3);
         bool outOk = _gnss.setUART1Output(COM_TYPE_UBX);
         Serial.printf("[GNSS] rover UART1 input UBX/NMEA/RTCM3=%d output UBX=%d\n",
                       inOk ? 1 : 0, outOk ? 1 : 0);
-        _gnss.setAutoPVT(true);
+        const bool autoPvtOk = _gnss.setAutoPVT(true);
+        Serial.printf("[GNSS] NAV-PVT UART1 auto rate=1 result=%d\n",
+                      autoPvtOk ? 1 : 0);
+        // Do not rely on a successful poll-before-set inside the library.
+        // These explicit UBX writes make 200ms NAV solutions and one PVT per
+        // solution deterministic even if the initial CFG-RATE poll timed out.
+        configureRoverPvtRate();
         enableRoverRtcmStatus();
+        startRoverRxTask();
     }
 
     if (_role == GNSS_BASE) {
@@ -144,9 +161,9 @@ bool Gnss::begin(HardwareSerial& serial, GnssRole role) {
 
 void Gnss::loop() {
     if (_role == GNSS_ROVER && _serial) {
-        while (_serial->available()) {
-            parseRoverUbxByte((uint8_t)_serial->read());
-        }
+        // The dedicated reader is the sole UART RX consumer. Keeping RX out
+        // of Arduino loop prevents WiFi / Serial logging stalls from turning
+        // into multi-second pvtAge gaps.
         return;
     }
 
@@ -186,6 +203,7 @@ void Gnss::captureNavPvtPayload(const uint8_t *p, uint16_t len) {
     uint32_t hAcc = rdU32(p + 40);
     if (iTOW == 0 || numSv > 64 || hAcc == 0) return;
 
+    taskENTER_CRITICAL(&_pvtMux);
     _latE7   = rdI32(p + 28);
     _lonE7   = rdI32(p + 24);
     _h       = rdI32(p + 32);
@@ -204,8 +222,14 @@ void Gnss::captureNavPvtPayload(const uint8_t *p, uint16_t len) {
     _nSv     = numSv;
     _pDop    = rdU16(p + 76) * 0.01f;
     _hasFreshPvt = true;
-    _lastPvtMs = millis();
+    const uint32_t now = millis();
+    _lastPvtIntervalMs = _lastPvtMs == 0 ? 0 : now - _lastPvtMs;
+    _lastPvtITowDeltaMs = _lastPvtITow == 0xFFFFFFFFu ? 0
+                                                       : iTOW - _lastPvtITow;
+    _lastPvtMs = now;
     _lastPvtITow = iTOW;
+    _pvtCount++;
+    taskEXIT_CRITICAL(&_pvtMux);
 }
 
 void Gnss::captureRxmRtcmPayload(const uint8_t *p, uint16_t len) {
@@ -241,7 +265,18 @@ void Gnss::parseRoverUbxByte(uint8_t b) {
             _ubxLen = b; ck(b); _ubxState = UBX_LEN2; break;
         case UBX_LEN2:
             _ubxLen |= ((uint16_t)b << 8); ck(b); _ubxIdx = 0;
-            _ubxState = (_ubxLen <= sizeof(_ubxPayload)) ? UBX_PAYLOAD : UBX_SYNC1;
+            if (_ubxLen == 0) {
+                _ubxState = UBX_CKA;
+            } else if (_ubxLen <= sizeof(_ubxPayload)) {
+                _ubxState = UBX_PAYLOAD;
+            } else {
+                // Consume the complete payload and checksum. Scanning an
+                // oversized payload for sync bytes caused false framing and
+                // could hide several following NAV-PVT messages.
+                _ubxSkipRemaining = _ubxLen + 2u;
+                _ubxOversizePackets++;
+                _ubxState = UBX_SKIP;
+            }
             break;
         case UBX_PAYLOAD:
             _ubxPayload[_ubxIdx++] = b; ck(b);
@@ -249,7 +284,7 @@ void Gnss::parseRoverUbxByte(uint8_t b) {
             break;
         case UBX_CKA:
             if (b == _ubxCkA) _ubxState = UBX_CKB;
-            else _ubxState = UBX_SYNC1;
+            else { _ubxChecksumFailures++; _ubxState = UBX_SYNC1; }
             break;
         case UBX_CKB:
             if (b == _ubxCkB) {
@@ -258,8 +293,12 @@ void Gnss::parseRoverUbxByte(uint8_t b) {
                 } else if (_ubxClass == 0x02 && _ubxId == 0x32) {
                     captureRxmRtcmPayload(_ubxPayload, _ubxLen);
                 }
-            }
+            } else _ubxChecksumFailures++;
             _ubxState = UBX_SYNC1;
+            break;
+        case UBX_SKIP:
+            if (_ubxSkipRemaining > 0) _ubxSkipRemaining--;
+            if (_ubxSkipRemaining == 0) _ubxState = UBX_SYNC1;
             break;
     }
 }
@@ -285,9 +324,26 @@ void Gnss::setRtcmInput(bool enable) { (void)enable; }
 void Gnss::pollRxmRtcm() {}
 
 uint32_t Gnss::pvtAgeMs(uint32_t nowMs) const {
-    if (_lastPvtMs == 0) return 0xFFFFFFFFu;
-    if (nowMs < _lastPvtMs) return 0;
-    return nowMs - _lastPvtMs;
+    const uint32_t last = _lastPvtMs;
+    if (last == 0) return 0xFFFFFFFFu;
+    if (nowMs < last) return 0;
+    return nowMs - last;
+}
+
+bool Gnss::consumeFreshPvt(GnssPvtData& out) {
+    bool fresh = false;
+    taskENTER_CRITICAL(&_pvtMux);
+    fresh = _hasFreshPvt;
+    if (fresh) {
+        out.latE7 = _latE7; out.lonE7 = _lonE7; out.heightMm = _h;
+        out.hAccMm = _hAcc; out.vAccMm = _vAcc; out.gSpeedMmps = _gSp;
+        out.headMotDegE5 = _headMot; out.headAccDegE5 = _headAcc;
+        out.fixType = _fix; out.carrierSol = _carSol; out.diffSoln = _diff;
+        out.numSv = _nSv; out.pDop = _pDop;
+        _hasFreshPvt = false;
+    }
+    taskEXIT_CRITICAL(&_pvtMux);
+    return fresh;
 }
 
 void Gnss::sendUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
@@ -327,4 +383,44 @@ void Gnss::enableRoverRtcmStatus() {
     };
     sendUbx(0x06, 0x01, payload, sizeof(payload));
     Serial.println("[GNSS] rover UBX-RXM-RTCM status enabled on UART1");
+}
+
+void Gnss::configureRoverPvtRate() {
+    // UBX-CFG-RATE: measRate=200ms, navRate=1, timeRef=GPS.
+    const uint8_t rate[] = { 0xC8, 0x00, 0x01, 0x00, 0x01, 0x00 };
+    sendUbx(0x06, 0x08, rate, sizeof(rate));
+    // UBX-CFG-MSG: NAV-PVT rate 1 on UART1.
+    const uint8_t pvt[] = { 0x01, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    sendUbx(0x06, 0x01, pvt, sizeof(pvt));
+    Serial.println("[GNSS] explicit NAV-PVT configuration: 5Hz, UART1 rate=1");
+}
+
+void Gnss::roverRxTaskTrampoline(void* arg) {
+    Gnss* self = static_cast<Gnss*>(arg);
+    for (;;) {
+        bool readAny = false;
+        while (self->_serial && self->_serial->available()) {
+            const int v = self->_serial->read();
+            if (v < 0) break;
+            self->_uartRxBytes++;
+            self->parseRoverUbxByte((uint8_t)v);
+            readAny = true;
+        }
+        if (!readAny) vTaskDelay(pdMS_TO_TICKS(1));
+        else taskYIELD();
+    }
+}
+
+void Gnss::startRoverRxTask() {
+    if (_role != GNSS_ROVER || !_serial || _rxTaskRunning) return;
+    _rxTaskRunning = true;
+    const BaseType_t ok = xTaskCreatePinnedToCore(
+        roverRxTaskTrampoline, "gnssRx", 4096, this, 2, &_rxTask, 0);
+    if (ok != pdPASS) {
+        _rxTaskRunning = false;
+        _rxTask = nullptr;
+        Serial.println("[GNSS] ERROR: failed to start dedicated UART RX task");
+    } else {
+        Serial.println("[GNSS] dedicated UART RX task started on core0");
+    }
 }

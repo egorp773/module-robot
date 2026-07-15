@@ -53,11 +53,11 @@ class _SafetyGeometry {
 }
 
 class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
-  static const double _draftLineStepMeters = 0.35;
   static const int _maxRouteWaypoints = 254;
   static const int _maxBoundaryPoints = _maxRouteWaypoints;
   static const int _maxForbiddenPolygons = 16;
   static const int _maxForbiddenPoints = _maxRouteWaypoints;
+  static const int _maxForbiddenTotalPoints = 512;
   static const double _maxStartOutsideBoundaryMeters = 0.0;
 
   // === Гейты для Start по сохранённой карте (см. требование "Preflight")
@@ -75,6 +75,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   String? _error;
   List<Offset> _route = []; // Построенный маршрут
   double _routeDistanceM = 0.0;
+  double _draftLineStepMeters = CleaningRoutePlanner.defaultLineStepMeters;
   double _routeRunTimeS = 0.0;
   bool _routeSent = false;
   bool _routeSending = false;
@@ -83,9 +84,30 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
   String? _routeWorkflowError;
   NavRunTracker? _navRunTracker;
 
-    // Состояние для управления картой
+  // Состояние для управления картой
   double _zoom = 1.0;
   Offset _pan = Offset.zero;
+
+  void _setDraftLineStep(double value) {
+    final next = value
+        .clamp(
+          CleaningRoutePlanner.minRecommendedLineStepMeters,
+          CleaningRoutePlanner.maxRecommendedLineStepMeters,
+        )
+        .toDouble();
+    if ((next - _draftLineStepMeters).abs() < 0.0001) return;
+    setState(() {
+      _draftLineStepMeters = next;
+      // The displayed/uploadable route was built with the previous spacing.
+      // Invalidate it so the operator cannot accidentally send stale geometry.
+      _route = [];
+      _routeDistanceM = 0.0;
+      _routeRunTimeS = 0.0;
+      _routeSent = false;
+      _routeSendProgress = 0;
+      _routeWorkflowError = 'Lane spacing changed: rebuild the route.';
+    });
+  }
 
   @override
   void initState() {
@@ -292,6 +314,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       lineStep: _draftLineStepMeters,
       borderPasses: 1,
       startOverride: currentStart,
+      includeRecordedPerimeterPass: false,
       maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
       debugPrint: true,
     );
@@ -300,7 +323,8 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       lineStep: math.max(_draftLineStepMeters, 0.50),
       borderPasses: 1,
       startOverride: currentStart,
-      boundaryMarginMeters: 0.05,
+      boundaryMarginMeters: CleaningRoutePlanner.defaultBoundaryMarginMeters,
+      includeRecordedPerimeterPass: false,
       maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
       debugPrint: true,
     );
@@ -431,8 +455,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         );
         return;
       }
-      if (_route.isNotEmpty &&
-          (currentStart - _route.first).distance > 0.50) {
+      if (_route.isNotEmpty && (currentStart - _route.first).distance > 0.50) {
         const msg =
             'Robot moved more than 0.50 m after route build. Rebuild the route before upload.';
         setState(() => _routeWorkflowError = msg);
@@ -478,8 +501,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           if (mounted) {
             setState(() {
               _routeSendProgress = done;
-              _routeWorkflowError =
-                  'Sending route: $_routeSendProgress/$total';
+              _routeWorkflowError = 'Sending route: $_routeSendProgress/$total';
             });
           }
         },
@@ -493,8 +515,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       _showNotice(
         ref,
         title: 'Route sent',
-        message:
-            'Robot received ${_route.length} waypoints, '
+        message: 'Robot received ${_route.length} waypoints, '
             '${safety.boundary.length} boundary points, '
             '${safety.forbidden.length} forbidden polygons.',
         kind: NoticeKind.info,
@@ -554,7 +575,8 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     if (preflightReason != null) {
       setState(() => _routeWorkflowError = preflightReason);
       _showNotice(ref,
-          title: 'Start blocked', message: preflightReason,
+          title: 'Start blocked',
+          message: preflightReason,
           kind: NoticeKind.danger);
       return;
     }
@@ -606,32 +628,35 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
           wifi1.gpsCarrier?.toLowerCase() != 'fixed' ||
           (wifi1.gpsAccuracy ?? 9999) > _startMaxHAccMm ||
           (wifi1.gpsAgeMs ?? 9999) > _startMaxPvtAgeMs) {
-        throw StateError(
-            'После auto-align потеряли RTK FIX: '
+        throw StateError('После auto-align потеряли RTK FIX: '
             'lat=${wifi1.gpsLat} lon=${wifi1.gpsLon} '
             'rtk=${wifi1.gpsCarrier} hAcc=${wifi1.gpsAccuracy} '
             'pvtAge=${wifi1.gpsAgeMs}');
       }
 
       // === 5. Перестраиваем маршрут с актуальным стартом
-      final geom = GpsDisplayGeometry(
-          originLat: map.refLat!, originLon: map.refLon!);
+      final geom =
+          GpsDisplayGeometry(originLat: map.refLat!, originLon: map.refLon!);
       final robotLocal = geom.toLocal(wifi1.gpsLat!, wifi1.gpsLon!);
       final startOverride = Offset(robotLocal.x, robotLocal.y);
-      final cleaningRoute =
-          CleaningRoutePlanner.planRoute(map, lineStep: _draftLineStepMeters,
-              borderPasses: 1, startOverride: startOverride,
+      final cleaningRoute = CleaningRoutePlanner.planRoute(map,
+              lineStep: _draftLineStepMeters,
+              borderPasses: 1,
+              startOverride: startOverride,
+              includeRecordedPerimeterPass: false,
               maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
               debugPrint: true) ??
-              CleaningRoutePlanner.planRoute(map,
-                  lineStep: math.max(_draftLineStepMeters, 0.50),
-                  borderPasses: 1, startOverride: startOverride,
-                  boundaryMarginMeters: 0.05,
-                  maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
-                  debugPrint: true);
+          CleaningRoutePlanner.planRoute(map,
+              lineStep: math.max(_draftLineStepMeters, 0.50),
+              borderPasses: 1,
+              startOverride: startOverride,
+              boundaryMarginMeters:
+                  CleaningRoutePlanner.defaultBoundaryMarginMeters,
+              includeRecordedPerimeterPass: false,
+              maxStartDistanceMeters: _maxStartOutsideBoundaryMeters,
+              debugPrint: true);
       if (cleaningRoute == null || cleaningRoute.path.isEmpty) {
-        throw StateError(
-            'Не удалось построить маршрут после auto-align. '
+        throw StateError('Не удалось построить маршрут после auto-align. '
             'Проверьте, что новая позиция робота внутри рабочей зоны.');
       }
       if (cleaningRoute.path.length > _maxRouteWaypoints) {
@@ -648,8 +673,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         _routeRunTimeS = _estimatedRunTimeSeconds(cleaningRoute.totalDistance);
         _routeSent = false;
         _routeSendProgress = 0;
-        _routeWorkflowError =
-            'Uploading route: 0/${freshRoute.length}';
+        _routeWorkflowError = 'Uploading route: 0/${freshRoute.length}';
       });
 
       // Boundary + forbidden — обязательная часть firmware safety
@@ -700,9 +724,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
 
       await ctrl.sendForbiddenBeginAck(
         safety.forbidden.length,
-        safety.forbidden
-            .map((poly) => poly.length)
-            .toList(growable: false),
+        safety.forbidden.map((poly) => poly.length).toList(growable: false),
       );
       for (var polyIdx = 0; polyIdx < safety.forbidden.length; polyIdx++) {
         final poly = safety.forbidden[polyIdx];
@@ -717,8 +739,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       if (!mounted) return;
       setState(() {
         _routeSent = true;
-        _routeWorkflowError =
-            'Route uploaded OK (${freshRoute.length} wp, '
+        _routeWorkflowError = 'Route uploaded OK (${freshRoute.length} wp, '
             'boundary=${safety.boundary.length}, '
             'forbidden=${safety.forbidden.length}). Starting nav…';
       });
@@ -809,24 +830,22 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         .where((points) => points.length >= 3)
         .toList(growable: false);
     if (boundaryPolygons.length != 1) {
-      const msg =
-          'Route upload blocked: firmware safety requires exactly one '
+      const msg = 'Route upload blocked: firmware safety requires exactly one '
           'green boundary zone.';
       _routeWorkflowError = msg;
       _showNotice(ref,
-          title: 'Boundary zone required', message: msg,
+          title: 'Boundary zone required',
+          message: msg,
           kind: NoticeKind.danger);
       return null;
     }
     final boundary = boundaryPolygons.single;
     if (boundary.length > _maxBoundaryPoints) {
-      final msg =
-          'Boundary zone is too complex for firmware safety: '
+      final msg = 'Boundary zone is too complex for firmware safety: '
           'max $_maxBoundaryPoints points.';
       _routeWorkflowError = msg;
       _showNotice(ref,
-          title: 'Boundary too complex', message: msg,
-          kind: NoticeKind.danger);
+          title: 'Boundary too complex', message: msg, kind: NoticeKind.danger);
       return null;
     }
 
@@ -834,14 +853,20 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         .map((poly) => _normalizedPolygon(poly.points))
         .where((points) => points.length >= 3)
         .toList(growable: false);
+    final forbiddenPointTotal = forbidden.fold<int>(
+      0,
+      (sum, polygon) => sum + polygon.length,
+    );
     if (forbidden.length > _maxForbiddenPolygons ||
-        forbidden.any((p) => p.length > _maxForbiddenPoints)) {
-      final msg =
-          'Forbidden zones exceed firmware limits: max '
-          '$_maxForbiddenPolygons zones, $_maxForbiddenPoints points each.';
+        forbidden.any((p) => p.length > _maxForbiddenPoints) ||
+        forbiddenPointTotal > _maxForbiddenTotalPoints) {
+      final msg = 'Forbidden zones exceed firmware limits: max '
+          '$_maxForbiddenPolygons zones, $_maxForbiddenPoints points each, '
+          '$_maxForbiddenTotalPoints points total.';
       _routeWorkflowError = msg;
       _showNotice(ref,
-          title: 'Forbidden zones too complex', message: msg,
+          title: 'Forbidden zones too complex',
+          message: msg,
           kind: NoticeKind.danger);
       return null;
     }
@@ -901,12 +926,11 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
-        title: const Text(
-            'Робот сейчас сам проедет вперёд примерно 1.5–2 м '
+        title: const Text('Робот сейчас сам проедет вперёд примерно 1.5–2 м '
             'для определения курса.'),
-        content: const Text(
-            'Убедись, что перед роботом нет людей, животных, стен, '
-            'машин, ям и препятствий.'),
+        content:
+            const Text('Убедись, что перед роботом нет людей, животных, стен, '
+                'машин, ям и препятствий.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
@@ -938,12 +962,10 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         }
         final okTrusted = hs.trusted;
         final okAlignState = hs.alignState == HeadingAlignState.ok;
-        final headingAgeOk = (hs.headingAgeMs ?? 999999) <=
-            _alignMaxHeadingAgeMs;
-        final distOk = (hs.lastAlignDist ?? 0.0) >=
-            _alignMinLastAlignDistM;
-        final hAccOk = (hs.lastAlignHAcc ?? 999.0) <=
-            _alignMaxLastAlignHAccM;
+        final headingAgeOk =
+            (hs.headingAgeMs ?? 999999) <= _alignMaxHeadingAgeMs;
+        final distOk = (hs.lastAlignDist ?? 0.0) >= _alignMinLastAlignDistM;
+        final hAccOk = (hs.lastAlignHAcc ?? 999.0) <= _alignMaxLastAlignHAccM;
         if (okTrusted &&
             okAlignState &&
             headingAgeOk &&
@@ -959,8 +981,7 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       }
       await Future<void>.delayed(_alignPollInterval);
     }
-    throw StateError(
-        'Auto-align: таймаут ${_alignTotalTimeout.inSeconds}с — '
+    throw StateError('Auto-align: таймаут ${_alignTotalTimeout.inSeconds}с — '
         'headingTrusted=1 с нужными гейтами не получен');
   }
 
@@ -1031,8 +1052,9 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
       return;
     }
     // Сразу отдаём отзыв пользователю — "STOP sent" (требование шаг 12).
-    ref.read(wifiConnectionProvider.notifier).addLocalLog(
-        'WORKFLOW [stop] STOP sent (raw, non-blocking)');
+    ref
+        .read(wifiConnectionProvider.notifier)
+        .addLocalLog('WORKFLOW [stop] STOP sent (raw, non-blocking)');
     // Fire-and-forget, чтобы не блокировать UI:
     ref.read(wifiConnectionProvider.notifier).sendRaw('STOP');
     setState(() {
@@ -1074,8 +1096,8 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
     _navRunTracker = null;
 
     final summary = tracker.finish();
-    final summaryText = summary?.shortText ??
-        'Недостаточно точек для уверенного разбора.';
+    final summaryText =
+        summary?.shortText ?? 'Недостаточно точек для уверенного разбора.';
 
     ref.read(wifiConnectionProvider.notifier).addLocalLog(
           'RUN_SUMMARY end=$endReason $summaryText',
@@ -1166,7 +1188,9 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
         });
       }
       _navRunTracker?.observe(next);
-      if (_navRunTracker != null && (previous?.isConnected ?? false) && !next.isConnected) {
+      if (_navRunTracker != null &&
+          (previous?.isConnected ?? false) &&
+          !next.isConnected) {
         _finalizeRunFeedback(ref, endReason: 'DISCONNECT');
       }
       if (_navRunTracker != null &&
@@ -1352,15 +1376,32 @@ class _AutoMapScreenState extends ConsumerState<AutoMapScreen> {
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          _ActionButton(
-                            icon: Icons.route_rounded,
-                            label: 'Build route',
-                            onTap: () {
-                              if (_mapState != null) {
-                                _buildRoute(context, ref);
-                              }
-                            },
-                            isPrimary: true,
+                          Row(
+                            children: [
+                              Expanded(
+                                child: _LaneSpacingControl(
+                                  valueM: _draftLineStepMeters,
+                                  minM: CleaningRoutePlanner
+                                      .minRecommendedLineStepMeters,
+                                  maxM: CleaningRoutePlanner
+                                      .maxRecommendedLineStepMeters,
+                                  onChanged: _setDraftLineStep,
+                                ),
+                              ),
+                              SizedBox(width: gap),
+                              Expanded(
+                                child: _ActionButton(
+                                  icon: Icons.route_rounded,
+                                  label: 'Build route',
+                                  onTap: () {
+                                    if (_mapState != null) {
+                                      _buildRoute(context, ref);
+                                    }
+                                  },
+                                  isPrimary: true,
+                                ),
+                              ),
+                            ],
                           ),
                           SizedBox(height: gap),
                           _AutoWorkflowPanel(
@@ -1892,6 +1933,90 @@ class _WorkflowButton extends StatelessWidget {
 /// ============================================================================
 /// Кнопка действия (Настройки / Построить маршрут)
 /// ============================================================================
+class _LaneSpacingControl extends StatelessWidget {
+  final double valueM;
+  final double minM;
+  final double maxM;
+  final ValueChanged<double> onChanged;
+
+  const _LaneSpacingControl({
+    required this.valueM,
+    required this.minM,
+    required this.maxM,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    Widget stepButton(IconData icon, double nextValue, bool enabled) {
+      return InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: enabled ? () => onChanged(nextValue) : null,
+        child: SizedBox(
+          width: 34,
+          height: 42,
+          child: Icon(
+            icon,
+            size: 18,
+            color: Colors.white.withValues(alpha: enabled ? 0.92 : 0.28),
+          ),
+        ),
+      );
+    }
+
+    const stepM = 0.01;
+    return Container(
+      height: 54,
+      padding: const EdgeInsets.symmetric(horizontal: 5),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          stepButton(
+            Icons.remove_rounded,
+            valueM - stepM,
+            valueM > minM + 0.0001,
+          ),
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  '${valueM.toStringAsFixed(2)} m',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                Text(
+                  'Lane spacing',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.62),
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          stepButton(
+            Icons.add_rounded,
+            valueM + stepM,
+            valueM < maxM - 0.0001,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _ActionButton extends StatelessWidget {
   final IconData icon;
   final String label;

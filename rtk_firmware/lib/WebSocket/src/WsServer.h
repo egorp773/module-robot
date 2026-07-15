@@ -46,6 +46,9 @@ public:
     // иначе условие в loop() "if (g_ws.navRequested() && g_route.isRunning())"
     // не сработает и моторы не получат команду.
     void setNavRequested(bool v) { _navRequested = v; }
+    void setSerialMotionActive(bool active) {
+        _serialMotionActive = active;
+    }
     // Включает/выключает периодическую телеметрию (TEL/GPS/NAV/IMU/MOTOR).
     // По умолчанию OFF — чтобы терминал не летал при ручной отладке.
     // LOG,1 — on, LOG,0 — off.
@@ -87,6 +90,7 @@ private:
     uint32_t _lastNavMs = 0;
     uint32_t _lastPingMs = 0;
     volatile bool _navRequested = false;
+    volatile bool _serialMotionActive = false;
     volatile bool _telemetryEnabled = false;
     NavStateOut _lastNav{};
 

@@ -26,6 +26,19 @@ void StateEstimator::begin() {
     _lastSpeedLMps = 0;
     _lastSpeedRMps = 0;
     _lastYawRateRadps = 0;
+    _fieldSafetyMode = false;
+    _antennaForwardOffsetM = ROVER_ANTENNA_FORWARD_OFFSET_M;
+    _antennaLeftOffsetM = ROVER_ANTENNA_LEFT_OFFSET_M;
+    _antennaCorrectionEnabled = true;
+    _lastHeadingOutputMs = 0;
+    _lastHeadingJumpLogMs = 0;
+    _courseRotatingInPlace = false;
+    _courseCommandedLinearMps = 0;
+    _courseWindowValid = false;
+    _courseWindowStartX = _courseWindowStartY = 0;
+    _courseWindowStartMs = 0;
+    _courseWindowAccumMs = 0;
+    _courseGyroAccumDeg = 0;
 }
 
 float StateEstimator::normalizeDeg360(float d) {
@@ -33,6 +46,67 @@ float StateEstimator::normalizeDeg360(float d) {
 }
 float StateEstimator::wrapDeg180(float d) {
     return NavMath::wrapDeg180(d);
+}
+
+void StateEstimator::setAntennaOffsets(float forwardM, float leftM) {
+    _antennaForwardOffsetM = isfinite(forwardM) ? forwardM : 0.0f;
+    _antennaLeftOffsetM = isfinite(leftM) ? leftM : 0.0f;
+    updateControlPoint();
+}
+
+void StateEstimator::setAntennaCorrectionEnabled(bool enabled) {
+    if (_antennaCorrectionEnabled == enabled) return;
+    _antennaCorrectionEnabled = enabled;
+    updateControlPoint();
+}
+
+void StateEstimator::setGpsCourseMotionContext(bool rotatingInPlace,
+                                                float commandedLinearMps) {
+    _courseRotatingInPlace = rotatingInPlace;
+    _courseCommandedLinearMps = isfinite(commandedLinearMps)
+        ? commandedLinearMps : 0.0f;
+}
+
+void StateEstimator::updateControlPoint() {
+    if (!_antennaCorrectionEnabled || !_headingSeeded ||
+        (_antennaForwardOffsetM == 0.0f && _antennaLeftOffsetM == 0.0f)) {
+        est.x = est.rawAntennaX;
+        est.y = est.rawAntennaY;
+        return;
+    }
+    const float h = est.headingFiltDeg * 0.0174532925f;
+    est.x = est.rawAntennaX - _antennaForwardOffsetM * sinf(h)
+            + _antennaLeftOffsetM * cosf(h);
+    est.y = est.rawAntennaY - _antennaForwardOffsetM * cosf(h)
+            - _antennaLeftOffsetM * sinf(h);
+}
+
+bool StateEstimator::headingMeasurementPlausible(uint32_t nowMs,
+                                                  float candidateDeg,
+                                                  const char* source,
+                                                  float yawRateDps,
+                                                  float measurementDtSec,
+                                                  float gyroExpectedDeg) {
+    if (!_headingSeeded || _lastHeadingOutputMs == 0) return true;
+    const float dt = measurementDtSec >= 0.0f
+        ? measurementDtSec
+        : min((nowMs - _lastHeadingOutputMs) * 0.001f, 0.5f);
+    const float oldDeg = ImuMath::normalizeDeg360(_ekf.heading() * 57.2957795f);
+    const float delta = ImuMath::wrapDeg180(candidateDeg - oldDeg);
+    const float gyroExpected = isfinite(gyroExpectedDeg)
+        ? gyroExpectedDeg : yawRateDps * dt;
+    const float allowed = 8.0f + min(8.0f, fabsf(gyroExpected) * 1.5f);
+    if (fabsf(delta) <= allowed) return true;
+    if (_lastHeadingJumpLogMs == 0 ||
+        (nowMs - _lastHeadingJumpLogMs) >= 500u) {
+        Serial.printf("[HEADING_JUMP_REJECT] old=%.1f candidate=%.1f delta=%+.1f "
+                      "gyroExpected=%+.1f dt=%.3f source=%s\n",
+                      (double)oldDeg, (double)candidateDeg, (double)delta,
+                      (double)gyroExpected, (double)dt,
+                      source ? source : "unknown");
+        _lastHeadingJumpLogMs = nowMs;
+    }
+    return false;
 }
 
 void StateEstimator::llaToLocalMeters(double lat, double lon,
@@ -52,14 +126,15 @@ bool StateEstimator::setOrigin(double lat, double lon) {
     if (est.lat != 0.0 || est.lon != 0.0) {
         llaToLocalMeters(est.lat, est.lon, est.originLat, est.originLon, newX, newY);
     }
-    est.x = newX;
-    est.y = newY;
+    est.rawAntennaX = newX;
+    est.rawAntennaY = newY;
     // Сброс EKF в новую систему координат. Heading — из последнего засеянного
     // headingFiltDeg (в радианах). headingFiltDeg в [0, 360], поэтому ВСЕГДА конвертим
     // (раньше был баг: при heading=0 (North) условие `> 0` ложно → hRad=0 → EKF
     // считал что heading=0 (East по нашей формуле atan2).
     float hRad = est.headingFiltDeg * 0.01745329f;
     _ekf.reset(newX, newY, hRad);
+    updateControlPoint();
     return true;
 }
 
@@ -84,7 +159,9 @@ void StateEstimator::seedHeadingDeg(float headingDeg, ImuYawSource yawSource) {
     // КРИТИЧНО: посеять сам EKF, иначе любой onPvt перезапишет headingFiltDeg из EKF (=0),
     // а потом setOrigin сбросит EKF в hRad=0. Должно быть _ekf.reset с hRad от seed'а.
     float hRad = h * 0.01745329f;
-    _ekf.reset(est.x, est.y, hRad);
+    _ekf.reset(est.rawAntennaX, est.rawAntennaY, hRad);
+    _lastHeadingOutputMs = nowMs;
+    updateControlPoint();
 }
 
 // --- IMU: gyro rate (deg/s → rad/s) подаётся в EKF.predict() для heading ---
@@ -109,6 +186,8 @@ void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh,
     }
 
     if (dt > 0.0f) {
+        if (_courseWindowValid)
+            _courseGyroAccumDeg += yawRateDps * dt;
         // Скорости берём последние измеренные (или 0, если ещё не было feedback).
         float v_mps = 0.5f * (_lastSpeedLMps + _lastSpeedRMps);
         float omega_radps = (_lastSpeedRMps - _lastSpeedLMps) / max(ROVER_WHEELBASE_M, 0.01f);
@@ -125,7 +204,10 @@ void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh,
     est.yawIsAbsolute = yawIsAbsolute;
 
     bool headingUsed = false;
-    if (_headingSeeded && est.absYawValid) {
+    if (_headingSeeded && est.absYawValid &&
+        headingMeasurementPlausible(nowMs, est.absYawDeg,
+                                    ImuMath::yawSourceName(yawSource),
+                                    yawRateDps)) {
         float yawRad = est.absYawDeg * 0.01745329f;
         float covRad2 = absYawAccRad * absYawAccRad;
         if (covRad2 < 0.0004f) covRad2 = 0.0004f;  // ~1.1 deg minimum
@@ -141,6 +223,8 @@ void StateEstimator::onImu(uint32_t nowMs, float yawRateDps, bool imuFresh,
         est.headingValid = true;
         est.headingAgeMs = 0;
         _lastHeadingMs = nowMs;
+        _lastHeadingOutputMs = nowMs;
+        updateControlPoint();
     }
 }
 
@@ -150,7 +234,8 @@ void StateEstimator::onPvt(uint32_t nowMs,
                             int32_t gSpeed_mmps, int32_t headMot_deg_e5,
                             int fixType, int carrierSol, bool diffSoln,
                             int numSv, float pDop,
-                            int32_t headAcc_deg_e5) {
+                            int32_t headAcc_deg_e5,
+                            uint32_t pvtIntervalMs) {
     double newLat = (double)lat_e7 * 1e-7;
     double newLon = (double)lon_e7 * 1e-7;
 
@@ -171,10 +256,14 @@ void StateEstimator::onPvt(uint32_t nowMs,
     else                      est.sol = SOL_INVALID;
 
     // --- outlier rejection: отбрасываем неправдоподобный скачок позиции ---
+    const float fixedLimit = _fieldSafetyMode ? FIELD_HACC_FIXED_M
+                                              : SAFE_HACC_FIXED_M;
+    const float floatLimit = _fieldSafetyMode ? FIELD_HACC_FLOAT_M
+                                              : SAFE_HACC_FLOAT_M;
     bool reliablePosition =
         fixType >= 3 &&
-        ((est.sol == SOL_FIXED && est.hAcc <= SAFE_HACC_FIXED_M) ||
-         (est.sol == SOL_FLOAT && est.hAcc <= SAFE_HACC_FLOAT_M));
+        ((est.sol == SOL_FIXED && est.hAcc <= fixedLimit) ||
+         (est.sol == SOL_FLOAT && est.hAcc <= floatLimit));
     bool accept = reliablePosition;
     if (reliablePosition && _haveLastFix && est.originSet) {
         float px, py, nx, ny;
@@ -208,13 +297,14 @@ void StateEstimator::onPvt(uint32_t nowMs,
             // Если EKF отбросил fix (Mahalanobis), НЕ обновляем est.x/est.y, но и не
             // инкрементируем rejectedPositionFixes — это сделает сам EKF в P-ковариации.
             if (updated) {
-                est.x = _ekf.x();
-                est.y = _ekf.y();
+                est.rawAntennaX = _ekf.x();
+                est.rawAntennaY = _ekf.y();
             } else {
-                est.x = _ekf.x();   // EKF оставил prediction, мы тоже остаёмся на нём
-                est.y = _ekf.y();
+                est.rawAntennaX = _ekf.x();
+                est.rawAntennaY = _ekf.y();
                 if (est.rejectedPositionFixes < 0xFFFFu) est.rejectedPositionFixes++;
             }
+            updateControlPoint();
         }
     } else if (reliablePosition) {
         if (est.rejectedPositionFixes < 0xFFFFu) est.rejectedPositionFixes++;
@@ -237,26 +327,70 @@ void StateEstimator::onPvt(uint32_t nowMs,
     // почти не тянет, а уверенный (быстрое прямое движение) — тянет сильно.
     // Mahalanobis-гейт внутри updateHeading отсекает выбросы.
     est.gpsCourseUsed = false;
-    if (_headingSeeded && accept &&
-        (est.sol == SOL_FIXED || est.sol == SOL_FLOAT) &&
-        est.speedMps >= GPS_COURSE_FUSE_MIN_MPS) {
-        const float courseAccDeg = est.gpsCourseAccDeg;
-        if (courseAccDeg > 0.01f && courseAccDeg <= GPS_COURSE_FUSE_MAX_ACC_DEG) {
-            const float courseRad = est.headingDeg * 0.01745329f;
-            const float sigmaRad  = courseAccDeg * 0.01745329f;
-            float cov = sigmaRad * sigmaRad;
-            if (cov < 0.0012f) cov = 0.0012f;   // floor ~2°
-            est.gpsCourseUsed = _ekf.updateHeading(courseRad, cov, true);
+    est.gpsCourseWindowDistM = 0;
+    est.gpsCourseWindowMs = 0;
+    const bool courseMotionValid = _headingSeeded && est.originSet && accept &&
+        !_courseRotatingInPlace &&
+        fabsf(_courseCommandedLinearMps) >= 0.05f &&
+        est.speedMps >= 0.05f &&
+        (est.sol == SOL_FIXED || est.sol == SOL_FLOAT);
+    if (!courseMotionValid) {
+        _courseWindowValid = false;
+        _courseGyroAccumDeg = 0;
+        _courseWindowAccumMs = 0;
+    } else if (!_courseWindowValid) {
+        _courseWindowValid = true;
+        _courseWindowStartX = est.x;
+        _courseWindowStartY = est.y;
+        _courseWindowStartMs = nowMs;
+        _courseWindowAccumMs = 0;
+        _courseGyroAccumDeg = 0;
+    } else {
+        if (pvtIntervalMs > 0u && pvtIntervalMs < 2000u)
+            _courseWindowAccumMs += pvtIntervalMs;
+        const float courseDx = est.x - _courseWindowStartX;
+        const float courseDy = est.y - _courseWindowStartY;
+        const float courseDistance = sqrtf(courseDx * courseDx +
+                                           courseDy * courseDy);
+        const uint32_t courseWindowMs = _courseWindowAccumMs > 0
+            ? _courseWindowAccumMs : (nowMs - _courseWindowStartMs);
+        est.gpsCourseWindowDistM = courseDistance;
+        est.gpsCourseWindowMs = courseWindowMs;
+        if (courseDistance >= 0.15f && courseWindowMs >= 400u) {
+            const float motionCourseDeg = NavMath::targetHeadingDeg(
+                courseDx, courseDy);
+            const float courseAccDeg = est.gpsCourseAccDeg;
+            if (courseAccDeg > 0.01f &&
+                courseAccDeg <= GPS_COURSE_FUSE_MAX_ACC_DEG) {
+                const float courseRad = motionCourseDeg * 0.01745329f;
+                const float sigmaRad = courseAccDeg * 0.01745329f;
+                float cov = sigmaRad * sigmaRad;
+                if (cov < 0.0012f) cov = 0.0012f;
+                const float measurementDt = courseWindowMs * 0.001f;
+                if (headingMeasurementPlausible(
+                        nowMs, motionCourseDeg, "gps_course_window",
+                        _lastYawRateRadps * 57.2957795f,
+                        measurementDt, _courseGyroAccumDeg)) {
+                    est.gpsCourseUsed = _ekf.updateHeading(courseRad, cov, true);
+                }
+            }
+            _courseWindowStartX = est.x;
+            _courseWindowStartY = est.y;
+            _courseWindowStartMs = nowMs;
+            _courseWindowAccumMs = 0;
+            _courseGyroAccumDeg = 0;
         }
     }
 
     // PVT may publish the current EKF value, but must not make an IMU-derived
-    // heading look fresh. GPS course fusion is disabled.
+    // heading look fresh. Course fusion above uses its own displacement window.
     if (_headingSeeded) {
         float hDeg = _ekf.heading() * 57.2957795f;
         hDeg = ImuMath::normalizeDeg360(hDeg);
         est.headingFiltDeg = hDeg;
         est.headingValid = true;
+        _lastHeadingOutputMs = nowMs;
+        updateControlPoint();
     }
 
     est.lastUpdateMs = nowMs;

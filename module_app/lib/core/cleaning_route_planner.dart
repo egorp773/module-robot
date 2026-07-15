@@ -43,9 +43,12 @@ class CleaningRoute {
 }
 
 class CleaningRoutePlanner {
-  static const double defaultLineStepMeters = 0.35;
-  static const double defaultRobotWidthMeters = 0.50;
-  static const double defaultBoundaryMarginMeters = 0.25;
+  /// Default coverage-lane spacing for the 0.50 m tool (0.08 m overlap).
+  static const double defaultLineStepMeters = 0.42;
+  static const double minRecommendedLineStepMeters = 0.38;
+  static const double maxRecommendedLineStepMeters = 0.45;
+  static const double defaultRobotWidthMeters = 0.55;
+  static const double defaultBoundaryMarginMeters = 0.275;
   // Forbidden contours are recorded by driving around the obstacle, so the
   // stored line is already a safe centerline contour. Keep a 5 cm buffer so the
   // robot may pass close to the contour without treating it as robot radius.

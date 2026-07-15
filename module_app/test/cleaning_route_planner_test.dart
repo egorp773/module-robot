@@ -5,6 +5,12 @@ import 'package:hello_flutter/core/cleaning_route_planner.dart';
 import 'package:hello_flutter/features/manual/manual_control_screen.dart';
 
 void main() {
+  test('coverage spacing defaults match the configurable tool range', () {
+    expect(CleaningRoutePlanner.defaultLineStepMeters, 0.42);
+    expect(CleaningRoutePlanner.minRecommendedLineStepMeters, 0.38);
+    expect(CleaningRoutePlanner.maxRecommendedLineStepMeters, 0.45);
+  });
+
   test('builds perimeter plus snake from an outside start', () {
     final zone = _rect(0, 0, 6, 2.4);
     final route = CleaningRoutePlanner.planRoute(

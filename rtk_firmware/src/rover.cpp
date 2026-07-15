@@ -13,7 +13,11 @@
 #include "Safety.h"
 #include "WsServer.h"
 #include "NavMath.h"
+#include "RouteExecutor.h"
+#include "CoveragePlanner.h"
+#include "RouteRunDiagnostics.h"
 #include <WiFi.h>
+#include <atomic>
 
 // --- global objects ---
 HardwareSerial F9pSerial(1);
@@ -27,8 +31,85 @@ Route           g_route;
 Motor           g_motor;
 Safety          g_safety;
 WsServer        g_ws;
+routeexec::RouteExecutor g_routeExecutor;
+
+static uint32_t g_nextRouteId = 1u;
+static routeexec::FootprintConfig g_routeFootprint;
+static std::atomic<bool> g_routeExecutorActiveMirror(false);
+static std::atomic<bool> g_routeStopLatch(false);
+
+enum class PendingRouteCommand : uint8_t {
+    NONE = 0,
+    START,
+    PAUSE,
+    RESUME,
+    STOP,
+    GO_FORWARD,
+    GO_NORTH,
+    GO_L_SHAPE,
+    GO_L_SHAPE_DEBUG,
+    GO_SQUARE_DEBUG,
+};
+static volatile PendingRouteCommand g_pendingRouteCommand =
+    PendingRouteCommand::NONE;
+static float g_pendingRouteArg1 = 0.0f;
+static float g_pendingRouteArg2 = 0.0f;
+static float g_pendingRouteArg3 = 0.0f;
+static portMUX_TYPE g_routeCommandMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct PendingRouteRequest {
+    PendingRouteCommand command;
+    float arg1;
+    float arg2;
+    float arg3;
+};
+
+static bool enqueueRouteCommand(PendingRouteCommand command,
+                                float arg1 = 0.0f,
+                                float arg2 = 0.0f,
+                                float arg3 = 0.0f) {
+    bool accepted = false;
+    if (command == PendingRouteCommand::STOP)
+        g_routeStopLatch.store(true, std::memory_order_release);
+    portENTER_CRITICAL(&g_routeCommandMux);
+    if (command == PendingRouteCommand::STOP) {
+        g_pendingRouteCommand = command;
+        accepted = true;
+    } else if (g_pendingRouteCommand == PendingRouteCommand::NONE) {
+        g_pendingRouteCommand = command;
+        accepted = true;
+    }
+    if (accepted) {
+        g_pendingRouteArg1 = arg1;
+        g_pendingRouteArg2 = arg2;
+        g_pendingRouteArg3 = arg3;
+    }
+    portEXIT_CRITICAL(&g_routeCommandMux);
+    return accepted;
+}
+
+static PendingRouteRequest takePendingRouteCommand() {
+    portENTER_CRITICAL(&g_routeCommandMux);
+    const PendingRouteRequest request{
+        g_pendingRouteCommand,
+        g_pendingRouteArg1,
+        g_pendingRouteArg2,
+        g_pendingRouteArg3,
+    };
+    g_pendingRouteCommand = PendingRouteCommand::NONE;
+    portEXIT_CRITICAL(&g_routeCommandMux);
+    return request;
+}
+
+static void clearPendingRouteCommand() {
+    portENTER_CRITICAL(&g_routeCommandMux);
+    g_pendingRouteCommand = PendingRouteCommand::NONE;
+    portEXIT_CRITICAL(&g_routeCommandMux);
+}
 
 static bool g_logEnabled = true;   // LOG,0 / LOG,1 — гасит периодический лог
+static bool g_pathLogEnabled = false;
+static uint32_t g_estimatorPvtId = 0;
 
 // --- Heading source / RTK-motion alignment state ---
 // IMU absolute heading has been demoted to optional. For navigation we now
@@ -128,7 +209,46 @@ struct SerialMotion {
     uint32_t startedAtMs = 0;
     uint32_t safetyArmedAtMs = 0;
     uint32_t timeoutMs = 0;
+    uint32_t pausedAtMs = 0;
 } g_serialMotion;
+
+struct PathLogState {
+    uint32_t lastPvtId = 0;
+    SerialMotionSource windowSource = SerialMotionSource::NONE;
+    int windowSegment = -1;
+    float motionX[24]{};
+    float motionY[24]{};
+    int motionCount = 0;
+    float goPlanAx = NAN, goPlanAy = NAN;
+    float goCtrlAx = NAN, goCtrlAy = NAN;
+    float goBx = NAN, goBy = NAN;
+    routeexec::ExecutorState lastExecutorState =
+        routeexec::ExecutorState::IDLE;
+} g_pathLog;
+
+// Diagnostics observe the executor but never own route transitions or write
+// motors.  A PVT is counted once, keyed by the estimator's monotonic PVT id.
+struct RouteObserverState {
+    uint32_t lastPvtId = 0;
+    int lastSegment = -1;
+    int lastLoggedSegment = -1;
+    routeexec::ExecutorState lastState = routeexec::ExecutorState::IDLE;
+    bool previousPvtValid = false;
+    float previousPvtX = 0.0f;
+    float previousPvtY = 0.0f;
+    float segmentPathLen = 0.0f;
+    float segmentMaxCross = 0.0f;
+    float segmentDriveStartX = 0.0f;
+    float segmentDriveStartY = 0.0f;
+    routediag::SegmentPathMetrics segmentMetrics;
+    routediag::CornerSnapshots cornerSnapshots;
+    uint32_t lastPhysicalStopLogMs = 0;
+    bool warnedToolFootprint = false;
+
+    void reset() {
+        *this = RouteObserverState{};
+    }
+} g_routeObserver;
 
 // --------------------------------------------------------------------
 // L-shape test statistics
@@ -169,10 +289,15 @@ struct LShapeTestStats {
     float startX = 0, startY = 0;
     float wp1X = NAN, wp1Y = NAN;
     float finishX = NAN, finishY = NAN;
+    float segment1DriveEndX = NAN, segment1DriveEndY = NAN;
+    float segment1PhysicalStopX = NAN, segment1PhysicalStopY = NAN;
+    float cornerAfterTurnX = NAN, cornerAfterTurnY = NAN;
 
     float headingStart  = 0;
     float headingWp1    = NAN;
     float headingFinish = NAN;
+    float headingBeforeCorner = NAN;
+    float headingAfterCorner = NAN;
 
     uint32_t startedMs = 0;
     uint32_t wp1Ms     = 0;
@@ -185,6 +310,8 @@ struct LShapeTestStats {
     float pathLen   = 0;
     float pathLen1  = 0;
     float pathLen2  = 0;
+    routediag::SegmentPathMetrics segmentMetrics[2];
+    routediag::CornerSnapshots cornerSnapshots;
 
     float maxCross1 = 0;
     float maxCross2 = 0;
@@ -219,6 +346,8 @@ struct SquareTestStats {
     uint32_t finishedMs = 0;
     uint32_t lastPrintMs = 0;
     float pathLen = 0;
+    float currentSegmentPathLen = 0;
+    float currentSegmentMaxCross = 0;
     float lastX = NAN;
     float lastY = NAN;
     float maxCross = 0;
@@ -283,11 +412,18 @@ static constexpr uint32_t SERIAL_MOTION_SAFETY_GRACE_MS = 1000u;
 
 static void serialMotionBegin(SerialMotionSource src, uint32_t timeoutMs) {
     const uint32_t now = millis();
+    g_ws.setSerialMotionActive(true);
     g_serialMotion.active = true;
     g_serialMotion.source = src;
     g_serialMotion.startedAtMs = now;
     g_serialMotion.safetyArmedAtMs = now + SERIAL_MOTION_SAFETY_GRACE_MS;
     g_serialMotion.timeoutMs = timeoutMs;
+    g_serialMotion.pausedAtMs = 0u;
+    g_pathLog.lastPvtId = g_estimatorPvtId;
+    g_pathLog.windowSource = SerialMotionSource::NONE;
+    g_pathLog.windowSegment = -1;
+    g_pathLog.motionCount = 0;
+    g_pathLog.lastExecutorState = routeexec::ExecutorState::IDLE;
     Serial.printf("[SERIAL-MOTION] begin source=%s timeoutMs=%u\n",
                   serialMotionSourceName(src), (unsigned)timeoutMs);
 }
@@ -308,6 +444,7 @@ bool precisionIsRotating();
 // страховка от "LTEST-DRIVE-TRACE продолжает писать после safety/stop".
 // Не трогает сегменты, маршрут или follower — только precision-state.
 void precisionResetForSafetyEnd();
+void pathDiagnosticsOnTick();
 }
 
 // Forward decl: resetFollowerConfig is defined below after the Follower
@@ -320,40 +457,48 @@ static void resetFollowerConfig();
 // roverdbg::ltestDriveTraceTick().
 namespace roverdbg { void ltestDriveTraceTick(); }
 
-static void serialMotionEnd(const char* reason) {
-    if (!g_serialMotion.active && g_serialMotion.source == SerialMotionSource::NONE) return;
-    // If the L-shape test was the active motion, finalise it first so
-    // the partial / final summary lands in the Serial log right after
-    // [SERIAL-MOTION] end.
-    if (g_ltest.active &&
-        g_serialMotion.source == SerialMotionSource::GO_L_SHAPE) {
-        roverdbg::lShapeFinish(reason ? reason : "unknown");
+static void serialMotionEnd(const char* reason);
+static void followerTerminalFault(const char* reason);
+static void servicePendingRouteCommand();
+
+enum class FollowerTurnState : uint8_t {
+    ENTER,
+    TURN,
+    BRAKE,
+    WAIT_STOP,
+    STABLE,
+    EXIT,
+    FAULT,
+    IDLE,
+};
+
+enum class FollowerControllerMode : uint8_t {
+    STANLEY,
+    LINE_RECOVERY,
+    ENDPOINT_RECOVERY,
+    TURN_IN_PLACE,
+};
+
+static const char* followerTurnStateName(FollowerTurnState state) {
+    switch (state) {
+        case FollowerTurnState::ENTER: return "ENTER";
+        case FollowerTurnState::TURN: return "TURN";
+        case FollowerTurnState::BRAKE: return "BRAKE";
+        case FollowerTurnState::WAIT_STOP: return "WAIT_STOP";
+        case FollowerTurnState::STABLE: return "STABLE";
+        case FollowerTurnState::EXIT: return "EXIT";
+        case FollowerTurnState::FAULT: return "FAULT";
+        default: return "IDLE";
     }
-    if (g_sqtest.active &&
-        g_serialMotion.source == SerialMotionSource::GO_SQUARE) {
-        roverdbg::squareFinish(reason ? reason : "unknown");
+}
+
+static const char* followerControllerModeName(FollowerControllerMode mode) {
+    switch (mode) {
+        case FollowerControllerMode::LINE_RECOVERY: return "LINE_RECOVERY";
+        case FollowerControllerMode::ENDPOINT_RECOVERY: return "ENDPOINT_RECOVERY";
+        case FollowerControllerMode::TURN_IN_PLACE: return "TURN_IN_PLACE";
+        default: return "STANLEY";
     }
-    Serial.printf("[SERIAL-MOTION] end source=%s reason=%s\n",
-                  serialMotionSourceName(g_serialMotion.source),
-                  reason ? reason : "-");
-    // Restore the default follower config so the next regular route
-    // (NAV_START, GO_FORWARD, route from WebSocket, …) sees the
-    // project's normal arrival radius and speed, not the L-shape
-    // override. The L-shape flow has already made the override
-    // visible via [LTEST] CONFIG at start; this guarantees it does
-    // not leak into subsequent motions.
-    resetFollowerConfig();
-    // === Точечная защита от "LTEST-DRIVE-TRACE продолжает писать после end" ===
-    // Если по какой-то причине precision-flow не закрылся (safety / STOP /
-    // timeout сбросили serialMotion.active, но g_precision остался активным
-    // с phase=DRIVE) — trace будет писать вечно. Гасим явно через
-    // roverdbg::precisionResetForSafetyEnd().
-    roverdbg::precisionResetForSafetyEnd();
-    g_serialMotion.active = false;
-    g_serialMotion.source = SerialMotionSource::NONE;
-    g_serialMotion.startedAtMs = 0;
-    g_serialMotion.safetyArmedAtMs = 0;
-    g_serialMotion.timeoutMs = 0;
 }
 
 // --- waypoint follower v2: simple first-route controller ---
@@ -395,6 +540,35 @@ struct Follower {
     float startY = 0;
     // turn-in-place флаг (раньше был file-static, мог "застрять" в true).
     bool  turnInPlaceActive = false;
+    FollowerTurnState turnState = FollowerTurnState::IDLE;
+    int turnDirection = 0;
+    int pendingTurnDirection = 0;
+    uint8_t turnAttempts = 0;
+    uint32_t turnStateSinceMs = 0;
+    uint32_t turnStableSinceMs = 0;
+    float turnStopX = 0;
+    float turnStopY = 0;
+    float steeringTargetDeg = 0;
+    uint32_t steeringTargetMs = 0;
+    bool recoveryActive = false;
+    bool endpointRecoveryActive = false;
+    uint8_t endpointRecoveryAttempt = 0;
+    uint32_t endpointRecoveryStartedMs = 0;
+    uint32_t endpointProgressSinceMs = 0;
+    float endpointBestDistanceM = INFINITY;
+    float endpointBestCrossM = INFINITY;
+    float lineHeadingDeg = 0;
+    float lineHeadingErrDeg = 0;
+    float bearingToTargetDeg = 0;
+    float interceptHeadingDeg = 0;
+    float turnTargetDeg = 0;
+    float steeringErrorDeg = 0;
+    FollowerControllerMode controllerMode = FollowerControllerMode::STANLEY;
+    uint32_t steerResponsePvtId = 0;
+    float steerResponseHeadingDeg = 0;
+    uint8_t steerWrongSamples = 0;
+    uint32_t lastSteerResponseLogMs = 0;
+    uint32_t lastSteerWarningMs = 0;
 
     // === Диагностика silent zero ===
     // Последняя причина, по которой мы НЕ отправили команду мотору,
@@ -433,6 +607,26 @@ struct Follower {
         startCaptured = false;
         startX = startY = 0;
         turnInPlaceActive = false;
+        turnState = FollowerTurnState::IDLE;
+        turnDirection = pendingTurnDirection = 0;
+        turnAttempts = 0;
+        turnStateSinceMs = turnStableSinceMs = 0;
+        turnStopX = turnStopY = 0;
+        steeringTargetDeg = 0;
+        steeringTargetMs = 0;
+        recoveryActive = false;
+        endpointRecoveryActive = false;
+        endpointRecoveryAttempt = 0;
+        endpointRecoveryStartedMs = 0;
+        endpointProgressSinceMs = 0;
+        endpointBestDistanceM = endpointBestCrossM = INFINITY;
+        lineHeadingDeg = lineHeadingErrDeg = bearingToTargetDeg = 0;
+        interceptHeadingDeg = turnTargetDeg = steeringErrorDeg = 0;
+        controllerMode = FollowerControllerMode::STANLEY;
+        steerResponsePvtId = 0;
+        steerResponseHeadingDeg = 0;
+        steerWrongSamples = 0;
+        lastSteerResponseLogMs = lastSteerWarningMs = 0;
         speedBlockedReason = nullptr;
         linearPreClamp = linearPostClamp = 0;
         slowFactorDbg = rampFactorDbg = 0;
@@ -475,6 +669,281 @@ static void resetFollowerConfig() {
     g_arrivalRadiusM      = ROVER_V2_ARRIVAL_RADIUS_M;
     g_finalArrivalRadiusM = ROVER_V2_FINAL_ARRIVAL_RADIUS_M;
     g_forwardSpeedMps     = ROVER_V2_FORWARD_MPS;
+}
+
+static routeexec::RouteExecutorConfig routeExecutorConfig() {
+    routeexec::RouteExecutorConfig cfg;
+    // Preserve the field-proven controller constants.  The executor changes
+    // lifecycle/geometry ownership, not Stanley tuning.
+    cfg.stanleyHeadingGain = ROVER_K_HEADING;
+    cfg.stanleyCrossTrackGain = ROVER_K_CROSSTRACK;
+    cfg.stanleySoftSpeedMps = ROVER_STANLEY_SOFT_SPEED;
+    cfg.yawRateDamping = ROVER_K_D_YAWRATE;
+    cfg.maxAngularRadps = ROVER_V2_MAX_CORRECTION_RADPS;
+    cfg.degradedSpeedMps = ROVER_DEGRADED_SPEED;
+    cfg.lookaheadM = ROVER_LOOKAHEAD_M;
+    cfg.rampUpM = DEBUG_RAMP_UP_M;
+    cfg.rampMinFactor = DEBUG_RAMP_MIN_FACTOR;
+    cfg.turnEnterDeg = ROVER_V2_TURN_IN_PLACE_DEG;
+    cfg.turnExitDeg = ROVER_TURN_EXIT_DEG;
+    cfg.turnSettleYawRateDps = 3.0f;
+    return cfg;
+}
+
+static bool executorStateUsesReverse(routeexec::ExecutorState state) {
+    return state == routeexec::ExecutorState::RECOVERY_PLAN ||
+           state == routeexec::ExecutorState::RECOVERY_REVERSE;
+}
+
+static bool executorStateRotating(routeexec::ExecutorState state) {
+    return state == routeexec::ExecutorState::TURN_TO_NEXT ||
+           state == routeexec::ExecutorState::CORNER_MISSED_INTERCEPT ||
+           state == routeexec::ExecutorState::RECOVERY_TURN ||
+           state == routeexec::ExecutorState::BRAKE ||
+           state == routeexec::ExecutorState::WAIT_PHYSICAL_STOP ||
+           state == routeexec::ExecutorState::HEADING_STABLE;
+}
+
+static routeexec::RouteExecutorInput routeExecutorInput(uint32_t now) {
+    routeexec::RouteExecutorInput in;
+    const auto& e = g_est.get();
+    in.nowMs = now;
+    in.pvtId = g_estimatorPvtId;
+    in.position = routeexec::LocalPoint(e.x, e.y);
+    in.headingDeg = e.headingFiltDeg;
+    in.yawRateDps = g_imu.yawRateDps();
+    in.estimatedSpeedMps = e.speedMps;
+    in.commandLeft = g_motor.currentLeftPwm();
+    in.commandRight = g_motor.currentRightPwm();
+    in.measuredLeft = g_motor.speedLeftMeas();
+    in.measuredRight = g_motor.speedRightMeas();
+    in.feedbackAgeMs = g_motor.feedbackAgeMs(now);
+    in.imuAgeMs = g_imu.ageMs(now);
+    in.pvtAgeMs = e.pvtAgeMs;
+    in.motionAllowed = g_safety.allowMotion() && g_ws.navRequested() &&
+        !g_routeStopLatch.load(std::memory_order_acquire);
+    in.degraded = g_safety.level() == SAFETY_DEGRADED;
+
+    const routeexec::Pose2D pose(in.position, in.headingDeg);
+    const routeexec::FootprintCheckResult footprintResult =
+        g_route.checkFootprintPose(pose, g_routeFootprint);
+    in.currentFootprintAllowed =
+        footprintResult == routeexec::FootprintCheckResult::CLEAR;
+
+    in.forwardPathAllowed = true;
+    in.nextSegmentPathAllowed = true;
+    in.recoveryPathAllowed = true;
+    in.turnPathAllowed = true;
+    if (g_routeExecutor.active() && g_routeExecutor.plan().valid() &&
+        g_routeExecutor.segmentIndex() <
+            g_routeExecutor.plan().segmentCount()) {
+        const auto pathAllowedTo = [&](const routeexec::LocalPoint& target) {
+            if (!routeexec::finitePoint(target)) return false;
+            bool allowed = g_route.segmentAllowed(
+                {e.x, e.y}, {target.x, target.y},
+                ROVER_BOUNDARY_TOLERANCE_M, ROVER_BOUNDARY_SAMPLE_M);
+            if (allowed) {
+                allowed = g_route.checkForwardSweptFootprint(
+                    pose, target, 0.05f, g_routeFootprint) ==
+                    routeexec::FootprintCheckResult::CLEAR;
+            }
+            return allowed;
+        };
+        const size_t currentIndex = g_routeExecutor.segmentIndex();
+        const routeexec::RouteSegment& segment =
+            g_routeExecutor.plan().segment(currentIndex);
+        routeexec::LocalPoint target = routeexec::computeInterceptTarget(
+            segment, in.position,
+            routeExecutorConfig().interceptLookaheadM).target;
+        if (g_routeExecutor.state() ==
+                routeexec::ExecutorState::RECOVERY_APPROACH) {
+            target = g_routeExecutor.lastOutput().recoveryGoal;
+        }
+        in.forwardPathAllowed = pathAllowedTo(target);
+        in.recoveryPathAllowed = pathAllowedTo(
+            g_routeExecutor.lastOutput().recoveryGoal);
+        if (currentIndex + 1u < g_routeExecutor.plan().segmentCount()) {
+            const routeexec::RouteSegment& next =
+                g_routeExecutor.plan().segment(currentIndex + 1u);
+            const routeexec::LocalPoint nextTarget =
+                routeexec::computeInterceptTarget(
+                    next, in.position,
+                    routeExecutorConfig().interceptLookaheadM).target;
+            in.nextSegmentPathAllowed = pathAllowedTo(nextTarget);
+        }
+        if (g_routeExecutor.state() ==
+                routeexec::ExecutorState::TURN_TO_NEXT ||
+            g_routeExecutor.state() ==
+                routeexec::ExecutorState::CORNER_MISSED_INTERCEPT ||
+            g_routeExecutor.state() ==
+                routeexec::ExecutorState::RECOVERY_TURN) {
+            const float targetHeading =
+                g_routeExecutor.lastOutput().latchedTurnTargetDeg;
+            in.turnPathAllowed = isfinite(targetHeading) &&
+                g_route.checkTurnSweptFootprint(
+                    pose, targetHeading, 5.0f, g_routeFootprint) ==
+                    routeexec::FootprintCheckResult::CLEAR;
+        }
+    }
+
+    in.reverseEnabled = ROVER_TOOL_FOOTPRINT_CONFIGURED != 0;
+    in.reversePathAllowed = false;
+    if (g_routeExecutor.active() &&
+        executorStateUsesReverse(g_routeExecutor.state())) {
+        const routeexec::FootprintCheckResult reverseResult =
+            g_route.checkReverseSweptFootprint(
+                pose, routeExecutorConfig().recoveryReverseMaxM,
+                0.05f, g_routeFootprint);
+        in.reversePathAllowed =
+            reverseResult == routeexec::FootprintCheckResult::CLEAR;
+        if (reverseResult ==
+                routeexec::FootprintCheckResult::TOOL_FOOTPRINT_UNCONFIGURED &&
+            !g_routeObserver.warnedToolFootprint) {
+            Serial.println("[FOOTPRINT_BLOCKED] reverse disabled: "
+                           "tool footprint is not configured");
+            g_routeObserver.warnedToolFootprint = true;
+        }
+    }
+    return in;
+}
+
+static bool validatePlanFootprint(const routeexec::RoutePlan& plan) {
+    if (!plan.valid()) return false;
+    for (size_t segmentIndex = 0u;
+         segmentIndex < plan.segmentCount(); ++segmentIndex) {
+        const routeexec::RouteSegment& segment = plan.segment(segmentIndex);
+        size_t steps = static_cast<size_t>(
+            ceilf(segment.segmentLengthM / 0.10f));
+        if (steps < 1u) steps = 1u;
+        for (size_t i = 0u; i <= steps; ++i) {
+            const float u = static_cast<float>(i) /
+                            static_cast<float>(steps);
+            routeexec::Pose2D pose;
+            pose.position.x = segment.plannedStart.x +
+                (segment.plannedEnd.x - segment.plannedStart.x) * u;
+            pose.position.y = segment.plannedStart.y +
+                (segment.plannedEnd.y - segment.plannedStart.y) * u;
+            pose.headingDeg = segment.plannedHeadingDeg;
+            if (g_route.checkFootprintPose(pose, g_routeFootprint) !=
+                routeexec::FootprintCheckResult::CLEAR) {
+                Serial.printf("[FOOTPRINT_BLOCKED] route validation "
+                              "segment=%u sample=%u/%u x=%.3f y=%.3f "
+                              "heading=%.1f\n",
+                              (unsigned)segmentIndex, (unsigned)i,
+                              (unsigned)steps, (double)pose.position.x,
+                              (double)pose.position.y,
+                              (double)pose.headingDeg);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool activateRoutePlan(const routeexec::RoutePlan& plan,
+                              const char* sourceTag) {
+    if (!plan.valid() || !g_route.isReady() ||
+        !validatePlanFootprint(plan)) return false;
+    const uint32_t now = millis();
+    routeexec::RouteExecutorInput input = routeExecutorInput(now);
+    // start() only snapshots validated geometry; Safety/navRequested gates are
+    // evaluated on the first runtime tick after the caller arms the session.
+    input.motionAllowed = true;
+    input.currentFootprintAllowed = true;
+    input.forwardPathAllowed = true;
+    input.nextSegmentPathAllowed = true;
+    input.recoveryPathAllowed = true;
+    input.turnPathAllowed = true;
+    if (!g_routeExecutor.start(plan, routeExecutorConfig(), input)) return false;
+    g_routeExecutorActiveMirror.store(true, std::memory_order_release);
+    g_route.start();  // compatibility mirror for existing upload telemetry
+    g_follow.reset();
+    g_follow.running = true;
+    g_routeObserver.reset();
+    g_routeObserver.lastSegment = 0;
+    g_routeObserver.previousPvtValid = true;
+    g_routeObserver.previousPvtX = input.position.x;
+    g_routeObserver.previousPvtY = input.position.y;
+    g_routeObserver.segmentDriveStartX = input.position.x;
+    g_routeObserver.segmentDriveStartY = input.position.y;
+    g_routeObserver.segmentMetrics.reset(input.position.x, input.position.y,
+                                         input.headingDeg);
+    g_pathLog.lastPvtId = g_estimatorPvtId;
+    g_pathLog.windowSource = SerialMotionSource::NONE;
+    g_pathLog.windowSegment = -1;
+    g_pathLog.motionCount = 0;
+    g_pathLog.lastExecutorState = routeexec::ExecutorState::IDLE;
+    Serial.printf("[ROUTE_START] routeId=%u source=%s points=%u segments=%u\n",
+                  (unsigned)plan.routeId(), sourceTag ? sourceTag : "-",
+                  (unsigned)plan.pointCount(), (unsigned)plan.segmentCount());
+    return true;
+}
+
+static void cancelRouteExecutor(const char* reason, bool clearLoadedRoute) {
+    if (g_routeExecutor.active() || g_routeExecutor.routeFinished()) {
+        g_routeExecutor.stop(reason ? reason : "stopped");
+    }
+    g_routeExecutorActiveMirror.store(false, std::memory_order_release);
+    if (clearLoadedRoute) g_route.stop();
+    else g_route.finish();
+    g_follow.reset();
+    g_routeObserver.reset();
+}
+
+static void serialMotionEnd(const char* reason) {
+    if (!g_serialMotion.active &&
+        g_serialMotion.source == SerialMotionSource::NONE) return;
+
+    const SerialMotionSource source = g_serialMotion.source;
+    const uint32_t now = millis();
+    const uint32_t durationMs = g_serialMotion.startedAtMs == 0
+        ? 0 : (now - g_serialMotion.startedAtMs);
+    const bool arrived = g_routeExecutor.arrived() || g_follow.arrived;
+    const char* fault = g_routeExecutor.faultReason()
+        ? g_routeExecutor.faultReason() : g_follow.faultReason;
+    const char* endReason = reason ? reason : "unknown";
+
+    if (g_ltest.active && source == SerialMotionSource::GO_L_SHAPE) {
+        roverdbg::lShapeFinish(endReason);
+    }
+    if (g_sqtest.active && source == SerialMotionSource::GO_SQUARE) {
+        roverdbg::squareFinish(endReason);
+    }
+
+    Serial.printf("[SERIAL-MOTION] end source=%s reason=%s durationMs=%u "
+                  "arrived=%d fault=%s\n",
+                  serialMotionSourceName(source), endReason,
+                  (unsigned)durationMs, arrived ? 1 : 0,
+                  fault ? fault : "-");
+
+    g_motor.stopImmediately();
+    g_ws.setNavRequested(false);
+    g_ws.setSerialMotionActive(false);
+
+    if (source == SerialMotionSource::AUTO_ALIGN) {
+        g_follow.reset();
+    } else if (source == SerialMotionSource::GO_FORWARD ||
+               source == SerialMotionSource::GO_NORTH ||
+               source == SerialMotionSource::GO_L_SHAPE ||
+               source == SerialMotionSource::GO_SQUARE) {
+        cancelRouteExecutor(endReason, true);
+    }
+
+    resetFollowerConfig();
+    roverdbg::precisionResetForSafetyEnd();
+
+    Serial.printf("[SERIAL-MOTION-END] source=%s reason=%s durationMs=%u "
+                  "navRequested=0 routeRunning=%d motorL=0 motorR=0\n",
+                  serialMotionSourceName(source), endReason,
+                  (unsigned)durationMs,
+                  g_routeExecutor.active() ? 1 : 0);
+
+    g_serialMotion.active = false;
+    g_serialMotion.source = SerialMotionSource::NONE;
+    g_serialMotion.startedAtMs = 0;
+    g_serialMotion.safetyArmedAtMs = 0;
+    g_serialMotion.timeoutMs = 0;
+    g_serialMotion.pausedAtMs = 0u;
 }
 
 // Helper: список "link watchdog" причин, которые должны игнорироваться
@@ -520,10 +989,16 @@ static void serialMotionTick() {
         serialMotionEnd("safety");
         return;
     }
-    if (g_follow.arrived && !roverdbg::precisionDebugActive()) {
+    if (g_routeExecutor.arrived() || g_follow.arrived) {
         serialMotionEnd("arrived");
         return;
     }
+    if (g_routeExecutor.state() == routeexec::ExecutorState::FAULT) {
+        const char* routeFault = g_routeExecutor.faultReason();
+        serialMotionEnd(routeFault ? routeFault : "route_fault");
+        return;
+    }
+    if (g_routeExecutor.paused()) return;
     if (g_serialMotion.source == SerialMotionSource::AUTO_ALIGN &&
         g_heading.alignState != AlignState::RUNNING) {
         // Alignment finished (OK or ERR). The alignment state machine
@@ -533,7 +1008,9 @@ static void serialMotionTick() {
         return;
     }
     if (g_serialMotion.timeoutMs != 0 &&
+        !g_routeExecutor.lastOutput().finalArrivalPending &&
         (now - g_serialMotion.startedAtMs) > g_serialMotion.timeoutMs) {
+        g_routeExecutor.expire("timeout");
         serialMotionEnd("timeout");
         // also stop the motors to be safe
         g_motor.stopImmediately();
@@ -583,6 +1060,81 @@ static void followerFault(const char* reason) {
     }
 }
 
+static void servicePendingRouteCommand() {
+    const PendingRouteRequest request = takePendingRouteCommand();
+    const PendingRouteCommand command = request.command;
+    if (command == PendingRouteCommand::NONE) return;
+    if (command != PendingRouteCommand::STOP &&
+        g_routeStopLatch.load(std::memory_order_acquire)) {
+        g_ws.setNavRequested(false);
+        Serial.printf("[ROUTE_COMMAND] command=%u result=ERR,STOP_LATCHED\n",
+                      (unsigned)command);
+        return;
+    }
+
+    String result;
+    switch (command) {
+        case PendingRouteCommand::START:
+            result = roverdbg::handleNavStartLine();
+            if (!result.startsWith("OK,NAV_START") &&
+                !g_serialMotion.active && !g_routeExecutor.active()) {
+                g_ws.setNavRequested(false);
+            }
+            break;
+        case PendingRouteCommand::PAUSE:
+            result = roverdbg::handleNavPauseLine();
+            break;
+        case PendingRouteCommand::RESUME:
+            result = roverdbg::handleNavResumeLine();
+            break;
+        case PendingRouteCommand::STOP:
+            result = roverdbg::handleStopLine();
+            break;
+        case PendingRouteCommand::GO_FORWARD:
+            result = roverdbg::handleGoForward(request.arg1)
+                ? String("OK,GO_FORWARD") : String("ERR,GO_FORWARD");
+            break;
+        case PendingRouteCommand::GO_NORTH:
+            result = roverdbg::handleGoNorth(request.arg1)
+                ? String("OK,GO_NORTH") : String("ERR,GO_NORTH");
+            break;
+        case PendingRouteCommand::GO_L_SHAPE:
+            result = roverdbg::handleGoLShape(
+                request.arg1, request.arg2, request.arg3)
+                ? String("OK,GO_L_SHAPE") : String("ERR,GO_L_SHAPE");
+            break;
+        case PendingRouteCommand::GO_L_SHAPE_DEBUG:
+            result = roverdbg::handleGoLShapeDebugLine(
+                request.arg1, request.arg2, request.arg3);
+            break;
+        case PendingRouteCommand::GO_SQUARE_DEBUG:
+            result = roverdbg::handleGoSquareDebugLine(request.arg1);
+            break;
+        default:
+            return;
+    }
+    Serial.printf("[ROUTE_COMMAND] command=%u result=%s\n",
+                  (unsigned)command, result.c_str());
+    if (result.startsWith("ERR") && !g_serialMotion.active &&
+        !g_routeExecutor.active()) {
+        g_ws.setNavRequested(false);
+    }
+}
+
+static void followerTerminalFault(const char* reason) {
+    g_follow.faultReason = reason;
+    g_follow.turnState = FollowerTurnState::FAULT;
+    g_follow.turnInPlaceActive = false;
+    g_follow.running = false;
+    g_follow.arrived = false;
+    g_follow.linearMps = 0;
+    g_follow.angularRadps = 0;
+    g_motor.stopImmediately();
+    g_route.finish();
+    Serial.printf("[ROVER] fault terminal: %s\n", reason);
+    if (g_serialMotion.active) serialMotionEnd(reason);
+}
+
 static bool checkFollowerProgress(const Estimate& e, float commandedSpeed) {
     uint32_t now = millis();
     if (!g_safety.allowMotion() || fabsf(commandedSpeed) < ROVER_STUCK_MIN_CMD_MPS) {
@@ -610,6 +1162,51 @@ static bool checkFollowerProgress(const Estimate& e, float commandedSpeed) {
         return false;
     }
     return true;
+}
+
+static void logSteerResponseWatchdog(
+        const routeexec::RouteExecutorOutput& out,
+        const routeexec::RouteExecutorInput& input,
+        const Estimate& e, uint32_t now) {
+    // RouteExecutor owns the validity gates, settling delay, consecutive
+    // observation counter and stop/fault transition.  This function is only a
+    // rate-limited renderer of that single watchdog; it must not maintain a
+    // second warning-only steering algorithm.
+    const bool faultThresholdReached =
+        out.transitionPurpose ==
+            routeexec::RouteTransitionPurpose::STEERING_RESPONSE_FAULT;
+    const bool forceFaultLog = faultThresholdReached && out.stateChanged;
+    const bool hasObservation =
+        out.steeringResponseObservationCount > 0u ||
+        out.steeringResponseWrongDirection;
+    if (!hasObservation && !forceFaultLog) return;
+    if (!forceFaultLog &&
+        (now - g_follow.lastSteerResponseLogMs) < 1000u) return;
+
+    const int rawMeasuredLeft = input.measuredLeft;
+    const int rawMeasuredRight = input.measuredRight;
+    // The field traces prove command-to-heading direction, but not each raw
+    // feedback channel's physical-forward sign. Do not publish an identity
+    // mapping as normalized physical track feedback.
+    Serial.printf(
+        "[STEER_RESPONSE] requestedAngular=%+.3f headingError=%+.1f "
+        "yawRate=%+.2f headingDelta=%+.2f cmdL=%d cmdR=%d "
+        "rawMeasuredLeft=%d rawMeasuredRight=%d "
+        "normalizedMeasuredLeft=NA normalizedMeasuredRight=NA "
+        "feedbackNormalizationValid=0 "
+        "observationCount=%u responseCorrect=%d faultStop=%d "
+        "heading=%.1f\n",
+        (double)out.steeringResponseRequestedAngularRadps,
+        (double)out.steeringErrorDeg,
+        (double)g_imu.yawRateDps(),
+        (double)out.steeringResponseHeadingDeltaDeg,
+        input.commandLeft, input.commandRight,
+        rawMeasuredLeft, rawMeasuredRight,
+        (unsigned)out.steeringResponseObservationCount,
+        out.steeringResponseWrongDirection ? 0 : 1,
+        faultThresholdReached ? 1 : 0,
+        (double)e.headingFiltDeg);
+    g_follow.lastSteerResponseLogMs = now;
 }
 
 static bool waitForInitialAbsoluteHeading(uint32_t timeoutMs, float& outHeadingDeg) {
@@ -689,6 +1286,12 @@ static bool startGoRoute(const char* tag, float distanceM, bool forwardFromHeadi
     const float startY = e.y;
     const float targetX = startX + dx;
     const float targetY = startY + dy;
+    g_pathLog.goPlanAx = startX;
+    g_pathLog.goPlanAy = startY;
+    g_pathLog.goCtrlAx = startX;
+    g_pathLog.goCtrlAy = startY;
+    g_pathLog.goBx = targetX;
+    g_pathLog.goBy = targetY;
     const float margin = 0.75f;
     const float minX = fminf(startX, targetX) - margin;
     const float maxX = fmaxf(startX, targetX) + margin;
@@ -711,7 +1314,26 @@ static bool startGoRoute(const char* tag, float distanceM, bool forwardFromHeadi
     g_route.beginForbidden(0, nullptr);
     g_route.endForbidden();
     g_route.endUpload();
-    g_route.start();
+
+    routeexec::RoutePlan& plan = g_routeExecutor.planBufferForBuild();
+    plan.clear();
+    plan.setRouteId(g_nextRouteId++);
+    routeexec::RoutePoint startPoint;
+    startPoint.position = routeexec::LocalPoint(startX, startY);
+    startPoint.type = routeexec::WaypointType::PASS_THROUGH;
+    startPoint.positionToleranceM = g_arrivalRadiusM;
+    routeexec::RoutePoint finalPoint;
+    finalPoint.position = routeexec::LocalPoint(targetX, targetY);
+    finalPoint.type = routeexec::WaypointType::FINAL_POSITION;
+    finalPoint.positionToleranceM = g_finalArrivalRadiusM;
+    if (!plan.appendPoint(startPoint) ||
+        !plan.appendPoint(finalPoint, routeexec::SegmentType::LINE,
+                          0.15f, g_forwardSpeedMps) ||
+        !plan.finalize() || !activateRoutePlan(plan, tag)) {
+        g_route.stop();
+        Serial.printf("[%s] refusing: executor plan failed\n", tag);
+        return false;
+    }
     g_ws.requestDebugNavigation();
     // Mark this as a serial-initiated motion so ws_disconnected does
     // not stop the test drive. Cleared by handleStopLine or by
@@ -770,7 +1392,8 @@ static void connectWiFi() {
     }
 }
 
-static void stepFollower() {
+#if 0  // Replaced by the unified RouteExecutor below.
+static void stepFollowerLegacy() {
     // === LTEST DRIVE PATH TRACE ===
     // По нему видно, реально ли stepFollower() вызывается для LTEST
     // и какой linear сейчас считает. Если ты видишь эти строки, но
@@ -792,22 +1415,13 @@ static void stepFollower() {
     int total = g_route.count();
     NavPoint current{e.x, e.y};
 
-    // RTK gate (FIXED only в автономном режиме).
-    const bool rtkOk = (e.sol == SOL_FIXED && e.hAcc <= SAFE_HACC_FIXED_M);
-    if (!rtkOk || e.pvtAgeMs > SAFE_PVT_AGE_MS ||
-        e.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {
-        // Мягкая реакция: плавный стоп + ожидание reacquire в течение
-        // SAFE_NAV_TIMEOUT_MS. Только если FIXED не вернулся за это окно
-        // — реальный fault. followerFault() сам инкрементирует счётчик
-        // и после ROVER_FAULT_RECOVERY_COUNT фаулит маршрут.
+    // GNSS quality and freshness are owned by Safety. Keeping a second,
+    // stricter FIXED/1s gate here made FIELD ineffective and produced an
+    // immediate stop before its DEGRADED/HOLD delays could apply.
+    if (!g_safety.allowMotion()) {
         g_follow.linearMps = 0;
         g_follow.angularRadps = 0;
         g_motor.stopImmediately();
-        if (g_follow.rtkLostSinceMs == 0) g_follow.rtkLostSinceMs = millis();
-        if ((millis() - g_follow.rtkLostSinceMs) > SAFE_NAV_TIMEOUT_MS) {
-            followerFault(rtkOk ? "position_stale" : "rtk_lost");
-            g_follow.rtkLostSinceMs = 0;
-        }
         return;
     }
     g_follow.rtkLostSinceMs = 0;
@@ -871,12 +1485,18 @@ static void stepFollower() {
     // Решение "по distToWp < arrival" раньше срезало углы.
     const bool isFinalWp = (g_follow.wpIdx == total - 1);
     const bool reachedByAlong = (segLen > 0.001f) &&
-                                (along >= segLen - 0.05f);
+                                (along >= segLen - 0.02f);
     const float distToB = sqrtf((b.x - current.x) * (b.x - current.x) +
                                 (b.y - current.y) * (b.y - current.y));
-    const bool reachedByRadius = distToB <
+    const bool reachedByRadius = distToB <=
         (isFinalWp ? g_finalArrivalRadiusM : g_arrivalRadiusM);
-    if (reachedByAlong || reachedByRadius) {
+    const bool reachedByCorridorOvershoot = !isFinalWp && reachedByAlong &&
+        fabsf(cross) <= 0.07f &&
+        distToB <= fmaxf(g_arrivalRadiusM, 0.15f);
+    if (reachedByRadius || reachedByCorridorOvershoot) {
+        g_follow.endpointRecoveryActive = false;
+        g_follow.endpointRecoveryAttempt = 0;
+        g_follow.endpointRecoveryStartedMs = 0;
         g_follow.faultCount = 0;
         g_follow.lastFaultWp = -1;
         g_follow.wpIdx++;
@@ -900,9 +1520,103 @@ static void stepFollower() {
     const float desiredHeading =
         (segLen > 0.001f) ? NavMath::targetHeadingDeg(segVx, segVy)
                           : e.headingFiltDeg;
-    const float headingErr = wrapDeg180Local(desiredHeading - e.headingFiltDeg);
+    const float absCrossForRecovery = fabsf(cross);
+    if (!g_follow.endpointRecoveryActive && !g_follow.recoveryActive &&
+        absCrossForRecovery >= 0.22f) {
+        g_follow.recoveryActive = true;
+    } else if (!g_follow.endpointRecoveryActive && g_follow.recoveryActive &&
+               absCrossForRecovery <= 0.12f) {
+        g_follow.recoveryActive = false;
+    }
+    const float bearingToWaypoint = NavMath::targetHeadingDeg(
+        b.x - current.x, b.y - current.y);
+    const bool finalWaypointMiss = isFinalWp && reachedByAlong &&
+                                   !reachedByRadius;
+    if (finalWaypointMiss && !g_follow.endpointRecoveryActive) {
+        g_follow.endpointRecoveryActive = true;
+        g_follow.recoveryActive = true;
+        g_follow.endpointRecoveryAttempt = 1;
+        g_follow.endpointRecoveryStartedMs = millis();
+        g_follow.endpointProgressSinceMs = g_follow.endpointRecoveryStartedMs;
+        g_follow.endpointBestDistanceM = distToB;
+        g_follow.endpointBestCrossM = absCrossForRecovery;
+        Serial.printf("[ENDPOINT_RECOVERY] enter dist=%.3f cross=%.3f "
+                      "bearing=%.1f\n",
+                      (double)distToB, (double)absCrossForRecovery,
+                      (double)bearingToWaypoint);
+    }
+    if (g_follow.endpointRecoveryActive) {
+        const uint32_t progressNow = millis();
+        if ((progressNow - g_follow.endpointRecoveryStartedMs) >= 15000u) {
+            followerTerminalFault("waypoint_missed");
+            return;
+        }
+        const bool distanceImproved =
+            distToB <= g_follow.endpointBestDistanceM - 0.025f;
+        const bool crossImproved =
+            absCrossForRecovery <= g_follow.endpointBestCrossM - 0.025f;
+        if (distanceImproved || crossImproved) {
+            g_follow.endpointBestDistanceM =
+                fminf(g_follow.endpointBestDistanceM, distToB);
+            g_follow.endpointBestCrossM =
+                fminf(g_follow.endpointBestCrossM, absCrossForRecovery);
+            g_follow.endpointProgressSinceMs = progressNow;
+        } else if ((progressNow - g_follow.endpointProgressSinceMs) >= 3000u) {
+            if (++g_follow.endpointRecoveryAttempt > 3) {
+                followerTerminalFault("recovery_not_converging");
+                return;
+            }
+            g_follow.endpointProgressSinceMs = progressNow;
+            Serial.printf("[ENDPOINT_RECOVERY] retry=%u dist=%.3f bestDist=%.3f "
+                          "cross=%.3f bestCross=%.3f\n",
+                          (unsigned)g_follow.endpointRecoveryAttempt,
+                          (double)distToB,
+                          (double)g_follow.endpointBestDistanceM,
+                          (double)absCrossForRecovery,
+                          (double)g_follow.endpointBestCrossM);
+        }
+    }
+    float requestedSteeringHeading = desiredHeading;
+    float interceptHeading = desiredHeading;
+    if (g_follow.recoveryActive) {
+        const float interceptDeg = clampf(
+            atanf(cross / 0.60f) * 180.0f / (float)M_PI,
+            -35.0f, 35.0f);
+        interceptHeading = NavMath::normalizeDeg360(
+            desiredHeading + interceptDeg);
+        requestedSteeringHeading = interceptHeading;
+    }
+    if (g_follow.endpointRecoveryActive)
+        requestedSteeringHeading = bearingToWaypoint;
+
+    const uint32_t steeringNow = millis();
+    if (g_follow.steeringTargetMs == 0) {
+        g_follow.steeringTargetDeg = requestedSteeringHeading;
+    } else {
+        const float dt = clampf((steeringNow - g_follow.steeringTargetMs) * 0.001f,
+                                0.0f, 0.20f);
+        const float maxStep = 60.0f * dt;
+        const float step = clampf(wrapDeg180Local(
+            requestedSteeringHeading - g_follow.steeringTargetDeg),
+            -maxStep, maxStep);
+        g_follow.steeringTargetDeg = NavMath::normalizeDeg360(
+            g_follow.steeringTargetDeg + step);
+    }
+    g_follow.steeringTargetMs = steeringNow;
+    const float headingErr = wrapDeg180Local(
+        g_follow.steeringTargetDeg - e.headingFiltDeg);
     const float absErr = fabsf(headingErr);
-    g_follow.targetHeadingDeg = desiredHeading;
+    g_follow.lineHeadingDeg = desiredHeading;
+    g_follow.lineHeadingErrDeg = wrapDeg180Local(
+        desiredHeading - e.headingFiltDeg);
+    g_follow.bearingToTargetDeg = bearingToWaypoint;
+    g_follow.interceptHeadingDeg = interceptHeading;
+    g_follow.steeringErrorDeg = headingErr;
+    g_follow.controllerMode = g_follow.endpointRecoveryActive
+        ? FollowerControllerMode::ENDPOINT_RECOVERY
+        : (g_follow.recoveryActive ? FollowerControllerMode::LINE_RECOVERY
+                                   : FollowerControllerMode::STANLEY);
+    g_follow.targetHeadingDeg = g_follow.steeringTargetDeg;
     g_follow.headingErr = headingErr;
 
     // Целевая точка на сегменте: проекция текущей позиции + lookahead.
@@ -934,12 +1648,165 @@ static void stepFollower() {
     float linear = 0.0f;
     float angular = 0.0f;
 
+    const uint32_t turnNow = millis();
+    const float absYawRateForTurn = fabsf(g_imu.yawRateDps());
+    auto enterFollowerBrake = [&](int pendingDirection) {
+        g_motor.stopImmediately();
+        g_follow.pendingTurnDirection = pendingDirection;
+        g_follow.turnState = FollowerTurnState::BRAKE;
+        g_follow.turnStateSinceMs = turnNow;
+        g_follow.turnStableSinceMs = 0;
+        g_follow.turnStopX = e.x;
+        g_follow.turnStopY = e.y;
+        g_follow.turnInPlaceActive = true;
+    };
+
+    if (g_follow.turnState == FollowerTurnState::IDLE &&
+        absErr > ROVER_V2_TURN_IN_PLACE_DEG) {
+        g_follow.turnState = FollowerTurnState::ENTER;
+        g_follow.turnTargetDeg = g_follow.steeringTargetDeg;
+        g_follow.turnStateSinceMs = turnNow;
+        g_follow.turnAttempts = 0;
+        g_follow.turnInPlaceActive = true;
+    }
+
+    switch (g_follow.turnState) {
+        case FollowerTurnState::ENTER:
+            enterFollowerBrake(headingErr >= 0.0f ? 1 : -1);
+            break;
+        case FollowerTurnState::BRAKE:
+            g_motor.stopImmediately();
+            g_follow.turnState = FollowerTurnState::WAIT_STOP;
+            g_follow.turnStateSinceMs = turnNow;
+            break;
+        case FollowerTurnState::WAIT_STOP: {
+            g_motor.stopImmediately();
+            const float stopDx = e.x - g_follow.turnStopX;
+            const float stopDy = e.y - g_follow.turnStopY;
+            const bool stopped = g_motor.currentLeftPwm() == 0 &&
+                g_motor.currentRightPwm() == 0 &&
+                g_motor.feedbackAgeMs(turnNow) <= 200u &&
+                abs(g_motor.speedLeftMeas()) <= 3 &&
+                abs(g_motor.speedRightMeas()) <= 3 &&
+                g_imu.fresh() && g_imu.ageMs(turnNow) <= 200u &&
+                e.pvtAgeMs <= 500u &&
+                absYawRateForTurn <= ROVER_TURN_SETTLE_RATE_DPS &&
+                sqrtf(stopDx * stopDx + stopDy * stopDy) <= 0.040f;
+            if (!stopped) {
+                g_follow.turnStableSinceMs = 0;
+                g_follow.turnStopX = e.x;
+                g_follow.turnStopY = e.y;
+            } else if (g_follow.turnStableSinceMs == 0) {
+                g_follow.turnStableSinceMs = turnNow;
+            }
+            if ((turnNow - g_follow.turnStateSinceMs) > 5000u) {
+                followerTerminalFault("turn_physical_stop_timeout");
+                return;
+            }
+            if (g_follow.turnStableSinceMs != 0 &&
+                (turnNow - g_follow.turnStableSinceMs) >= 550u) {
+                if (g_follow.pendingTurnDirection == 0) {
+                    g_follow.turnState = FollowerTurnState::STABLE;
+                    g_follow.turnStableSinceMs = turnNow;
+                } else {
+                    if (++g_follow.turnAttempts > 3) {
+                        followerTerminalFault("turn_not_converging");
+                        return;
+                    }
+                    g_follow.turnDirection = g_follow.pendingTurnDirection;
+                    g_follow.pendingTurnDirection = 0;
+                    g_follow.turnState = FollowerTurnState::TURN;
+                    g_follow.turnStateSinceMs = turnNow;
+                    g_follow.turnWatchSinceMs = turnNow;
+                    g_follow.turnWatchHeadingDeg = e.headingFiltDeg;
+                    g_follow.turnWatchAbsErrorDeg = absErr;
+                }
+            }
+            break;
+        }
+        case FollowerTurnState::TURN: {
+            const int requestedDirection = headingErr >= 0.0f ? 1 : -1;
+            if (absErr <= ROVER_TURN_EXIT_DEG) {
+                enterFollowerBrake(0);
+                break;
+            }
+            if (requestedDirection != g_follow.turnDirection) {
+                enterFollowerBrake(requestedDirection);
+                break;
+            }
+            float mag = clampf(fabsf(ROVER_TURN_KP * headingErr),
+                               ROVER_TURN_MIN_RADPS, ROVER_V2_TURN_RADPS);
+            if (absErr < 15.0f)
+                mag = fmaxf(0.0f, mag - 0.012f * absYawRateForTurn);
+            angular = (float)g_follow.turnDirection * mag;
+            linear = 0.0f;
+            if ((turnNow - g_follow.turnWatchSinceMs) >
+                ROVER_V2_TURN_WATCHDOG_MS) {
+                const float signedDelta = wrapDeg180Local(
+                    e.headingFiltDeg - g_follow.turnWatchHeadingDeg);
+                const bool directionOk = signedDelta * g_follow.turnDirection >=
+                    ROVER_V2_TURN_MIN_DELTA_DEG;
+                const bool errorImproved = absErr <=
+                    g_follow.turnWatchAbsErrorDeg -
+                    ROVER_V2_TURN_MIN_ERROR_IMPROVE_DEG;
+                if (!directionOk || !errorImproved) {
+                    if (g_follow.turnAttempts >= 3) {
+                        followerTerminalFault(!directionOk
+                            ? "turn_wrong_direction_or_stuck"
+                            : "turn_not_converging");
+                        return;
+                    }
+                    enterFollowerBrake(requestedDirection);
+                    break;
+                }
+                g_follow.turnWatchHeadingDeg = e.headingFiltDeg;
+                g_follow.turnWatchAbsErrorDeg = absErr;
+                g_follow.turnWatchSinceMs = turnNow;
+            }
+            break;
+        }
+        case FollowerTurnState::STABLE:
+            g_motor.stopImmediately();
+            if (absErr > ROVER_TURN_EXIT_DEG + 2.0f) {
+                enterFollowerBrake(headingErr >= 0.0f ? 1 : -1);
+            } else if (absYawRateForTurn > ROVER_TURN_SETTLE_RATE_DPS ||
+                       abs(g_motor.speedLeftMeas()) > 3 ||
+                       abs(g_motor.speedRightMeas()) > 3) {
+                g_follow.turnStableSinceMs = 0;
+            } else {
+                if (g_follow.turnStableSinceMs == 0)
+                    g_follow.turnStableSinceMs = turnNow;
+                if ((turnNow - g_follow.turnStableSinceMs) >= 600u)
+                    g_follow.turnState = FollowerTurnState::EXIT;
+            }
+            break;
+        case FollowerTurnState::EXIT:
+            g_follow.turnState = FollowerTurnState::IDLE;
+            g_follow.turnInPlaceActive = false;
+            g_follow.turnAttempts = 0;
+            break;
+        case FollowerTurnState::FAULT:
+            followerTerminalFault("turn_not_converging");
+            return;
+        case FollowerTurnState::IDLE:
+        default:
+            g_follow.turnInPlaceActive = false;
+            break;
+    }
+    if (g_follow.turnInPlaceActive) {
+        g_follow.controllerMode = FollowerControllerMode::TURN_IN_PLACE;
+        g_follow.turnTargetDeg = g_follow.steeringTargetDeg;
+    } else {
+        g_follow.turnTargetDeg = NAN;
+    }
+
     // === Turn-in-place: гистерезис входа/выхода + P-профиль + settle по yawRate ===
     // Раньше: bang-bang фиксированная omega=0.95 → перелёт 30°+ и осцилляции.
     // Теперь: P-профиль clamp(KP*err, minW, maxW) со знаком, выход только когда
     // ошибка < EXIT_DEG И |yawRate| < SETTLE_RATE_DPS.
     // Флаг состояния теперь живёт в g_follow (а не file-static), и сбрасывается
     // в g_follow.reset() — иначе между сессиями он мог застрять в true.
+    #if 0
     const float absYawRate = fabsf(g_imu.yawRateDps());
 
     auto exitTurnInPlace = [&]() {
@@ -993,12 +1860,13 @@ static void stepFollower() {
         }
     }
 
+    #endif
     if (!g_follow.turnInPlaceActive) {
         // === Drive-on-line (Stanley) ===
         // Если headingErr большой (но < V2_TURN_IN_PLACE_DEG), притормаживаем.
         const float headingRad = headingErr * (float)M_PI / 180.0f;
         const float speedBase = (g_safety.level() == SAFETY_DEGRADED)
-                                ? ROVER_FLOAT_SPEED : g_forwardSpeedMps;
+                                ? ROVER_DEGRADED_SPEED : g_forwardSpeedMps;
         // linear снижается по закону 1 - errNorm^2, где errNorm = absErr/45°.
         const float errNorm = absErr / 45.0f;
         const float slowFactor = (errNorm >= 1.0f) ? 0.0f
@@ -1030,14 +1898,23 @@ static void stepFollower() {
 
         // Stanley: heading gain + atan(k_ct * cross / (k_soft + |v|))
         // + демпфирование по yawRate (rad/s).
+        // Imu::yawRateDps() is already expressed in the navigation convention
+        // (clockwise-positive).  Applying IMU_YAW_RATE_SIGN again inverted the
+        // damping response a second time.
         const float yawRateRadps =
-            g_imu.yawRateDps() * (float)M_PI / 180.0f *
-            (IMU_YAW_RATE_SIGN == 0 ? 1 : (IMU_YAW_RATE_SIGN > 0 ? 1.0f : -1.0f));
+            g_imu.yawRateDps() * (float)M_PI / 180.0f;
         const float v = linear;
         const float crossTerm = atanf(ROVER_K_CROSSTRACK * cross /
                                        (ROVER_STANLEY_SOFT_SPEED + fabsf(v)));
-        angular = ROVER_K_HEADING * headingRad + crossTerm
-                  - ROVER_K_D_YAWRATE * yawRateRadps;
+        if (g_follow.recoveryActive) {
+            linear = fminf(linear,
+                           g_follow.endpointRecoveryActive ? 0.04f : 0.07f);
+            angular = ROVER_K_HEADING * headingRad
+                      - ROVER_K_D_YAWRATE * yawRateRadps;
+        } else {
+            angular = ROVER_K_HEADING * headingRad + crossTerm
+                      - ROVER_K_D_YAWRATE * yawRateRadps;
+        }
         const float angClamp = ROVER_V2_MAX_CORRECTION_RADPS;
         if (angular >  angClamp) angular =  angClamp;
         if (angular < -angClamp) angular = -angClamp;
@@ -1101,10 +1978,13 @@ static void stepFollower() {
                                  ROVER_V2_MAX_CORRECTION_RADPS);
             }
         }
+        if (g_follow.endpointRecoveryActive && linear > 0.04f)
+            linear = 0.04f;
         g_follow.speedBlockedReason = nullptr;
         g_follow.linearMps = linear;
         g_follow.angularRadps = angular;
         g_motor.setLinearAngularSpeed(linear, angular, true);
+        logSteerResponseOnNewPvt(e, millis());
     } else {
         // Раньше это был silent zero — сейчас фиксируем конкретную причину
         // и логируем не чаще раза в 500мс, чтобы не флудить Serial.
@@ -1144,6 +2024,606 @@ static void stepFollower() {
         }
     }
 }
+#endif
+
+static FollowerControllerMode executorControllerMode(
+    routeexec::ExecutorState state) {
+    switch (state) {
+        case routeexec::ExecutorState::INTERCEPT_NEXT_LINE:
+            return FollowerControllerMode::LINE_RECOVERY;
+        case routeexec::ExecutorState::RECOVERY_PLAN:
+        case routeexec::ExecutorState::RECOVERY_REVERSE:
+        case routeexec::ExecutorState::RECOVERY_TURN:
+        case routeexec::ExecutorState::RECOVERY_APPROACH:
+        case routeexec::ExecutorState::RECOVERY_EVALUATE:
+            return FollowerControllerMode::ENDPOINT_RECOVERY;
+        case routeexec::ExecutorState::TURN_TO_NEXT:
+        case routeexec::ExecutorState::CORNER_MISSED_INTERCEPT:
+            return FollowerControllerMode::TURN_IN_PLACE;
+        default:
+            return FollowerControllerMode::STANLEY;
+    }
+}
+
+static FollowerTurnState executorTurnState(routeexec::ExecutorState state) {
+    switch (state) {
+        case routeexec::ExecutorState::TURN_TO_NEXT:
+        case routeexec::ExecutorState::CORNER_MISSED_INTERCEPT:
+        case routeexec::ExecutorState::RECOVERY_TURN:
+            return FollowerTurnState::TURN;
+        case routeexec::ExecutorState::BRAKE:
+        case routeexec::ExecutorState::FINAL_STOP:
+            return FollowerTurnState::BRAKE;
+        case routeexec::ExecutorState::WAIT_PHYSICAL_STOP:
+            return FollowerTurnState::WAIT_STOP;
+        case routeexec::ExecutorState::HEADING_STABLE:
+            return FollowerTurnState::STABLE;
+        case routeexec::ExecutorState::FAULT:
+            return FollowerTurnState::FAULT;
+        default:
+            return FollowerTurnState::IDLE;
+    }
+}
+
+static void updateRouteObserverOnNewPvt(
+    const routeexec::RouteExecutorOutput& out,
+    const Estimate& e) {
+    if (g_estimatorPvtId == 0 ||
+        g_estimatorPvtId == g_routeObserver.lastPvtId) {
+        g_routeObserver.lastState = out.state;
+        return;
+    }
+    g_routeObserver.lastPvtId = g_estimatorPvtId;
+
+    const bool drivePhase =
+        out.state == routeexec::ExecutorState::FOLLOW_SEGMENT ||
+        out.state == routeexec::ExecutorState::APPROACH_TRANSITION ||
+        out.state == routeexec::ExecutorState::INTERCEPT_NEXT_LINE ||
+        out.state == routeexec::ExecutorState::TERMINAL_APPROACH ||
+        out.state == routeexec::ExecutorState::RECOVERY_APPROACH;
+    const bool preDrivePhase =
+        out.state == routeexec::ExecutorState::VALIDATE_ROUTE ||
+        out.state == routeexec::ExecutorState::ACQUIRE_SEGMENT;
+    const bool previousDrivePhase =
+        g_routeObserver.lastState ==
+            routeexec::ExecutorState::FOLLOW_SEGMENT ||
+        g_routeObserver.lastState ==
+            routeexec::ExecutorState::APPROACH_TRANSITION ||
+        g_routeObserver.lastState ==
+            routeexec::ExecutorState::INTERCEPT_NEXT_LINE ||
+        g_routeObserver.lastState ==
+            routeexec::ExecutorState::TERMINAL_APPROACH ||
+        g_routeObserver.lastState ==
+            routeexec::ExecutorState::RECOVERY_APPROACH;
+    const bool previousBrakeCoastPhase =
+        g_routeObserver.lastState == routeexec::ExecutorState::BRAKE ||
+        g_routeObserver.lastState == routeexec::ExecutorState::FINAL_STOP ||
+        g_routeObserver.lastState ==
+            routeexec::ExecutorState::WAIT_PHYSICAL_STOP;
+
+    // Attribute every PVT-to-PVT interval to the phase which owned the motors
+    // before this sample.  The first sample which triggers BRAKE therefore
+    // remains powered drive; later displacement at zero command is explicit
+    // brake/coast distance.  A closed segment rejects turn displacement.
+    const routediag::PathIntervalKind intervalKind = previousDrivePhase
+        ? routediag::PathIntervalKind::POWERED_DRIVE
+        : (previousBrakeCoastPhase
+               ? routediag::PathIntervalKind::BRAKE_COAST
+               : routediag::PathIntervalKind::NONE);
+    const float step = g_routeObserver.segmentMetrics.observePvt(
+        e.x, e.y, intervalKind);
+    g_routeObserver.segmentPathLen =
+        g_routeObserver.segmentMetrics.totalTranslationalPathM();
+    if (intervalKind != routediag::PathIntervalKind::NONE && step > 0.0f) {
+        if (g_ltest.active) {
+            const int segment = g_routeObserver.lastSegment;
+            if (segment >= 0 && segment < 2) {
+                routediag::SegmentPathMetrics& metrics =
+                    g_ltest.segmentMetrics[segment];
+                if (!metrics.segmentStart.valid) {
+                    metrics.reset(g_routeObserver.segmentDriveStartX,
+                                  g_routeObserver.segmentDriveStartY,
+                                  e.headingFiltDeg);
+                }
+                metrics.observePvt(e.x, e.y, intervalKind);
+                g_ltest.pathLen1 =
+                    g_ltest.segmentMetrics[0].totalTranslationalPathM();
+                g_ltest.pathLen2 =
+                    g_ltest.segmentMetrics[1].totalTranslationalPathM();
+                g_ltest.pathLen = g_ltest.pathLen1 + g_ltest.pathLen2;
+            }
+        }
+        if (g_sqtest.active) {
+            g_sqtest.pathLen += step;
+            g_sqtest.currentSegmentPathLen += step;
+        }
+    }
+
+    if ((int)out.segmentIndex != g_routeObserver.lastSegment) {
+        if (g_sqtest.active && g_routeObserver.lastSegment >= 0 &&
+            g_routeObserver.lastSegment < 4) {
+            g_sqtest.segPathLen[g_routeObserver.lastSegment] =
+                g_routeObserver.segmentPathLen;
+            g_sqtest.segMaxCross[g_routeObserver.lastSegment] =
+                g_routeObserver.segmentMaxCross;
+        }
+        g_routeObserver.lastSegment = (int)out.segmentIndex;
+        g_routeObserver.previousPvtValid = drivePhase;
+        g_routeObserver.previousPvtX = e.x;
+        g_routeObserver.previousPvtY = e.y;
+        g_routeObserver.segmentPathLen = 0.0f;
+        g_routeObserver.segmentMaxCross =
+            drivePhase ? fabsf(out.crossTrackM) : 0.0f;
+        g_routeObserver.segmentDriveStartX = e.x;
+        g_routeObserver.segmentDriveStartY = e.y;
+        g_routeObserver.segmentMetrics.reset(e.x, e.y,
+                                             e.headingFiltDeg);
+        if (g_sqtest.active) {
+            g_sqtest.currentSegmentPathLen = 0.0f;
+            g_sqtest.currentSegmentMaxCross =
+                drivePhase ? fabsf(out.crossTrackM) : 0.0f;
+        }
+    } else if (drivePhase) {
+        g_routeObserver.previousPvtValid = true;
+        g_routeObserver.previousPvtX = e.x;
+        g_routeObserver.previousPvtY = e.y;
+    } else if (!drivePhase && !preDrivePhase) {
+        // TURN/STOP motion is deliberately excluded from straight pathLen.
+        g_routeObserver.previousPvtValid = false;
+    }
+    g_routeObserver.lastState = out.state;
+
+    if (drivePhase) {
+        const float absCross = fabsf(out.crossTrackM);
+        if (absCross > g_routeObserver.segmentMaxCross)
+            g_routeObserver.segmentMaxCross = absCross;
+        if (g_ltest.active) {
+            if (out.segmentIndex == 0u && absCross > g_ltest.maxCross1)
+                g_ltest.maxCross1 = absCross;
+            if (out.segmentIndex == 1u && absCross > g_ltest.maxCross2)
+                g_ltest.maxCross2 = absCross;
+        }
+        if (g_sqtest.active) {
+            if (absCross > g_sqtest.currentSegmentMaxCross)
+                g_sqtest.currentSegmentMaxCross = absCross;
+            if (absCross > g_sqtest.maxCross) g_sqtest.maxCross = absCross;
+        }
+    }
+}
+
+static void logRouteTransition(const routeexec::RouteExecutorOutput& out,
+                               const Estimate& e, uint32_t now) {
+    const bool driveState =
+        out.state == routeexec::ExecutorState::FOLLOW_SEGMENT ||
+        out.state == routeexec::ExecutorState::INTERCEPT_NEXT_LINE ||
+        out.state == routeexec::ExecutorState::TERMINAL_APPROACH;
+    const bool segmentChanged = driveState &&
+        (int)out.segmentIndex != g_routeObserver.lastLoggedSegment;
+    if (!out.stateChanged && !segmentChanged && !out.workActionPending) return;
+    const bool enteredSegmentStop =
+        out.state == routeexec::ExecutorState::BRAKE ||
+        out.state == routeexec::ExecutorState::FINAL_STOP ||
+        (out.state == routeexec::ExecutorState::WAIT_PHYSICAL_STOP &&
+         out.oldState == routeexec::ExecutorState::FINAL_STOP);
+    const bool oldStateWasTranslational =
+        out.oldState == routeexec::ExecutorState::FOLLOW_SEGMENT ||
+        out.oldState == routeexec::ExecutorState::APPROACH_TRANSITION ||
+        out.oldState == routeexec::ExecutorState::INTERCEPT_NEXT_LINE ||
+        out.oldState == routeexec::ExecutorState::TERMINAL_APPROACH ||
+        out.oldState == routeexec::ExecutorState::RECOVERY_APPROACH;
+    const bool plannedCornerLifecycle =
+        out.transitionPurpose ==
+            routeexec::RouteTransitionPurpose::PLANNED_CORNER;
+    const bool finalArrivalLifecycle =
+        out.transitionPurpose ==
+            routeexec::RouteTransitionPurpose::FINAL_ARRIVAL;
+    if (out.stateChanged) {
+        Serial.printf("[ROUTE_STATE] routeId=%u old=%s new=%s segment=%u "
+                      "along=%.3f cross=%+.3f dist=%.3f\n",
+                      (unsigned)out.routeId,
+                      routeexec::executorStateName(out.oldState),
+                      routeexec::executorStateName(out.state),
+                      (unsigned)out.segmentIndex,
+                      (double)out.alongTrackM, (double)out.crossTrackM,
+                      (double)out.distanceToWaypointM);
+    }
+
+    if (segmentChanged) {
+        if (g_routeObserver.lastLoggedSegment >= 0) {
+            Serial.printf("[SEGMENT_COMPLETE] routeId=%u segment=%d\n",
+                          (unsigned)out.routeId,
+                          g_routeObserver.lastLoggedSegment);
+        }
+        Serial.printf("[SEGMENT_START] routeId=%u segment=%u "
+                      "A=(%.3f,%.3f) B=(%.3f,%.3f) heading=%.1f "
+                      "mode=%s\n",
+                      (unsigned)out.routeId, (unsigned)out.segmentIndex,
+                      (double)out.plannedStart.x,
+                      (double)out.plannedStart.y,
+                      (double)out.plannedEnd.x,
+                      (double)out.plannedEnd.y,
+                      (double)out.plannedHeadingDeg,
+                      routeexec::executorStateName(out.state));
+        g_routeObserver.lastLoggedSegment = (int)out.segmentIndex;
+    }
+    if (enteredSegmentStop) {
+        Serial.printf("[TRANSITION] segment=%u waypointType=%s "
+                      "state=%s dist=%.3f cross=%+.3f\n",
+                      (unsigned)out.segmentIndex,
+                      routeexec::waypointTypeName(out.waypointType),
+                      routeexec::executorStateName(out.state),
+                      (double)out.distanceToWaypointM,
+                      (double)out.crossTrackM);
+        if (g_sqtest.active && out.segmentIndex < 4u) {
+            g_sqtest.segPathLen[out.segmentIndex] =
+                g_routeObserver.segmentPathLen;
+            g_sqtest.segMaxCross[out.segmentIndex] =
+                g_routeObserver.segmentMaxCross;
+        }
+    }
+
+    // Planned-corner diagnostics are purpose-gated.  A steering re-acquire or
+    // CORNER_MISSED_INTERCEPT may use the same BRAKE/WAIT machinery, but it
+    // must never overwrite the one real planned-corner observation.
+    if (out.stateChanged && oldStateWasTranslational &&
+        out.state == routeexec::ExecutorState::BRAKE &&
+        plannedCornerLifecycle) {
+        routediag::captureOnce(
+            g_routeObserver.cornerSnapshots.cornerApproachBrakeStart,
+            e.x, e.y, e.headingFiltDeg);
+        g_routeObserver.segmentMetrics.captureBrake(
+            e.x, e.y, e.headingFiltDeg, out.alongTrackM, out.crossTrackM);
+        if (g_ltest.active && out.segmentIndex == 0u) {
+            routediag::captureOnce(
+                g_ltest.cornerSnapshots.cornerApproachBrakeStart,
+                e.x, e.y, e.headingFiltDeg);
+            if (!g_ltest.segmentMetrics[0].segmentStart.valid) {
+                g_ltest.segmentMetrics[0].reset(
+                    g_ltest.startX, g_ltest.startY, g_ltest.headingStart);
+            }
+            g_ltest.segmentMetrics[0].captureBrake(
+                e.x, e.y, e.headingFiltDeg,
+                out.alongTrackM, out.crossTrackM);
+            g_ltest.segment1DriveEndX = e.x;
+            g_ltest.segment1DriveEndY = e.y;
+        }
+    }
+
+    if (out.stateChanged && plannedCornerLifecycle &&
+        out.state == routeexec::ExecutorState::TURN_TO_NEXT) {
+        const bool firstTurnStart = routediag::captureOnce(
+            g_routeObserver.cornerSnapshots.turnStart,
+            e.x, e.y, e.headingFiltDeg);
+        if (firstTurnStart) {
+            routediag::captureOnce(
+                g_routeObserver.cornerSnapshots.cornerPhysicalStopBeforeTurn,
+                e.x, e.y, e.headingFiltDeg);
+            g_routeObserver.segmentMetrics.capturePhysicalStop(
+                e.x, e.y, e.headingFiltDeg,
+                out.alongTrackM, out.crossTrackM);
+            const float actualStopChord = g_routeObserver.segmentMetrics
+                .plannedStartToActualStopChordM();
+            if (!g_routeObserver.segmentMetrics
+                     .totalPathCoversActualStopChord()) {
+                Serial.printf(
+                    "[PATH_WARN] total_path_shorter_than_actual_stop_chord "
+                    "routeId=%u seg=%u powered=%.3f brakeCoast=%.3f "
+                    "total=%.3f actualStopChord=%.3f\n",
+                    (unsigned)out.routeId, (unsigned)out.segmentIndex,
+                    (double)g_routeObserver.segmentMetrics.poweredDrivePathM,
+                    (double)g_routeObserver.segmentMetrics.brakeCoastPathM,
+                    (double)g_routeObserver.segmentMetrics
+                        .totalTranslationalPathM(),
+                    (double)actualStopChord);
+            }
+        }
+        if (g_ltest.active && out.segmentIndex == 0u) {
+            const bool firstLtestTurnStart = routediag::captureOnce(
+                g_ltest.cornerSnapshots.turnStart,
+                e.x, e.y, e.headingFiltDeg);
+            if (firstLtestTurnStart) {
+                routediag::captureOnce(
+                    g_ltest.cornerSnapshots.cornerPhysicalStopBeforeTurn,
+                    e.x, e.y, e.headingFiltDeg);
+                g_ltest.segmentMetrics[0].capturePhysicalStop(
+                    e.x, e.y, e.headingFiltDeg,
+                    out.alongTrackM, out.crossTrackM);
+                g_ltest.segment1PhysicalStopX = e.x;
+                g_ltest.segment1PhysicalStopY = e.y;
+                g_ltest.headingBeforeCorner = e.headingFiltDeg;
+                g_ltest.pathLen1 =
+                    g_ltest.segmentMetrics[0].totalTranslationalPathM();
+            }
+        }
+    }
+
+    if (out.stateChanged && plannedCornerLifecycle &&
+        out.state == routeexec::ExecutorState::INTERCEPT_NEXT_LINE) {
+        const bool firstTurnStop = routediag::captureOnce(
+            g_routeObserver.cornerSnapshots.turnPhysicalStop,
+            e.x, e.y, e.headingFiltDeg);
+        routediag::captureOnce(
+            g_routeObserver.cornerSnapshots.nextSegmentInterceptStart,
+            e.x, e.y, e.headingFiltDeg);
+        if (firstTurnStop) {
+            const routediag::CornerSnapshots& corner =
+                g_routeObserver.cornerSnapshots;
+            const float dx = corner.turnPhysicalStop.x - corner.turnStart.x;
+            const float dy = corner.turnPhysicalStop.y - corner.turnStart.y;
+            Serial.printf("[TURN_GEOM] corner=%u,start=(%.3f,%.3f),"
+                          "end=(%.3f,%.3f),dx=%+.3f,dy=%+.3f,"
+                          "positionChord=%.3f,bodyForwardShift=%+.3f,"
+                          "bodyLeftShift=%+.3f,headingDelta=%+.1f,"
+                          "equivalentRadius=%.3f\n",
+                          (unsigned)out.segmentIndex,
+                          (double)corner.turnStart.x,
+                          (double)corner.turnStart.y,
+                          (double)corner.turnPhysicalStop.x,
+                          (double)corner.turnPhysicalStop.y,
+                          (double)dx, (double)dy,
+                          (double)corner.turnPositionChordM(),
+                          (double)corner.turnBodyForwardShiftM(),
+                          (double)corner.turnBodyLeftShiftM(),
+                          (double)corner.turnActualDeg(),
+                          (double)corner.equivalentRadiusM());
+        }
+        if (g_ltest.active && out.segmentIndex == 1u) {
+            routediag::captureOnce(
+                g_ltest.cornerSnapshots.turnPhysicalStop,
+                e.x, e.y, e.headingFiltDeg);
+            routediag::captureOnce(
+                g_ltest.cornerSnapshots.nextSegmentInterceptStart,
+                e.x, e.y, e.headingFiltDeg);
+            g_ltest.cornerAfterTurnX = e.x;
+            g_ltest.cornerAfterTurnY = e.y;
+            g_ltest.wp1X = e.x;
+            g_ltest.wp1Y = e.y;
+            g_ltest.headingWp1 = e.headingFiltDeg;
+            g_ltest.headingAfterCorner = e.headingFiltDeg;
+        }
+        if (g_sqtest.active && out.segmentIndex > 0u &&
+            out.segmentIndex < 4u) {
+            const size_t completedSegment = out.segmentIndex - 1u;
+            const float headingDelta =
+                g_routeObserver.cornerSnapshots.turnActualDeg();
+            const float plannedTurn = routeexec::wrapHeadingErrorDeg(
+                g_routeExecutor.plan().segment(out.segmentIndex)
+                    .plannedHeadingDeg -
+                g_routeExecutor.plan().segment(completedSegment)
+                    .plannedHeadingDeg);
+            g_sqtest.segTurnErr[completedSegment] =
+                routeexec::wrapHeadingErrorDeg(headingDelta - plannedTurn);
+            g_sqtest.cornerErr[completedSegment] = lshapeDist2d(
+                e.x, e.y, g_sqtest.pX[out.segmentIndex],
+                g_sqtest.pY[out.segmentIndex]);
+            // A square has another planned corner later; start a fresh
+            // one-shot set only after this completed turn was recorded.
+            g_routeObserver.cornerSnapshots.reset();
+        }
+    }
+
+    if (out.stateChanged && finalArrivalLifecycle &&
+        out.state == routeexec::ExecutorState::FINAL_STOP) {
+        g_routeObserver.segmentMetrics.captureBrake(
+            e.x, e.y, e.headingFiltDeg, out.alongTrackM, out.crossTrackM);
+        if (g_ltest.active && out.segmentIndex < 2u) {
+            routediag::SegmentPathMetrics& metrics =
+                g_ltest.segmentMetrics[out.segmentIndex];
+            if (!metrics.segmentStart.valid) {
+                metrics.reset(g_routeObserver.segmentDriveStartX,
+                              g_routeObserver.segmentDriveStartY,
+                              e.headingFiltDeg);
+            }
+            metrics.captureBrake(e.x, e.y, e.headingFiltDeg,
+                                 out.alongTrackM, out.crossTrackM);
+        }
+    }
+
+    if (out.stateChanged && finalArrivalLifecycle &&
+        out.state == routeexec::ExecutorState::COMPLETE) {
+        g_routeObserver.segmentMetrics.capturePhysicalStop(
+            e.x, e.y, e.headingFiltDeg, out.alongTrackM, out.crossTrackM);
+        const float actualStopChord =
+            g_routeObserver.segmentMetrics.plannedStartToActualStopChordM();
+        if (!g_routeObserver.segmentMetrics.totalPathCoversActualStopChord()) {
+            Serial.printf("[PATH_WARN] total_path_shorter_than_actual_stop_chord "
+                          "routeId=%u seg=%u powered=%.3f brakeCoast=%.3f "
+                          "total=%.3f actualStopChord=%.3f\n",
+                          (unsigned)out.routeId, (unsigned)out.segmentIndex,
+                          (double)g_routeObserver.segmentMetrics.poweredDrivePathM,
+                          (double)g_routeObserver.segmentMetrics.brakeCoastPathM,
+                          (double)g_routeObserver.segmentMetrics
+                              .totalTranslationalPathM(),
+                          (double)actualStopChord);
+        }
+        if (g_ltest.active && out.segmentIndex < 2u) {
+            routediag::SegmentPathMetrics& metrics =
+                g_ltest.segmentMetrics[out.segmentIndex];
+            metrics.capturePhysicalStop(e.x, e.y, e.headingFiltDeg,
+                                        out.alongTrackM, out.crossTrackM);
+            g_ltest.pathLen1 =
+                g_ltest.segmentMetrics[0].totalTranslationalPathM();
+            g_ltest.pathLen2 =
+                g_ltest.segmentMetrics[1].totalTranslationalPathM();
+            g_ltest.pathLen = g_ltest.pathLen1 + g_ltest.pathLen2;
+        }
+    }
+    if (out.state == routeexec::ExecutorState::INTERCEPT_NEXT_LINE) {
+        Serial.printf("[INTERCEPT] segment=%u target=(%.3f,%.3f) "
+                      "cross=%+.3f steering=%.1f\n",
+                      (unsigned)out.segmentIndex,
+                      (double)out.interceptTarget.x,
+                      (double)out.interceptTarget.y,
+                      (double)out.crossTrackM,
+                      (double)out.steeringTargetDeg);
+    }
+    if (out.state == routeexec::ExecutorState::TERMINAL_APPROACH) {
+        Serial.printf("[TERMINAL_APPROACH] segment=%u dist=%.3f "
+                      "cross=%+.3f\n",
+                      (unsigned)out.segmentIndex,
+                      (double)out.distanceToWaypointM,
+                      (double)out.crossTrackM);
+    }
+    if (out.state == routeexec::ExecutorState::RECOVERY_PLAN) {
+        Serial.printf("[RECOVERY_PLAN] segment=%u attempt=%u "
+                      "bearing=%.1f target=(%.3f,%.3f)\n",
+                      (unsigned)out.segmentIndex,
+                      (unsigned)out.recoveryAttempt,
+                      (double)out.computedRecoveryBearingDeg,
+                      (double)out.recoveryGoal.x,
+                      (double)out.recoveryGoal.y);
+    }
+    if (out.state == routeexec::ExecutorState::RECOVERY_TURN) {
+        Serial.printf("[RECOVERY_ATTEMPT] segment=%u attempt=%u "
+                      "latchedTurnTarget=%.1f\n",
+                      (unsigned)out.segmentIndex,
+                      (unsigned)out.recoveryAttempt,
+                      (double)out.latchedTurnTargetDeg);
+    }
+    if (out.state == routeexec::ExecutorState::RECOVERY_EVALUATE) {
+        Serial.printf("[RECOVERY_RESULT] segment=%u attempt=%u "
+                      "dist=%.3f cross=%+.3f\n",
+                      (unsigned)out.segmentIndex,
+                      (unsigned)out.recoveryAttempt,
+                      (double)out.distanceToWaypointM,
+                      (double)out.crossTrackM);
+    }
+    if (out.workActionPending) {
+        Serial.printf("[TRANSITION] routeId=%u segment=%u "
+                      "workActionPoint=%u workActionPending=1\n",
+                      (unsigned)out.routeId,
+                      (unsigned)out.segmentIndex,
+                      (unsigned)out.workActionPointIndex);
+    }
+    if (out.state == routeexec::ExecutorState::COMPLETE) {
+        if (g_routeObserver.lastLoggedSegment >= 0) {
+            Serial.printf("[SEGMENT_COMPLETE] routeId=%u segment=%d\n",
+                          (unsigned)out.routeId,
+                          g_routeObserver.lastLoggedSegment);
+            g_routeObserver.lastLoggedSegment = -1;
+        }
+        Serial.printf("[ROUTE_COMPLETE] routeId=%u result=arrived "
+                      "segment=%u x=%.3f y=%.3f\n",
+                      (unsigned)out.routeId, (unsigned)out.segmentIndex,
+                      (double)e.x, (double)e.y);
+    }
+    if (out.state == routeexec::ExecutorState::FAULT) {
+        Serial.printf("[ROUTE_FAULT] routeId=%u segment=%u reason=%s\n",
+                      (unsigned)out.routeId, (unsigned)out.segmentIndex,
+                      out.faultReason ? out.faultReason : "route_fault");
+    }
+    (void)now;
+}
+
+static void stepRouteExecutor() {
+    const uint32_t now = millis();
+    const auto& e = g_est.get();
+    const routeexec::RouteExecutorInput input = routeExecutorInput(now);
+    const routeexec::RouteExecutorOutput out =
+        g_routeExecutor.update(input);
+    g_routeExecutorActiveMirror.store(g_routeExecutor.active(),
+                                      std::memory_order_release);
+    if (out.state == routeexec::ExecutorState::COMPLETE ||
+        out.state == routeexec::ExecutorState::FAULT) {
+        g_route.finish();
+        g_ws.setNavRequested(false);
+    }
+
+    g_follow.wpIdx = (int)out.segmentIndex;
+    g_follow.running = g_routeExecutor.active();
+    g_follow.arrived = g_routeExecutor.arrived();
+    g_follow.faultReason = out.faultReason;
+    g_follow.linearMps = out.linearMps;
+    g_follow.angularRadps = out.angularRadps;
+    g_follow.crossTrack = out.crossTrackM;
+    g_follow.distToTarget = out.distanceToWaypointM;
+    g_follow.targetX = out.interceptTarget.x;
+    g_follow.targetY = out.interceptTarget.y;
+    g_follow.lineHeadingDeg = out.plannedHeadingDeg;
+    g_follow.lineHeadingErrDeg = NavMath::wrapDeg180(
+        out.plannedHeadingDeg - e.headingFiltDeg);
+    g_follow.bearingToTargetDeg = NavMath::targetHeadingDeg(
+        out.plannedEnd.x - e.x, out.plannedEnd.y - e.y);
+    g_follow.interceptHeadingDeg = NavMath::targetHeadingDeg(
+        out.interceptTarget.x - e.x, out.interceptTarget.y - e.y);
+    g_follow.steeringTargetDeg = out.steeringTargetDeg;
+    g_follow.steeringErrorDeg = out.steeringErrorDeg;
+    g_follow.headingErr = out.steeringErrorDeg;
+    g_follow.turnTargetDeg = out.latchedTurnTargetDeg;
+    g_follow.endpointRecoveryAttempt = out.recoveryAttempt;
+    g_follow.endpointRecoveryActive =
+        executorControllerMode(out.state) ==
+        FollowerControllerMode::ENDPOINT_RECOVERY;
+    g_follow.recoveryActive =
+        out.state == routeexec::ExecutorState::INTERCEPT_NEXT_LINE ||
+        g_follow.endpointRecoveryActive;
+    g_follow.turnInPlaceActive = executorStateRotating(out.state);
+    g_follow.turnState = executorTurnState(out.state);
+    g_follow.controllerMode = executorControllerMode(out.state);
+    g_follow.targetHeadingDeg = out.steeringTargetDeg;
+    g_follow.headingValidDbg = e.headingValid;
+    g_follow.headingAgeDbg = e.headingAgeMs;
+    g_follow.pvtAgeDbg = e.pvtAgeMs;
+    g_follow.serialMotionDbg = g_serialMotion.active;
+
+    updateRouteObserverOnNewPvt(out, e);
+    logRouteTransition(out, e, now);
+
+    if (out.stateChanged && out.state == routeexec::ExecutorState::FAULT &&
+        out.faultReason != nullptr &&
+        (strcmp(out.faultReason, "footprint_blocked") == 0 ||
+         strcmp(out.faultReason, "route_segment_blocked") == 0 ||
+         strcmp(out.faultReason, "turn_footprint_blocked") == 0)) {
+        Serial.printf("[FOOTPRINT_BLOCKED] routeId=%u segment=%u "
+                      "reason=%s x=%.3f y=%.3f heading=%.1f\n",
+                      (unsigned)out.routeId, (unsigned)out.segmentIndex,
+                      out.faultReason, (double)e.x, (double)e.y,
+                      (double)e.headingFiltDeg);
+    }
+
+    if ((out.state == routeexec::ExecutorState::WAIT_PHYSICAL_STOP ||
+         out.state == routeexec::ExecutorState::HEADING_STABLE) &&
+        (out.stateChanged ||
+         now - g_routeObserver.lastPhysicalStopLogMs >= 300u)) {
+        Serial.printf("[PHYSICAL_STOP] phase=%s cmdL=%d cmdR=%d "
+                      "measL=%d measR=%d feedbackAge=%u yawRate=%+.2f "
+                      "stableMs=%u ready=%d\n",
+                      routeexec::executorStateName(out.state),
+                      input.commandLeft, input.commandRight,
+                      input.measuredLeft, input.measuredRight,
+                      (unsigned)input.feedbackAgeMs,
+                      (double)input.yawRateDps,
+                      (unsigned)out.physicalStableMs,
+                      out.physicalStopReady ? 1 : 0);
+        g_routeObserver.lastPhysicalStopLogMs = now;
+    }
+
+    const bool routeMirrorInvariantViolation =
+        g_routeExecutor.routeFinished() && g_route.isRunning();
+    if (out.invariantViolation || routeMirrorInvariantViolation) {
+        Serial.printf("[ROUTE_INVARIANT] state=%s result=%s "
+                      "arrived=%d fault=%s routeFinished=%d "
+                      "routeRunning=%d\n",
+                      routeexec::executorStateName(out.state),
+                      routeexec::executorResultName(out.result),
+                      g_routeExecutor.arrived() ? 1 : 0,
+                      out.faultReason ? out.faultReason : "-",
+                      g_routeExecutor.routeFinished() ? 1 : 0,
+                      g_route.isRunning() ? 1 : 0);
+    }
+
+    const bool commandAllowed = input.motionAllowed &&
+        !g_routeStopLatch.load(std::memory_order_acquire) &&
+        g_routeExecutor.active() && out.faultReason == nullptr;
+    if (commandAllowed && out.motion != routeexec::MotionKind::STOP) {
+        g_motor.setLinearAngularSpeed(out.linearMps,
+                                      out.angularRadps, true);
+    } else {
+        g_motor.stopImmediately();
+    }
+    logSteerResponseWatchdog(out, input, e, now);
+
+}
 
 // ============================================================================
 // RTK motion alignment
@@ -1167,7 +2647,7 @@ static constexpr float ALIGN_FORWARD_MPS       = 0.18f;
 // We always stop at 1.5 m (or earlier) so an over-shoot doesn't push the
 // robot outside the test field, but OK is also allowed to fire earlier if
 // we have enough high-confidence travel.
-static constexpr float ALIGN_MAX_DIST_M        = 2.5f;
+static constexpr float ALIGN_MAX_DIST_M        = 1.5f;
 static constexpr float ALIGN_MIN_TRAVEL_M      = 1.0f;   // accept-OK travel
 static constexpr uint32_t ALIGN_TIMEOUT_MS     = 15000u;
 // Below this we still accept but tag as not_enough_motion in diagnostics.
@@ -1282,11 +2762,17 @@ static bool rtkAcceptableForAlign(const Estimate& e) {
 static bool autoAlignHeadingBegin(bool fromWebSocket) {
     // Busy-guard: AUTO_ALIGN конкурирует за моторы с другими debug
     // motion. Нельзя стартовать новый поверх активного.
-    if (g_serialMotion.active) {
-        g_heading.lastAlignError = "busy_serial_motion";
+    if (g_serialMotion.active ||
+        g_routeExecutorActiveMirror.load(std::memory_order_acquire) ||
+        g_ws.navRequested()) {
+        g_heading.lastAlignError = "busy_navigation";
         g_heading.alignState = AlignState::ERR;
-        Serial.printf("[BUSY] AUTO_ALIGN rejected: serialMotionSource=%s active\n",
-                      serialMotionSourceName(g_serialMotion.source));
+        Serial.printf("[BUSY] AUTO_ALIGN rejected: serialMotionSource=%s "
+                      "routeActive=%d navRequested=%d\n",
+                      serialMotionSourceName(g_serialMotion.source),
+                      g_routeExecutorActiveMirror.load(
+                          std::memory_order_acquire) ? 1 : 0,
+                      g_ws.navRequested() ? 1 : 0);
         return false;
     }
     const auto& e0 = g_est.get();
@@ -1731,7 +3217,10 @@ static void stepAlign(bool& stopMotorsOut, const char*& errOut) {
                 errOut = "pvt_dropped_in_drive";
                 return;
             }
-            g_motor.setLinearAngularSpeed(ALIGN_FORWARD_MPS, 0.0f, true);
+            const float alignSpeed = g_safety.level() == SAFETY_DEGRADED
+                ? min(ALIGN_FORWARD_MPS, ROVER_DEGRADED_SPEED)
+                : ALIGN_FORWARD_MPS;
+            g_motor.setLinearAngularSpeed(alignSpeed, 0.0f, true);
         }
         return;
     }
@@ -1787,7 +3276,10 @@ static void stepAlign(bool& stopMotorsOut, const char*& errOut) {
                 stopMotorsOut = true;
                 return;
             }
-            g_motor.setLinearAngularSpeed(ALIGN_FORWARD_MPS, 0.0f, true);
+            const float alignSpeed = g_safety.level() == SAFETY_DEGRADED
+                ? min(ALIGN_FORWARD_MPS, ROVER_DEGRADED_SPEED)
+                : ALIGN_FORWARD_MPS;
+            g_motor.setLinearAngularSpeed(alignSpeed, 0.0f, true);
             return;
         }
         case AlignPhase::END_SETTLE: {
@@ -1848,6 +3340,8 @@ void setup() {
     g_imu.begin(PIN_IMU_SDA, PIN_IMU_SCL);
     g_gnss.begin(F9pSerial, GNSS_ROVER);
     g_est.begin();
+    g_est.setAntennaOffsets(ROVER_ANTENNA_FORWARD_OFFSET_M,
+                            ROVER_ANTENNA_LEFT_OFFSET_M);
     float startupHeading = 0.0f;
     if (waitForInitialAbsoluteHeading(IMU_STARTUP_WAIT_MS, startupHeading)) {
         g_est.seedHeadingDeg(startupHeading, g_imu.yawSource());
@@ -1863,6 +3357,11 @@ void setup() {
         Serial.println("[IMU] absolute heading unavailable; game vector is relative; route start blocked");
     }
     g_route.begin();
+    g_routeFootprint = Route::configuredFootprint();
+    if (!g_routeFootprint.toolConfigured) {
+        Serial.println("[FOOTPRINT_BLOCKED] tool footprint is not configured; "
+                       "automatic reverse recovery is disabled");
+    }
     g_safety.begin();
 
     g_rtcm.begin(g_gnss, BASE_IP, RTCM_TCP_PORT, RTCM_UDP_PORT);
@@ -1888,6 +3387,10 @@ void loop() {
         size_t n = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
         if (n > 0) {
             buf[n] = 0;
+            while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == ' ' ||
+                             buf[n - 1] == '\t')) {
+                buf[--n] = 0;
+            }
             if (strcmp(buf, "CAL") == 0) {
                 roverdbg::handleCal();
             } else if (strcmp(buf, "IMU_STATUS") == 0) {
@@ -1957,6 +3460,32 @@ void loop() {
                 roverdbg::handleGoLShape(firstM, turnDeg, secondM);
             } else if (strcmp(buf, "STOP") == 0) {
                 roverdbg::handleStopLine();
+            } else if (strcmp(buf, "SAFETY_MODE,NORMAL") == 0) {
+                g_safety.setMode(SAFETY_MODE_NORMAL);
+                g_est.setFieldSafetyMode(false);
+                Serial.println("OK,SAFETY_MODE,NORMAL");
+            } else if (strcmp(buf, "SAFETY_MODE,FIELD") == 0) {
+                g_safety.setMode(SAFETY_MODE_FIELD);
+                g_est.setFieldSafetyMode(true);
+                Serial.println("OK,SAFETY_MODE,FIELD");
+            } else if (strcmp(buf, "SAFETY_STATUS") == 0) {
+                const SafetyInput& s = g_safety.lastInput();
+                Serial.printf("[SAFETY_STATUS] mode=%s level=%s reason=%s "
+                              "pvtAge=%u headingAge=%u sol=%d hAcc=%.3f "
+                              "rtcmAge=%u pvtCount=%u pvtInterval=%u "
+                              "pvtITowDelta=%u uartRx=%u ubxCkFail=%u "
+                              "ubxOversize=%u\n",
+                              g_safety.modeName(),
+                              Safety::levelName(g_safety.level()),
+                              g_safety.reason(), (unsigned)s.pvtAgeMs,
+                              (unsigned)s.headingAgeMs, (int)s.sol,
+                              (double)s.hAcc, (unsigned)s.rtcmAgeMs,
+                              (unsigned)g_gnss.pvtCount(),
+                              (unsigned)g_gnss.lastPvtIntervalMs(),
+                              (unsigned)g_gnss.lastPvtITowDeltaMs(),
+                              (unsigned)g_gnss.uartRxBytes(),
+                              (unsigned)g_gnss.ubxChecksumFailures(),
+                              (unsigned)g_gnss.ubxOversizePackets());
             } else if (strcmp(buf, "IMU_ZERO") == 0) {
                 Serial.println(roverdbg::imuZeroLine());
             } else if (strcmp(buf, "IMU_DIAG") == 0) {
@@ -1965,6 +3494,12 @@ void loop() {
                 int v = atoi(buf + 4);
                 g_logEnabled = (v != 0);
                 Serial.printf("[LOG] periodic log %s\n", g_logEnabled ? "ON (200ms)" : "OFF");
+            } else if (strcmp(buf, "PATH_LOG,1") == 0) {
+                g_pathLogEnabled = true;
+                Serial.println("[PATH_LOG] ON");
+            } else if (strcmp(buf, "PATH_LOG,0") == 0) {
+                g_pathLogEnabled = false;
+                Serial.println("[PATH_LOG] OFF");
             } else if (buf[0] != 0) {
                 Serial.printf("[?] unknown: '%s' (try CAL / GO / STOP / LOG,0 / LOG,1)\n", buf);
             }
@@ -1981,14 +3516,25 @@ void loop() {
     // на ядро 0 и помехи ушли. 11 dBm даёт нестабильную связь → реконнекты WebSocket.
     // Если hoverboard снова запищит — вернём динамическое снижение, но это не наш кейс.
 
-    if (g_gnss.consumeFreshPvt()) {
+    const bool rawAntennaPositionForAlignment =
+        g_align.active && g_heading.alignState == AlignState::RUNNING;
+    g_est.setAntennaCorrectionEnabled(!rawAntennaPositionForAlignment);
+    const bool gpsCourseRotating = g_follow.turnInPlaceActive ||
+        roverdbg::precisionIsRotating() ||
+        fabsf(g_imu.yawRateDps()) > 5.0f;
+    g_est.setGpsCourseMotionContext(gpsCourseRotating,
+                                    g_follow.linearMps);
+
+    GnssPvtData pvt;
+    if (g_gnss.consumeFreshPvt(pvt)) {
         g_est.onPvt(now,
-            g_gnss.lastLatE7(), g_gnss.lastLonE7(), g_gnss.lastHeightMm(),
-            g_gnss.lastHAccMm(), g_gnss.lastVAccMm(),
-            g_gnss.lastGSpeedMmps(), g_gnss.lastHeadMotDe5(),
-            g_gnss.lastFixType(), g_gnss.lastCarrierSol(), g_gnss.lastDiffSoln(),
-            g_gnss.lastNumSv(), g_gnss.lastPDop(),
-            g_gnss.lastHeadAccDe5());
+            pvt.latE7, pvt.lonE7, pvt.heightMm,
+            pvt.hAccMm, pvt.vAccMm,
+            pvt.gSpeedMmps, pvt.headMotDegE5,
+            pvt.fixType, pvt.carrierSol, pvt.diffSoln,
+            pvt.numSv, pvt.pDop, pvt.headAccDegE5,
+            g_gnss.lastPvtITowDeltaMs());
+        g_estimatorPvtId = g_gnss.pvtCount();
     }
     // RTCM транспорт → возраст в эстимейторе (раньше est.rtcmAgeMs зеркалил
     // возраст PVT и телеметрия врала). Отмечаем каждый принятый UDP-пакет.
@@ -2006,8 +3552,18 @@ void loop() {
                 g_imu.yawAccRad(), g_imu.yawSource(), g_imu.yawIsAbsolute());
     // Hoverboard feedback → EKF predict. TX-задача на ядре 0 обновляет _fb в Motor;
     // здесь читаем актуальные обороты. Если feedback ещё не пришёл, шлёт 0/0.
-    g_est.onHoverboardFeedback(now, g_motor.speedLeftMeas(), g_motor.speedRightMeas());
+    if (g_motor.feedbackAlive(now)) {
+        g_est.onHoverboardFeedback(now, g_motor.speedLeftMeas(),
+                                   g_motor.speedRightMeas());
+    } else {
+        g_est.onHoverboardFeedback(now, 0, 0);
+    }
     g_est.tick(now);
+
+    // AsyncWebSocket callbacks enqueue route lifecycle commands. The loop is
+    // the sole executor/RoutePlan owner; only an immediate zero-motor latch is
+    // allowed from the network task for STOP/disconnect.
+    servicePendingRouteCommand();
 
     // Refresh the operator-facing trusted heading from the live
     // estimator whenever we are in the RTK_MOTION_ALIGNED_PLUS_IMU mode.
@@ -2034,6 +3590,14 @@ void loop() {
     // first so the alignment block sees the up-to-date level. Otherwise
     // a fresh Serial AUTO_ALIGN would inherit the previous tick's
     // ESTOP `ws_disconnected` and abort immediately as `safety`.
+
+    // WebSocket disconnect/NAV_STOP clears navRequested asynchronously and
+    // may also clear the upload container. Retire executor state before Safety
+    // inspects route geometry so no stale segment survives the disconnect.
+    if (!g_ws.navRequested() && g_routeExecutor.active() &&
+        !g_serialMotion.active) {
+        cancelRouteExecutor("navigation_not_requested", false);
+    }
 
     SafetyInput si;
     si.wsConnected  = g_ws.isConnected();
@@ -2063,7 +3627,39 @@ void loop() {
         g_align.active &&
         g_heading.alignState == AlignState::RUNNING &&
         !g_align.fromWebSocket;
+    const bool alignmentRunning =
+        g_align.active && g_heading.alignState == AlignState::RUNNING;
     si.serialDebugMotion = serialAlignActive || g_serialMotion.active;
+    si.rtkAlignmentActive = alignmentRunning;
+    const auto& safetyEstimate = g_est.get();
+    const bool routeActive = g_routeExecutor.active();
+    si.motorMotionCommanded = g_motor.currentLeftPwm() != 0 ||
+                              g_motor.currentRightPwm() != 0 ||
+                              g_motor.lastSpeedCmd() != 0 ||
+                              g_motor.lastSteerCmd() != 0;
+    si.motorFeedbackAlive = g_motor.feedbackAlive(now);
+    si.motorHardwareFault = g_motor.hardwareFault() || g_motor.commandFault();
+    si.internalFinite = isfinite(safetyEstimate.lat) &&
+                        isfinite(safetyEstimate.lon) &&
+                        isfinite(safetyEstimate.x) &&
+                        isfinite(safetyEstimate.y) &&
+                        isfinite(safetyEstimate.headingFiltDeg) &&
+                        isfinite(safetyEstimate.headingDeg) &&
+                        isfinite(safetyEstimate.hAcc) &&
+                        isfinite(g_routeExecutor.lastOutput().linearMps) &&
+                        isfinite(g_routeExecutor.lastOutput().angularRadps);
+    si.routeStateCritical =
+        (g_route.state() == ROUTE_INVALID) ||
+        (routeActive &&
+         (!g_routeExecutor.plan().valid() ||
+          g_routeExecutor.segmentIndex() >=
+              g_routeExecutor.plan().segmentCount()));
+    const routeexec::Pose2D safetyPose(
+        routeexec::LocalPoint(safetyEstimate.x, safetyEstimate.y),
+        safetyEstimate.headingFiltDeg);
+    si.boundaryAndZoneAllowed = !routeActive ||
+        g_route.checkFootprintPose(safetyPose, g_routeFootprint) ==
+            routeexec::FootprintCheckResult::CLEAR;
 
     // rotatingInPlace: turn-in-place активен в follower'е, ИЛИ идёт
     // угловой поворот (precision corner turn в LTEST/SQTEST имеет
@@ -2074,18 +3670,16 @@ void loop() {
     //
     // Доступ к g_precision/PrecisionPhase идёт через roverdbg::, потому
     // что они объявлены в namespace roverdbg (см. ниже по файлу).
-    si.rotatingInPlace = g_follow.turnInPlaceActive ||
-        roverdbg::precisionIsRotating() ||
+    si.rotatingInPlace =
+        executorStateRotating(g_routeExecutor.state()) ||
         fabsf(g_imu.yawRateDps()) > 5.0f;
 
     // Relaxed PVT staleness threshold while alignment is running (in
     // either Serial or WebSocket mode). Normal navigation keeps the
     // strict SAFE_PVT_AGE_MS so a stale estimator never silently drives.
-    const bool alignmentRunning = (g_align.active &&
-        g_heading.alignState == AlignState::RUNNING);
-    si.maxPvtAgeMs = alignmentRunning
-        ? ALIGN_MAX_PVT_AGE_MS
-        : SAFE_PVT_AGE_MS;
+    // Alignment still requires a fresh PVT. FIELD applies its explicit
+    // 1s/3s/6s policy inside Safety; NORMAL remains at SAFE_PVT_AGE_MS.
+    si.maxPvtAgeMs = SAFE_PVT_AGE_MS;
 
     // Heading trust gate. Accept any of:
     //   - BNO085 absolute yaw OK (computed via canUseAbsoluteYawForNav)
@@ -2114,7 +3708,9 @@ void loop() {
             (g_heading.source == HeadingSource::RTK_MOTION_ALIGNED ||
              g_heading.source == HeadingSource::RTK_MOTION_ALIGNED_PLUS_IMU) &&
             e.headingValid &&
-            e.headingAgeMs <= SAFE_HEADING_AGE_MS;
+            e.headingAgeMs <= (g_safety.mode() == SAFETY_MODE_FIELD
+                               ? FIELD_HEADING_ESTOP_MS
+                               : SAFE_HEADING_AGE_MS);
         si.headingTrustedForNav = imuAbsOk || manualTrust || rtkAlignFresh;
         // `headingUsesImu` is true only when navigation depends on
         // BNO085 being live right now. RTK_MOTION_ALIGNED_PLUS_IMU
@@ -2171,23 +3767,26 @@ void loop() {
         g_motor.stopImmediately();
     }
 
-    if (!g_ws.navRequested()) {
-        g_follow.reset();
+    if (!g_ws.navRequested() && g_routeExecutor.active() &&
+        !g_serialMotion.active) {
+        cancelRouteExecutor("navigation_not_requested", true);
     }
 
-    if (g_ws.navRequested() && g_route.isRunning()) {
-        if (!g_follow.running) {
-            g_follow.reset();
-            g_follow.running = true;
-        }
-        stepFollower();
+    if (g_routeStopLatch.load(std::memory_order_acquire)) {
+        // A WS callback already sent an immediate zero.  Do not let the
+        // main-loop route writer overwrite it while the queued STOP is
+        // waiting for the next lifecycle-service point.
+        g_motor.stopImmediately();
+    } else if (g_ws.navRequested() && g_routeExecutor.active()) {
+        stepRouteExecutor();
     }
+
+    roverdbg::pathDiagnosticsOnTick();
 
     // Auto-clear the serialDebugMotion override once the test drive
     // completes (arrival / safety fault / timeout / STOP).
     serialMotionTick();
     roverdbg::lShapeOnTick();
-    roverdbg::precisionDebugOnTick();
 
     NavStateOut nso;
     if (g_follow.faultReason != nullptr) {
@@ -2196,17 +3795,17 @@ void loop() {
     } else if (g_safety.level() == SAFETY_ESTOP || g_safety.level() == SAFETY_HOLD) {
         nso.state = NavStateOut::ERROR;
         nso.errorReason = g_safety.reason();
-    } else if (!g_route.isRunning() && g_route.isReady() && g_follow.arrived) {
+    } else if (g_routeExecutor.arrived()) {
         nso.state = NavStateOut::ARRIVED;
-    } else if (g_route.isPaused()) {
+    } else if (g_routeExecutor.paused()) {
         nso.state = NavStateOut::PAUSED;
-    } else if (g_route.isRunning()) {
+    } else if (g_routeExecutor.active()) {
         nso.state = (g_follow.distToTarget < 0.30f) ? NavStateOut::APPROACHING : NavStateOut::RUNNING;
     } else {
         nso.state = NavStateOut::IDLE;
     }
     nso.wpIdx = g_follow.wpIdx;
-    nso.wpTotal = g_route.count();
+    nso.wpTotal = (int)g_routeExecutor.plan().segmentCount();
     nso.distToWp = g_follow.distToTarget;
     nso.headingErr = g_follow.headingErr;
     nso.crossTrack = g_follow.crossTrack;
@@ -2237,9 +3836,9 @@ void loop() {
         const auto& e = g_est.get();
         const char* navState =
             g_follow.faultReason ? "ERROR" :
-            g_route.isPaused() ? "PAUSED" :
-            g_route.isRunning() ? "RUNNING" :
-            g_follow.arrived ? "ARRIVED" : "IDLE";
+            g_routeExecutor.paused() ? "PAUSED" :
+            g_routeExecutor.active() ? "RUNNING" :
+            g_routeExecutor.arrived() ? "ARRIVED" : "IDLE";
         Serial.printf("[NAVV2] timestamp=%lu lat=%.8f lon=%.8f x=%.3f y=%.3f "
                       "imuYaw=%.1f imuRawYaw=%.1f imuState=%d imuSource=%d imuAbs=%d "
                       "imuMag=%d imuMagNorm=%.2f imuMagX=%.2f imuMagY=%.2f imuMagZ=%.2f "
@@ -2258,7 +3857,9 @@ void loop() {
                       "wsTelSent=%u wsTelDropped=%u "
                       "serialMotion=%d serialMotionSource=%s wsConn=%d safety=%d reason=%s "
                       "imuAbsAge=%u imuRelYawAge=%u gyroAge=%u "
-                      "odoL=%d odoR=%d gpsCourse=%.1f gpsCourseAcc=%.1f gpsCourseUsed=%d\n",
+                      "odoL=%d odoR=%d gpsCourse=%.1f gpsCourseAcc=%.1f "
+                      "gpsCourseUsed=%d gpsCourseWindowDist=%.3f "
+                      "gpsCourseWindowMs=%u\n",
             (unsigned long)now, e.lat, e.lon, e.x, e.y,
             g_imu.yawDeg(), g_imu.rawYawDeg(), (int)g_imu.headingState(), (int)g_imu.yawSource(), g_imu.yawAbsoluteValid() ? 1 : 0,
             g_imu.yawFromMag() ? 1 : 0, g_imu.magNorm(),
@@ -2268,7 +3869,9 @@ void loop() {
             g_follow.targetX, g_follow.targetY, g_follow.targetHeadingDeg,
             g_follow.headingErr, g_follow.distToTarget,
             g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
-            g_follow.wpIdx, g_route.count(), navState, (int)e.sol, e.hAcc,
+            g_follow.wpIdx,
+            (int)g_routeExecutor.plan().segmentCount(),
+            navState, (int)e.sol, e.hAcc,
             e.originLat, e.originLon,
             e.speedMps, e.pvtAgeMs, g_rtcm.transportAgeMs(now), g_imu.ageMs(now),
             (int)g_safety.level(), g_safety.reason(),
@@ -2296,7 +3899,9 @@ void loop() {
             g_motor.speedLeftMeas(), g_motor.speedRightMeas(),
             (double)e.headingDeg,          // сырой GPS-курс
             (double)e.gpsCourseAccDeg,     // headAcc, deg
-            e.gpsCourseUsed ? 1 : 0);      // курс скорректирован этим PVT
+            e.gpsCourseUsed ? 1 : 0,
+            (double)e.gpsCourseWindowDistM,
+            (unsigned)e.gpsCourseWindowMs);
     }
 }
 
@@ -2513,7 +4118,7 @@ static bool goPrecheck() {
 // может запустить SQTEST поверх оборванного LTEST и получить два
 // активных follower'а одновременно.
 static bool serialMotionBusy() {
-    return g_serialMotion.active;
+    return g_serialMotion.active || g_routeExecutor.active();
 }
 
 bool handleGoForward(float distanceM) {
@@ -2545,6 +4150,10 @@ bool handleGoNorth(float distanceM) {
 // GO_FORWARD, this runs even without WebSocket via the serialMotion
 // override.
 bool handleGoLShape(float firstM, float turnDeg, float secondM) {
+    if (serialMotionBusy() || g_routeExecutor.active()) {
+        Serial.println("[BUSY] GO_L_SHAPE rejected: route executor active");
+        return false;
+    }
     if (!isfinite(firstM) || firstM <= 0.0f || firstM > 5.0f ||
         !isfinite(secondM) || secondM <= 0.0f || secondM > 5.0f ||
         !isfinite(turnDeg) || turnDeg < -360.0f || turnDeg > 360.0f) {
@@ -2582,12 +4191,13 @@ bool handleGoLShape(float firstM, float turnDeg, float secondM) {
                   (double)p2x, (double)p2y);
 
     g_follow.reset();
-    if (!g_route.beginUpload(2, e.originLat, e.originLon)) {
+    if (!g_route.beginUpload(3, e.originLat, e.originLon)) {
         Serial.println("[GO_L_SHAPE] refusing: route begin failed");
         return false;
     }
-    g_route.addWaypoint(0, p1x, p1y);
-    g_route.addWaypoint(1, p2x, p2y);
+    g_route.addWaypoint(0, p0x, p0y);
+    g_route.addWaypoint(1, p1x, p1y);
+    g_route.addWaypoint(2, p2x, p2y);
     // Safety boundary: rectangle covering both segments with margin.
     const float margin = 0.75f;
     const float minX = fminf(fminf(p0x, p1x), p2x) - margin;
@@ -2603,19 +4213,54 @@ bool handleGoLShape(float firstM, float turnDeg, float secondM) {
     g_route.beginForbidden(0, nullptr);
     g_route.endForbidden();
     g_route.endUpload();
-    g_route.start();
+
+    routeexec::RoutePlan& plan = g_routeExecutor.planBufferForBuild();
+    plan.clear();
+    plan.setRouteId(g_nextRouteId++);
+    routeexec::RoutePoint p0;
+    p0.position = routeexec::LocalPoint(p0x, p0y);
+    p0.type = routeexec::WaypointType::PASS_THROUGH;
+    p0.positionToleranceM = g_arrivalRadiusM;
+    routeexec::RoutePoint p1;
+    p1.position = routeexec::LocalPoint(p1x, p1y);
+    p1.type = routeexec::WaypointType::CORNER;
+    p1.positionToleranceM = g_arrivalRadiusM;
+    routeexec::RoutePoint p2;
+    p2.position = routeexec::LocalPoint(p2x, p2y);
+    p2.type = routeexec::WaypointType::FINAL_POSITION;
+    p2.positionToleranceM = g_finalArrivalRadiusM;
+    if (!plan.appendPoint(p0) ||
+        !plan.appendPoint(p1, routeexec::SegmentType::LINE,
+                          0.15f, g_forwardSpeedMps) ||
+        !plan.appendPoint(p2, routeexec::SegmentType::LINE,
+                          0.15f, g_forwardSpeedMps) ||
+        !plan.finalize() || !activateRoutePlan(plan, "GO_L_SHAPE")) {
+        g_route.stop();
+        Serial.println("[GO_L_SHAPE] refusing: executor plan failed");
+        return false;
+    }
     g_ws.requestDebugNavigation();
     serialMotionBegin(SerialMotionSource::GO_L_SHAPE, SERIAL_L_SHAPE_TIMEOUT_MS);
     return true;
 }
 
-static constexpr float DEBUG_PRECISION_RADIUS_M = 0.25f;
-static constexpr float DEBUG_PRECISION_FINAL_RADIUS_M = 0.20f;
+static constexpr float DEBUG_PRECISION_RADIUS_M = 0.11f;
+static constexpr float DEBUG_PRECISION_FINAL_RADIUS_M = 0.09f;
 static constexpr float DEBUG_PRECISION_SPEED_MPS = 0.11f;
 static constexpr float DEBUG_TURN_TOLERANCE_DEG = 7.0f;
 static constexpr uint32_t DEBUG_SETTLE_MS = 300u;
 static constexpr uint32_t DEBUG_TURN_HOLD_MS = 400u;
 static constexpr uint32_t DEBUG_POST_TURN_SETTLE_MS = 800u;
+static constexpr uint32_t PRECISION_STOP_STABLE_MS = 650u;
+static constexpr uint32_t PRECISION_STOP_TIMEOUT_MS = 6000u;
+static constexpr uint32_t PRECISION_STOP_PVT_WINDOW_MS = 600u;
+static constexpr float PRECISION_STOP_PVT_DISPLACEMENT_M = 0.040f;
+static constexpr int PRECISION_STOP_MOTOR_PCT = 3;
+static constexpr float PRECISION_STOP_YAW_RATE_DPS = 3.0f;
+static constexpr float PRECISION_HEADING_DRIFT_DEG = 2.0f;
+static constexpr uint32_t PRECISION_FEEDBACK_FRESH_MS = 200u;
+static constexpr uint32_t PRECISION_IMU_FRESH_MS = 200u;
+static constexpr uint32_t PRECISION_PVT_FRESH_MS = 500u;
 // DEBUG_RAMP_UP_M — в RtkConfig.h (нужен stepFollower'у ниже по файлу).
 
 // === Precision debug turn PWM profile ===
@@ -2635,7 +4280,16 @@ enum class PrecisionPhase : uint8_t {
     DRIVE,
     SETTLE,
     TURN,
+    BRAKE,
+    WAIT_PHYSICAL_STOP,
+    HEADING_STABLE,
     POST_TURN_SETTLE,
+};
+
+enum class PrecisionBrakePurpose : uint8_t {
+    BEFORE_TURN,
+    AFTER_TURN,
+    BEFORE_REVERSE,
 };
 
 struct PrecisionDebugMotion {
@@ -2659,6 +4313,30 @@ struct PrecisionDebugMotion {
     // дрейфует, и первые 1-2 sample'а уже давали cross-track 0.2м.
     float segmentStartX = 0;
     float segmentStartY = 0;
+    float plannedSegmentStartX = 0;
+    float plannedSegmentStartY = 0;
+    float controlSegmentStartX = 0;
+    float controlSegmentStartY = 0;
+    float previousPvtX = 0;
+    float previousPvtY = 0;
+    bool previousPvtValid = false;
+    float currentSegmentPathLen = 0;
+    float turnStartX = 0;
+    float turnStartY = 0;
+    float turnStartHeading = 0;
+    PrecisionBrakePurpose brakePurpose = PrecisionBrakePurpose::BEFORE_TURN;
+    uint32_t brakeStartedMs = 0;
+    uint32_t turnStartedMs = 0;
+    uint32_t physicalStableSinceMs = 0;
+    uint32_t stopWindowStartedMs = 0;
+    uint32_t lastPhysicalStopLogMs = 0;
+    uint32_t stopWindowPvtId = 0;
+    float stopWindowX = 0;
+    float stopWindowY = 0;
+    float stopHeading = 0;
+    int turnDirection = 0;
+    int pendingTurnDirection = 0;
+    uint8_t turnAttempts = 0;
 };
 
 static PrecisionDebugMotion g_precision;
@@ -2672,6 +4350,9 @@ bool precisionDebugActive() {
 bool precisionIsRotating() {
     if (!g_precision.active) return false;
     return g_precision.phase == PrecisionPhase::TURN ||
+           g_precision.phase == PrecisionPhase::BRAKE ||
+           g_precision.phase == PrecisionPhase::WAIT_PHYSICAL_STOP ||
+           g_precision.phase == PrecisionPhase::HEADING_STABLE ||
            g_precision.phase == PrecisionPhase::SETTLE ||
            g_precision.phase == PrecisionPhase::POST_TURN_SETTLE;
 }
@@ -2688,6 +4369,18 @@ static bool uploadPrecisionSegment(int segment) {
     const float sy = haveAnchor ? g_precision.segmentStartY : e.y;
     const float tx = g_precision.px[segment + 1];
     const float ty = g_precision.py[segment + 1];
+    g_precision.plannedSegmentStartX = g_precision.px[segment];
+    g_precision.plannedSegmentStartY = g_precision.py[segment];
+    g_precision.controlSegmentStartX = sx;
+    g_precision.controlSegmentStartY = sy;
+    g_precision.previousPvtX = sx;
+    g_precision.previousPvtY = sy;
+    g_precision.previousPvtValid = true;
+    g_precision.currentSegmentPathLen = 0;
+    if (g_precision.square) {
+        g_sqtest.currentSegmentPathLen = 0;
+        g_sqtest.currentSegmentMaxCross = 0;
+    }
     const float margin = 0.75f;
     const float minX = fminf(sx, tx) - margin;
     const float maxX = fmaxf(sx, tx) + margin;
@@ -2749,9 +4442,20 @@ static void lShapeRecordWp1();
 
 static void beginPrecisionTurn(bool finalTurn) {
     const uint32_t now = millis();
+    const auto& e = g_est.get();
     const float target = precisionTargetHeading();
+    if (g_precision.turnAttempts == 0) {
+        g_precision.turnStartX = e.x;
+        g_precision.turnStartY = e.y;
+        g_precision.turnStartHeading = e.headingFiltDeg;
+    }
+    const float initialErr = NavMath::wrapDeg180(target - e.headingFiltDeg);
+    g_precision.turnDirection = initialErr >= 0.0f ? 1 : -1;
+    g_precision.pendingTurnDirection = 0;
+    ++g_precision.turnAttempts;
     g_precision.phase = PrecisionPhase::TURN;
     g_precision.phaseStartedMs = now;
+    g_precision.turnStartedMs = now;
     g_precision.headingOkSinceMs = 0;
     if (g_precision.square) {
         Serial.printf("[SQTEST] CORNER_TURN corner=%d target=%.1f tolerance=%.1f\n",
@@ -2864,21 +4568,22 @@ void ltestDriveTraceTick() {
     const auto& e = g_est.get();
     const bool navOk   = g_ws.navRequested();
     const bool routeOk = g_route.isRunning();
-    const int  pauseOk = g_route.isPaused() ? 0 : 1;
+    const int  paused = g_route.isPaused() ? 1 : 0;
     const bool safeOk  = g_safety.allowMotion();
-    const int  canDrive = (navOk && routeOk && (pauseOk != 0) && safeOk) ? 1 : 0;
+    const int  canDrive = (navOk && routeOk && !paused && safeOk) ? 1 : 0;
     const float speedBase = (g_safety.level() == SAFETY_DEGRADED)
-                            ? ROVER_FLOAT_SPEED : g_forwardSpeedMps;
+                            ? ROVER_DEGRADED_SPEED : g_forwardSpeedMps;
     const char* block = g_follow.speedBlockedReason ? g_follow.speedBlockedReason : "-";
     Serial.printf("[LTEST-DRIVE-TRACE] t=%u seg=%d/%d navReq=%d routeRun=%d "
                   "paused=%d serialMotion=%d allowMotion=%d canDrive=%d "
                   "speedBase=%.2f linPre=%.3f linPost=%.3f slow=%.2f ramp=%.2f "
-                  "turnIP=%d hErr=%+.1f cross=%+.3f "
+                  "turnIP=%d steeringErr=%+.1f lineHeadingErr=%+.1f "
+                  "mode=%s turnState=%s recoveryAttempt=%u crossCtrl=%+.3f "
                   "sol=%d hAcc=%.3f pvtAge=%u rtcmAge=%lu eHValid=%d eHAge=%u "
                   "block=%s\n",
         (unsigned)now,
         g_precision.segment, g_precision.segmentCount,
-        (int)navOk, (int)routeOk, pauseOk,
+        (int)navOk, (int)routeOk, paused,
         (int)g_serialMotion.active, (int)safeOk, canDrive,
         (double)speedBase,
         (double)g_follow.linearPreClamp,
@@ -2886,7 +4591,11 @@ void ltestDriveTraceTick() {
         (double)g_follow.slowFactorDbg,
         (double)g_follow.rampFactorDbg,
         (int)g_follow.turnInPlaceActive,
-        (double)g_follow.headingErr,
+        (double)g_follow.steeringErrorDeg,
+        (double)g_follow.lineHeadingErrDeg,
+        followerControllerModeName(g_follow.controllerMode),
+        followerTurnStateName(g_follow.turnState),
+        (unsigned)g_follow.endpointRecoveryAttempt,
         (double)g_follow.crossTrack,
         (int)e.sol, (double)e.hAcc,
         (unsigned)e.pvtAgeMs,
@@ -2896,8 +4605,295 @@ void ltestDriveTraceTick() {
         block);
 }
 
+static const char* precisionPhaseName(PrecisionPhase phase) {
+    switch (phase) {
+        case PrecisionPhase::DRIVE: return "DRIVE";
+        case PrecisionPhase::SETTLE: return "SETTLE";
+        case PrecisionPhase::TURN: return "TURN";
+        case PrecisionPhase::BRAKE: return "BRAKE";
+        case PrecisionPhase::WAIT_PHYSICAL_STOP: return "WAIT_PHYSICAL_STOP";
+        case PrecisionPhase::HEADING_STABLE: return "HEADING_STABLE";
+        case PrecisionPhase::POST_TURN_SETTLE: return "POST_TURN_SETTLE";
+        default: return "IDLE";
+    }
+}
+
+static void pathWarnIfShort(const char* test, int segment,
+                            float pathLen, float chord) {
+    if (pathLen + 0.02f < chord) {
+        Serial.printf("[PATH_WARN] path_shorter_than_chord test=%s seg=%d "
+                      "path=%.3f chord=%.3f\n",
+                      test, segment, (double)pathLen, (double)chord);
+    }
+}
+
+void pathDiagnosticsLegacyOnTick() {
+    const uint32_t pvtId = g_estimatorPvtId;
+    if (pvtId == 0 || pvtId == g_pathLog.lastPvtId) return;
+    g_pathLog.lastPvtId = pvtId;
+
+    const SerialMotionSource source = g_serialMotion.source;
+    const bool precision = g_precision.active &&
+        (source == SerialMotionSource::GO_L_SHAPE ||
+         source == SerialMotionSource::GO_SQUARE);
+    const bool goForward = source == SerialMotionSource::GO_FORWARD;
+    if (!precision && !goForward) return;
+
+    const auto& e = g_est.get();
+    const uint32_t now = millis();
+    const int segment = precision ? g_precision.segment : 0;
+    const char* test = precision ? (g_precision.square ? "SQTEST" : "LTEST")
+                                 : "GO_FORWARD";
+    const char* phase = precision ? precisionPhaseName(g_precision.phase)
+                                  : "DRIVE";
+
+    float planAx, planAy, ctrlAx, ctrlAy, bx, by;
+    if (precision) {
+        planAx = g_precision.plannedSegmentStartX;
+        planAy = g_precision.plannedSegmentStartY;
+        ctrlAx = g_precision.controlSegmentStartX;
+        ctrlAy = g_precision.controlSegmentStartY;
+        bx = g_precision.px[segment + 1];
+        by = g_precision.py[segment + 1];
+    } else {
+        planAx = g_pathLog.goPlanAx;
+        planAy = g_pathLog.goPlanAy;
+        ctrlAx = g_pathLog.goCtrlAx;
+        ctrlAy = g_pathLog.goCtrlAy;
+        bx = g_pathLog.goBx;
+        by = g_pathLog.goBy;
+    }
+
+    const bool segmentStopping = precision &&
+        (g_precision.phase == PrecisionPhase::BRAKE ||
+         g_precision.phase == PrecisionPhase::WAIT_PHYSICAL_STOP) &&
+        g_precision.brakePurpose == PrecisionBrakePurpose::BEFORE_TURN;
+    if (precision &&
+        (g_precision.phase == PrecisionPhase::DRIVE || segmentStopping)) {
+        const float crossPlanNow = fabsf(lshapeSignedCross(
+            planAx, planAy, bx, by, e.x, e.y));
+        if (g_precision.previousPvtValid) {
+            const float step = lshapeDist2d(g_precision.previousPvtX,
+                                            g_precision.previousPvtY,
+                                            e.x, e.y);
+            g_precision.currentSegmentPathLen += step;
+            if (g_precision.square && g_sqtest.active) {
+                g_sqtest.pathLen += step;
+                g_sqtest.currentSegmentPathLen += step;
+                if (crossPlanNow > g_sqtest.currentSegmentMaxCross)
+                    g_sqtest.currentSegmentMaxCross = crossPlanNow;
+                if (crossPlanNow > g_sqtest.maxCross)
+                    g_sqtest.maxCross = crossPlanNow;
+            } else if (g_ltest.active) {
+                g_ltest.pathLen += step;
+                if (segment == 0) g_ltest.pathLen1 += step;
+                else              g_ltest.pathLen2 += step;
+            }
+        }
+        g_precision.previousPvtX = e.x;
+        g_precision.previousPvtY = e.y;
+        g_precision.previousPvtValid = true;
+    }
+
+    if (source != g_pathLog.windowSource ||
+        segment != g_pathLog.windowSegment) {
+        g_pathLog.windowSource = source;
+        g_pathLog.windowSegment = segment;
+        g_pathLog.motionCount = 0;
+    }
+    if (g_pathLog.motionCount < 24) {
+        const int i = g_pathLog.motionCount++;
+        g_pathLog.motionX[i] = e.x;
+        g_pathLog.motionY[i] = e.y;
+    } else {
+        for (int i = 1; i < 24; ++i) {
+            g_pathLog.motionX[i - 1] = g_pathLog.motionX[i];
+            g_pathLog.motionY[i - 1] = g_pathLog.motionY[i];
+        }
+        g_pathLog.motionX[23] = e.x;
+        g_pathLog.motionY[23] = e.y;
+    }
+
+    float motionCourse = NAN;
+    float motionCourseDist = NAN;
+    if (g_pathLog.motionCount >= 2) {
+        const float dx = e.x - g_pathLog.motionX[0];
+        const float dy = e.y - g_pathLog.motionY[0];
+        const float dist = sqrtf(dx * dx + dy * dy);
+        if (dist >= 0.15f) {
+            motionCourseDist = dist;
+            motionCourse = NavMath::targetHeadingDeg(dx, dy);
+        }
+    }
+
+    if (!g_pathLogEnabled) return;
+
+    const float alongPlan = lshapeAlongTrack(planAx, planAy, bx, by, e.x, e.y);
+    const float crossPlan = lshapeSignedCross(planAx, planAy, bx, by, e.x, e.y);
+    const float alongCtrl = lshapeAlongTrack(ctrlAx, ctrlAy, bx, by, e.x, e.y);
+    const float crossCtrl = lshapeSignedCross(ctrlAx, ctrlAy, bx, by, e.x, e.y);
+    const float lineHeading = NavMath::targetHeadingDeg(bx - ctrlAx,
+                                                        by - ctrlAy);
+    const float bearingToTarget = NavMath::targetHeadingDeg(bx - e.x,
+                                                            by - e.y);
+    const float lineHeadingErr = NavMath::wrapDeg180(lineHeading -
+                                                     e.headingFiltDeg);
+
+    Serial.printf("[PATH_CSV] t=%u,test=%s,phase=%s,seg=%d,pvtId=%u,"
+                  "x=%.3f,y=%.3f,planAx=%.3f,planAy=%.3f,"
+                  "ctrlAx=%.3f,ctrlAy=%.3f,bx=%.3f,by=%.3f,"
+                  "alongPlan=%.3f,crossPlan=%+.3f,"
+                  "alongCtrl=%.3f,crossCtrl=%+.3f,"
+                  "lineHeading=%.1f,bearingToTarget=%.1f,"
+                  "interceptHeading=%.1f,steeringTarget=%.1f,turnTarget=%.1f,"
+                  "estHeading=%.1f,lineHeadingErr=%+.1f,steeringError=%+.1f,"
+                  "controllerMode=%s,turnState=%s,recoveryAttempt=%u,"
+                  "motionCourse=%.1f,motionCourseDist=%.3f,"
+                  "yawRate=%.2f,linear=%.3f,angular=%.3f,"
+                  "cmdL=%d,cmdR=%d,measL=%d,measR=%d,"
+                  "sol=%d,hAcc=%.3f,pvtAge=%u,rtcmAge=%u\n",
+                  (unsigned)now, test, phase, segment, (unsigned)pvtId,
+                  (double)e.x, (double)e.y,
+                  (double)planAx, (double)planAy,
+                  (double)ctrlAx, (double)ctrlAy,
+                  (double)bx, (double)by,
+                  (double)alongPlan, (double)crossPlan,
+                  (double)alongCtrl, (double)crossCtrl,
+                  (double)lineHeading, (double)bearingToTarget,
+                  (double)g_follow.interceptHeadingDeg,
+                  (double)g_follow.steeringTargetDeg,
+                  (double)g_follow.turnTargetDeg,
+                  (double)e.headingFiltDeg, (double)lineHeadingErr,
+                  (double)g_follow.steeringErrorDeg,
+                  followerControllerModeName(g_follow.controllerMode),
+                  followerTurnStateName(g_follow.turnState),
+                  (unsigned)g_follow.endpointRecoveryAttempt,
+                  (double)motionCourse, (double)motionCourseDist,
+                  (double)g_imu.yawRateDps(),
+                  (double)g_follow.linearMps,
+                  (double)g_follow.angularRadps,
+                  g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
+                  g_motor.speedLeftMeas(), g_motor.speedRightMeas(),
+                  (int)e.sol, (double)e.hAcc, (unsigned)e.pvtAgeMs,
+                  (unsigned)g_rtcm.transportAgeMs(now));
+}
+
 // Гасит g_precision.active. Страховка от "LTEST-DRIVE-TRACE продолжает
 // писать после safety/stop". Вызывается ТОЛЬКО из serialMotionEnd().
+void pathDiagnosticsOnTick() {
+    if (!g_routeExecutor.active() && !g_routeExecutor.routeFinished()) return;
+
+    const routeexec::RouteExecutorOutput& out = g_routeExecutor.lastOutput();
+    if (out.state != g_pathLog.lastExecutorState) {
+        g_pathLog.motionCount = 0;
+        g_pathLog.lastExecutorState = out.state;
+    }
+
+    const uint32_t pvtId = g_estimatorPvtId;
+    if (pvtId == 0u || pvtId == g_pathLog.lastPvtId) return;
+    g_pathLog.lastPvtId = pvtId;
+
+    if (!g_routeExecutor.plan().valid() ||
+        out.segmentIndex >= g_routeExecutor.plan().segmentCount()) return;
+
+    const auto& e = g_est.get();
+    const uint32_t now = millis();
+    const int segment = static_cast<int>(out.segmentIndex);
+    const SerialMotionSource source = g_serialMotion.source;
+    const bool translational =
+        (out.motion == routeexec::MotionKind::DRIVE ||
+         out.motion == routeexec::MotionKind::REVERSE) &&
+        fabsf(out.linearMps) >= 0.02f;
+
+    if (source != g_pathLog.windowSource ||
+        segment != g_pathLog.windowSegment || !translational) {
+        g_pathLog.windowSource = source;
+        g_pathLog.windowSegment = segment;
+        g_pathLog.motionCount = 0;
+    }
+    if (translational) {
+        if (g_pathLog.motionCount < 24) {
+            const int i = g_pathLog.motionCount++;
+            g_pathLog.motionX[i] = e.x;
+            g_pathLog.motionY[i] = e.y;
+        } else {
+            for (int i = 1; i < 24; ++i) {
+                g_pathLog.motionX[i - 1] = g_pathLog.motionX[i];
+                g_pathLog.motionY[i - 1] = g_pathLog.motionY[i];
+            }
+            g_pathLog.motionX[23] = e.x;
+            g_pathLog.motionY[23] = e.y;
+        }
+    }
+
+    float motionCourse = NAN;
+    float motionCourseDist = NAN;
+    if (translational && g_pathLog.motionCount >= 2) {
+        const float dx = e.x - g_pathLog.motionX[0];
+        const float dy = e.y - g_pathLog.motionY[0];
+        const float dist = sqrtf(dx * dx + dy * dy);
+        if (dist >= 0.15f) {
+            motionCourse = NavMath::targetHeadingDeg(dx, dy);
+            motionCourseDist = dist;
+        }
+    }
+
+    if (!g_pathLogEnabled) return;
+
+    const char* test = "APP_ROUTE";
+    if (source == SerialMotionSource::GO_FORWARD) test = "GO_FORWARD";
+    else if (source == SerialMotionSource::GO_L_SHAPE) test = "LTEST";
+    else if (source == SerialMotionSource::GO_SQUARE) test = "SQTEST";
+
+    const float bearingToTarget = routeexec::bearingDeg(
+        routeexec::LocalPoint(e.x, e.y), out.plannedEnd);
+    const float lineHeadingErr = routeexec::wrapHeadingErrorDeg(
+        out.plannedHeadingDeg - e.headingFiltDeg);
+    const char* controllerMode =
+        followerControllerModeName(executorControllerMode(out.state));
+    const char* turnState =
+        followerTurnStateName(executorTurnState(out.state));
+
+    Serial.printf(
+        "[PATH_CSV] t=%u,routeId=%u,test=%s,segmentIndex=%u,state=%s,"
+        "pvtId=%u,x=%.3f,y=%.3f,plannedStartX=%.3f,plannedStartY=%.3f,"
+        "plannedEndX=%.3f,plannedEndY=%.3f,plannedHeading=%.1f,"
+        "crossTrack=%+.3f,alongTrack=%.3f,distanceToWaypoint=%.3f,"
+        "interceptTargetX=%.3f,"
+        "interceptTargetY=%.3f,lineHeading=%.1f,bearingToTarget=%.1f,"
+        "steeringTarget=%.1f,turnTarget=%.1f,steeringError=%+.1f,"
+        "lineHeadingErr=%+.1f,computedRecoveryBearing=%.1f,"
+        "latchedTurnTarget=%.1f,recoveryGoalX=%.3f,recoveryGoalY=%.3f,"
+        "waypointType=%s,recoveryAttempt=%u,"
+        "controllerMode=%s,turnState=%s,motionCourse=%.1f,"
+        "motionCourseDist=%.3f,cmdL=%d,cmdR=%d,measuredL=%d,"
+        "measuredR=%d,heading=%.1f,yawRate=%+.2f,linear=%.3f,"
+        "angular=%+.3f,sol=%d,hAcc=%.3f,pvtAge=%u,rtcmAge=%u\n",
+        (unsigned)now, (unsigned)out.routeId, test,
+        (unsigned)out.segmentIndex, routeexec::executorStateName(out.state),
+        (unsigned)pvtId, (double)e.x, (double)e.y,
+        (double)out.plannedStart.x, (double)out.plannedStart.y,
+        (double)out.plannedEnd.x, (double)out.plannedEnd.y,
+        (double)out.plannedHeadingDeg, (double)out.crossTrackM,
+        (double)out.alongTrackM, (double)out.distanceToWaypointM,
+        (double)out.interceptTarget.x,
+        (double)out.interceptTarget.y, (double)out.plannedHeadingDeg,
+        (double)bearingToTarget, (double)out.steeringTargetDeg,
+        (double)out.latchedTurnTargetDeg, (double)out.steeringErrorDeg,
+        (double)lineHeadingErr, (double)out.computedRecoveryBearingDeg,
+        (double)out.latchedTurnTargetDeg,
+        (double)out.recoveryGoal.x, (double)out.recoveryGoal.y,
+        routeexec::waypointTypeName(out.waypointType),
+        (unsigned)out.recoveryAttempt, controllerMode, turnState,
+        (double)motionCourse, (double)motionCourseDist,
+        g_motor.currentLeftPwm(), g_motor.currentRightPwm(),
+        g_motor.speedLeftMeas(), g_motor.speedRightMeas(),
+        (double)e.headingFiltDeg, (double)g_imu.yawRateDps(),
+        (double)out.linearMps, (double)out.angularRadps,
+        (int)e.sol, (double)e.hAcc, (unsigned)e.pvtAgeMs,
+        (unsigned)g_rtcm.transportAgeMs(now));
+}
+
 void precisionResetForSafetyEnd() {
     if (!g_precision.active) return;
     g_precision.active = false;
@@ -2908,6 +4904,144 @@ void precisionResetForSafetyEnd() {
     Serial.println("[PRECISION-RESET] g_precision.active=false (safety/stop end)");
 }
 
+static void precisionMotionFault(const char* reason) {
+    g_motor.stopImmediately();
+    g_follow.faultReason = reason;
+    g_precision.active = false;
+    serialMotionEnd(reason);
+}
+
+static void precisionEnterBrake(PrecisionBrakePurpose purpose,
+                                int pendingTurnDirection = 0) {
+    const uint32_t now = millis();
+    const auto& e = g_est.get();
+    g_motor.stopImmediately();
+    g_precision.brakePurpose = purpose;
+    g_precision.pendingTurnDirection = pendingTurnDirection;
+    g_precision.phase = PrecisionPhase::BRAKE;
+    g_precision.phaseStartedMs = now;
+    g_precision.brakeStartedMs = now;
+    g_precision.physicalStableSinceMs = 0;
+    g_precision.stopWindowStartedMs = 0;
+    g_precision.stopWindowPvtId = g_estimatorPvtId;
+    g_precision.stopWindowX = e.x;
+    g_precision.stopWindowY = e.y;
+    g_precision.stopHeading = e.headingFiltDeg;
+    g_precision.lastPhysicalStopLogMs = 0;
+}
+
+static bool precisionPhysicalStopReady(uint32_t now, const char* phaseName) {
+    const auto& e = g_est.get();
+    const int cmdL = g_motor.currentLeftPwm();
+    const int cmdR = g_motor.currentRightPwm();
+    const int measL = g_motor.speedLeftMeas();
+    const int measR = g_motor.speedRightMeas();
+    const uint32_t feedbackAge = g_motor.feedbackAgeMs(now);
+    const float yawRate = g_imu.yawRateDps();
+    const float dx = e.x - g_precision.stopWindowX;
+    const float dy = e.y - g_precision.stopWindowY;
+    const float pvtDisplacement = sqrtf(dx * dx + dy * dy);
+    const float headingDrift = fabsf(NavMath::wrapDeg180(
+        e.headingFiltDeg - g_precision.stopHeading));
+    const bool fresh = feedbackAge <= PRECISION_FEEDBACK_FRESH_MS &&
+                       g_imu.fresh() &&
+                       g_imu.ageMs(now) <= PRECISION_IMU_FRESH_MS &&
+                       e.pvtAgeMs <= PRECISION_PVT_FRESH_MS;
+    const bool instantStop = cmdL == 0 && cmdR == 0 && fresh &&
+                             abs(measL) <= PRECISION_STOP_MOTOR_PCT &&
+                             abs(measR) <= PRECISION_STOP_MOTOR_PCT &&
+                             fabsf(yawRate) <= PRECISION_STOP_YAW_RATE_DPS;
+
+    if (!instantStop || pvtDisplacement > PRECISION_STOP_PVT_DISPLACEMENT_M) {
+        g_precision.physicalStableSinceMs = 0;
+        g_precision.stopWindowStartedMs = now;
+        g_precision.stopWindowPvtId = g_estimatorPvtId;
+        g_precision.stopWindowX = e.x;
+        g_precision.stopWindowY = e.y;
+        g_precision.stopHeading = e.headingFiltDeg;
+    } else if (g_precision.physicalStableSinceMs == 0) {
+        g_precision.physicalStableSinceMs = now;
+        g_precision.stopWindowStartedMs = now;
+        g_precision.stopWindowPvtId = g_estimatorPvtId;
+        g_precision.stopWindowX = e.x;
+        g_precision.stopWindowY = e.y;
+        g_precision.stopHeading = e.headingFiltDeg;
+    }
+
+    const uint32_t stableMs = g_precision.physicalStableSinceMs == 0
+        ? 0u : now - g_precision.physicalStableSinceMs;
+    const bool pvtWindowReady = stableMs >= PRECISION_STOP_PVT_WINDOW_MS;
+    const bool ready = instantStop && pvtWindowReady &&
+                       stableMs >= PRECISION_STOP_STABLE_MS;
+    if (ready || g_precision.lastPhysicalStopLogMs == 0 ||
+        (now - g_precision.lastPhysicalStopLogMs) >= 300u) {
+        Serial.printf("[PHYSICAL_STOP] phase=%s cmdL=%d cmdR=%d measL=%d "
+                      "measR=%d feedbackAge=%u yawRate=%+.2f "
+                      "pvtDisplacement=%.3f headingDrift=%.2f stableMs=%u "
+                      "ready=%d\n",
+                      phaseName, cmdL, cmdR, measL, measR,
+                      (unsigned)feedbackAge, (double)yawRate,
+                      (double)pvtDisplacement, (double)headingDrift,
+                      (unsigned)stableMs, ready ? 1 : 0);
+        g_precision.lastPhysicalStopLogMs = now;
+    }
+    return ready;
+}
+
+static void precisionCaptureCornerAndContinue(float err) {
+    const auto& e = g_est.get();
+    const float turnDx = e.x - g_precision.turnStartX;
+    const float turnDy = e.y - g_precision.turnStartY;
+    const float positionChord = sqrtf(turnDx * turnDx + turnDy * turnDy);
+    const float headingDelta = NavMath::wrapDeg180(
+        e.headingFiltDeg - g_precision.turnStartHeading);
+    const float headingDeltaRad = fabsf(headingDelta) * (float)M_PI / 180.0f;
+    const float equivalentRadius = headingDeltaRad < 0.01f
+        ? NAN : positionChord / (2.0f * sinf(headingDeltaRad * 0.5f));
+    Serial.printf("[TURN_GEOM] corner=%d,start=(%.3f,%.3f),end=(%.3f,%.3f),"
+                  "dx=%+.3f,dy=%+.3f,positionChord=%.3f,headingDelta=%+.1f,"
+                  "equivalentRadius=%.3f\n",
+                  g_precision.segment + 1,
+                  (double)g_precision.turnStartX, (double)g_precision.turnStartY,
+                  (double)e.x, (double)e.y, (double)turnDx, (double)turnDy,
+                  (double)positionChord, (double)headingDelta,
+                  (double)equivalentRadius);
+
+    const bool finalTurn = g_precision.segment >= g_precision.segmentCount - 1;
+    if (!g_precision.square && g_precision.segment == 0 && g_ltest.active) {
+        g_ltest.cornerAfterTurnX = e.x;
+        g_ltest.cornerAfterTurnY = e.y;
+        g_ltest.headingAfterCorner = e.headingFiltDeg;
+        const float cornerShift = lshapeDist2d(
+            g_ltest.segment1DriveEndX, g_ltest.segment1DriveEndY,
+            g_ltest.cornerAfterTurnX, g_ltest.cornerAfterTurnY);
+        const float cornerTurnActual = NavMath::wrapDeg180(
+            g_ltest.headingAfterCorner - g_ltest.headingBeforeCorner);
+        Serial.printf("[LTEST] CORNER_AFTER_TURN pos=(%.3f,%.3f) "
+                      "heading=%.1f cornerShift=%.3f turnActual=%+.1f\n",
+                      (double)e.x, (double)e.y,
+                      (double)e.headingFiltDeg, (double)cornerShift,
+                      (double)cornerTurnActual);
+    }
+    if (g_precision.square && g_precision.segment >= 0 && g_precision.segment < 4) {
+        g_sqtest.segTurnErr[g_precision.segment] = err;
+    }
+    if (finalTurn) {
+        if (!g_precision.square) lShapeRecordWp1();
+        g_precision.active = false;
+        serialMotionEnd("arrived");
+        return;
+    }
+    if (!g_precision.square && g_precision.segment == 0) lShapeRecordWp1();
+    g_precision.segment++;
+    g_precision.lastTurnPwm = 0;
+    g_precision.segmentStartX = e.x;
+    g_precision.segmentStartY = e.y;
+    if (!uploadPrecisionSegment(g_precision.segment)) {
+        precisionMotionFault("route_begin_failed");
+    }
+}
+
 void precisionDebugOnTick() {
     if (!g_precision.active || !g_serialMotion.active) return;
     const uint32_t now = millis();
@@ -2916,8 +5050,15 @@ void precisionDebugOnTick() {
     if (g_precision.phase == PrecisionPhase::DRIVE && g_follow.arrived) {
         g_motor.stopImmediately();
         const bool finalSegment = g_precision.segment >= g_precision.segmentCount - 1;
-        g_precision.phase = PrecisionPhase::SETTLE;
-        g_precision.phaseStartedMs = now;
+        const float segmentChord = lshapeDist2d(
+            g_precision.controlSegmentStartX,
+            g_precision.controlSegmentStartY, e.x, e.y);
+        pathWarnIfShort(g_precision.square ? "SQTEST" : "LTEST",
+                        g_precision.segment,
+                        g_precision.currentSegmentPathLen,
+                        segmentChord);
+        g_precision.turnAttempts = 0;
+        precisionEnterBrake(PrecisionBrakePurpose::BEFORE_TURN);
         if (g_precision.square) {
             // SQTEST: фиксируем фактический угол и метрики предыдущего
             // сегмента (только если это не первый corner = старт).
@@ -2933,8 +5074,8 @@ void precisionDebugOnTick() {
                 const float err = lshapeDist2d(e.x, e.y, cx, cy);
                 g_sqtest.cornerErr[segIdx] = err;
                 // segment metrics: previous segment
-                g_sqtest.segMaxCross[segIdx] = g_sqtest.maxCross;
-                g_sqtest.segPathLen[segIdx] = g_sqtest.pathLen;
+                g_sqtest.segMaxCross[segIdx] = g_sqtest.currentSegmentMaxCross;
+                g_sqtest.segPathLen[segIdx] = g_sqtest.currentSegmentPathLen;
                 Serial.printf("[SQTEST] CORNER_REACHED corner=%d actual=(%.3f,%.3f) "
                               "planned=(%.3f,%.3f) err=%.3f heading=%.1f\n",
                               cornerIdx,
@@ -2960,11 +5101,7 @@ void precisionDebugOnTick() {
     }
 
     if (g_precision.phase == PrecisionPhase::SETTLE) {
-        g_motor.stopImmediately();
-        if ((now - g_precision.phaseStartedMs) >= DEBUG_SETTLE_MS) {
-            const bool finalTurn = g_precision.segment >= g_precision.segmentCount - 1;
-            beginPrecisionTurn(finalTurn);
-        }
+        precisionEnterBrake(PrecisionBrakePurpose::BEFORE_TURN);
         return;
     }
 
@@ -2974,6 +5111,12 @@ void precisionDebugOnTick() {
         const float err = NavMath::wrapDeg180(target - e.headingFiltDeg);
         const float absErr = fabsf(err);
         if (absErr <= DEBUG_TURN_TOLERANCE_DEG) {
+            Serial.printf("[PRECISION_TURN] target=%.1f heading=%.1f err=%+.1f "
+                          "pwm=0 braking_before_heading_check\n",
+                          (double)target, (double)e.headingFiltDeg,
+                          (double)err);
+            precisionEnterBrake(PrecisionBrakePurpose::AFTER_TURN);
+            return;
             g_motor.setLinearAngularSpeed(0, 0, true);
             if (g_precision.headingOkSinceMs == 0) {
                 g_precision.headingOkSinceMs = now;
@@ -3002,6 +5145,17 @@ void precisionDebugOnTick() {
             return;
         }
         g_precision.headingOkSinceMs = 0;
+        const int requestedDirection = err >= 0.0f ? 1 : -1;
+        if (requestedDirection != g_precision.turnDirection) {
+            precisionEnterBrake(PrecisionBrakePurpose::BEFORE_REVERSE,
+                                requestedDirection);
+            return;
+        }
+        if ((now - g_precision.turnStartedMs) > PRECISION_STOP_TIMEOUT_MS ||
+            g_precision.turnAttempts > 4) {
+            precisionMotionFault("turn_not_converging");
+            return;
+        }
         // Ступенчатый PWM профиль по абсолютной ошибке угла. cmdL/cmdR
         // — это PWM в единицах мотора; в Motor::setLinearAngularSpeed()
         // они нормируются на 0..1 через PWM/ROVER_INPUT_DIV.
@@ -3022,6 +5176,92 @@ void precisionDebugOnTick() {
                           (double)err, pwm);
             g_precision.lastTurnPwm = pwm;
         }
+        return;
+    }
+
+    if (g_precision.phase == PrecisionPhase::BRAKE) {
+        g_motor.stopImmediately();
+        g_precision.phase = PrecisionPhase::WAIT_PHYSICAL_STOP;
+        g_precision.phaseStartedMs = now;
+        return;
+    }
+
+    if (g_precision.phase == PrecisionPhase::WAIT_PHYSICAL_STOP) {
+        g_motor.stopImmediately();
+        if ((now - g_precision.brakeStartedMs) > PRECISION_STOP_TIMEOUT_MS) {
+            precisionMotionFault("physical_stop_timeout");
+            return;
+        }
+        if (!precisionPhysicalStopReady(now, "WAIT_PHYSICAL_STOP")) return;
+        const bool finalTurn = g_precision.segment >= g_precision.segmentCount - 1;
+        if (g_precision.brakePurpose == PrecisionBrakePurpose::BEFORE_TURN) {
+            if (!g_precision.square && g_precision.segment == 0 &&
+                g_ltest.active) {
+                g_ltest.segment1DriveEndX = e.x;
+                g_ltest.segment1DriveEndY = e.y;
+                g_ltest.headingBeforeCorner = e.headingFiltDeg;
+                Serial.printf("[LTEST] SEGMENT1_DRIVE_END pos=(%.3f,%.3f) "
+                              "heading=%.1f path=%.3f\n",
+                              (double)e.x, (double)e.y,
+                              (double)e.headingFiltDeg,
+                              (double)g_ltest.pathLen1);
+            }
+            beginPrecisionTurn(finalTurn);
+            return;
+        }
+        if (g_precision.brakePurpose == PrecisionBrakePurpose::BEFORE_REVERSE) {
+            if (g_precision.turnAttempts >= 4) {
+                precisionMotionFault("turn_not_converging");
+                return;
+            }
+            beginPrecisionTurn(finalTurn);
+            return;
+        }
+        g_precision.phase = PrecisionPhase::HEADING_STABLE;
+        g_precision.phaseStartedMs = now;
+        g_precision.headingOkSinceMs = 0;
+        g_precision.stopHeading = e.headingFiltDeg;
+        return;
+    }
+
+    if (g_precision.phase == PrecisionPhase::HEADING_STABLE) {
+        g_motor.stopImmediately();
+        if ((now - g_precision.brakeStartedMs) > PRECISION_STOP_TIMEOUT_MS) {
+            precisionMotionFault("heading_stop_not_stable");
+            return;
+        }
+        if (!precisionPhysicalStopReady(now, "HEADING_STABLE")) {
+            g_precision.headingOkSinceMs = 0;
+            return;
+        }
+        const float target = precisionTargetHeading();
+        const float err = NavMath::wrapDeg180(target - e.headingFiltDeg);
+        const float drift = fabsf(NavMath::wrapDeg180(
+            e.headingFiltDeg - g_precision.stopHeading));
+        if (fabsf(err) > DEBUG_TURN_TOLERANCE_DEG) {
+            if (g_precision.turnAttempts >= 4) {
+                precisionMotionFault("turn_not_converging");
+                return;
+            }
+            beginPrecisionTurn(
+                g_precision.segment >= g_precision.segmentCount - 1);
+            return;
+        }
+        if (drift > PRECISION_HEADING_DRIFT_DEG) {
+            g_precision.stopHeading = e.headingFiltDeg;
+            g_precision.headingOkSinceMs = 0;
+            return;
+        }
+        if (g_precision.headingOkSinceMs == 0) {
+            g_precision.headingOkSinceMs = now;
+        }
+        if ((now - g_precision.headingOkSinceMs) < PRECISION_STOP_STABLE_MS) return;
+        Serial.printf("[PRECISION_TURN] HEADING_STABLE target=%.1f heading=%.1f "
+                      "err=%+.1f stableMs=%u\n",
+                      (double)target, (double)e.headingFiltDeg, (double)err,
+                      (unsigned)(now - g_precision.headingOkSinceMs));
+        precisionCaptureCornerAndContinue(err);
+        return;
     }
 
     if (g_precision.phase == PrecisionPhase::POST_TURN_SETTLE) {
@@ -3035,6 +5275,27 @@ void precisionDebugOnTick() {
                           (unsigned)DEBUG_POST_TURN_SETTLE_MS);
         }
         if (dwell >= DEBUG_POST_TURN_SETTLE_MS) {
+            const float turnDx = e.x - g_precision.turnStartX;
+            const float turnDy = e.y - g_precision.turnStartY;
+            const float positionChord = sqrtf(turnDx * turnDx + turnDy * turnDy);
+            const float headingDelta = NavMath::wrapDeg180(
+                e.headingFiltDeg - g_precision.turnStartHeading);
+            const float headingDeltaRad = fabsf(headingDelta) *
+                                          (float)M_PI / 180.0f;
+            const float equivalentRadius = headingDeltaRad < 0.01f
+                ? NAN
+                : positionChord / (2.0f * sinf(headingDeltaRad * 0.5f));
+            Serial.printf("[TURN_GEOM] corner=%d,start=(%.3f,%.3f),"
+                          "end=(%.3f,%.3f),dx=%+.3f,dy=%+.3f,"
+                          "positionChord=%.3f,headingDelta=%+.1f,"
+                          "equivalentRadius=%.3f\n",
+                          g_precision.segment + 1,
+                          (double)g_precision.turnStartX,
+                          (double)g_precision.turnStartY,
+                          (double)e.x, (double)e.y,
+                          (double)turnDx, (double)turnDy,
+                          (double)positionChord, (double)headingDelta,
+                          (double)equivalentRadius);
             const bool finalTurn = g_precision.segment >= g_precision.segmentCount - 1;
             if (finalTurn) {
                 if (!g_precision.square) lShapeRecordWp1();
@@ -3066,25 +5327,64 @@ void precisionDebugOnTick() {
 // the namespace, so the body cannot live in global scope.)
 
 static bool startPrecisionLShapeDebug() {
-    g_precision.active = true;
-    g_precision.square = false;
-    g_precision.segmentCount = 2;
-    g_precision.tag = "LTEST";
-    g_precision.px[0] = g_ltest.p0x;
-    g_precision.py[0] = g_ltest.p0y;
-    g_precision.px[1] = g_ltest.p1x;
-    g_precision.py[1] = g_ltest.p1y;
-    g_precision.px[2] = g_ltest.p2x;
-    g_precision.py[2] = g_ltest.p2y;
-    g_precision.heading[0] = g_ltest.h0;
-    g_precision.heading[1] = g_ltest.h1;
-    g_precision.finalHeading = g_ltest.h1;
-    serialMotionBegin(SerialMotionSource::GO_L_SHAPE, SERIAL_L_SHAPE_TIMEOUT_MS);
-    if (!uploadPrecisionSegment(0)) {
-        g_precision.active = false;
-        serialMotionEnd("route_begin_failed");
+    const auto& e = g_est.get();
+    if (!e.originSet) return false;
+    const float margin = 0.75f;
+    const float minX = fminf(fminf(g_ltest.p0x, g_ltest.p1x),
+                             g_ltest.p2x) - margin;
+    const float maxX = fmaxf(fmaxf(g_ltest.p0x, g_ltest.p1x),
+                             g_ltest.p2x) + margin;
+    const float minY = fminf(fminf(g_ltest.p0y, g_ltest.p1y),
+                             g_ltest.p2y) - margin;
+    const float maxY = fmaxf(fmaxf(g_ltest.p0y, g_ltest.p1y),
+                             g_ltest.p2y) + margin;
+    if (!g_route.beginUpload(3, e.originLat, e.originLon) ||
+        !g_route.addWaypoint(0, g_ltest.p0x, g_ltest.p0y) ||
+        !g_route.addWaypoint(1, g_ltest.p1x, g_ltest.p1y) ||
+        !g_route.addWaypoint(2, g_ltest.p2x, g_ltest.p2y) ||
+        !g_route.beginBoundary(4) ||
+        !g_route.addBoundaryPoint(0, minX, minY) ||
+        !g_route.addBoundaryPoint(1, maxX, minY) ||
+        !g_route.addBoundaryPoint(2, maxX, maxY) ||
+        !g_route.addBoundaryPoint(3, minX, maxY) ||
+        !g_route.endBoundary() ||
+        !g_route.beginForbidden(0, nullptr) || !g_route.endForbidden()) {
+        g_route.stop();
         return false;
     }
+    g_route.endUpload();
+    if (!g_route.isReady()) return false;
+
+    routeexec::RoutePlan& plan = g_routeExecutor.planBufferForBuild();
+    plan.clear();
+    plan.setRouteId(g_nextRouteId++);
+    routeexec::RoutePoint p0;
+    p0.position = routeexec::LocalPoint(g_ltest.p0x, g_ltest.p0y);
+    p0.type = routeexec::WaypointType::PASS_THROUGH;
+    p0.positionToleranceM = DEBUG_PRECISION_RADIUS_M;
+    routeexec::RoutePoint p1;
+    p1.position = routeexec::LocalPoint(g_ltest.p1x, g_ltest.p1y);
+    p1.type = routeexec::WaypointType::CORNER;
+    p1.positionToleranceM = DEBUG_PRECISION_RADIUS_M;
+    p1.headingToleranceDeg = DEBUG_TURN_TOLERANCE_DEG;
+    routeexec::RoutePoint p2;
+    p2.position = routeexec::LocalPoint(g_ltest.p2x, g_ltest.p2y);
+    p2.type = routeexec::WaypointType::FINAL_POSITION;
+    p2.finalHeadingRequired = false;
+    p2.positionToleranceM = DEBUG_PRECISION_FINAL_RADIUS_M;
+    if (!plan.appendPoint(p0) ||
+        !plan.appendPoint(p1, routeexec::SegmentType::LINE, 0.12f,
+                          DEBUG_PRECISION_SPEED_MPS) ||
+        !plan.appendPoint(p2, routeexec::SegmentType::LINE, 0.12f,
+                          DEBUG_PRECISION_SPEED_MPS) ||
+        !plan.finalize() || !activateRoutePlan(plan, "LTEST")) {
+        g_route.stop();
+        return false;
+    }
+    g_precision = PrecisionDebugMotion{};  // legacy executor stays disabled
+    g_ws.requestDebugNavigation();
+    serialMotionBegin(SerialMotionSource::GO_L_SHAPE,
+                      SERIAL_L_SHAPE_TIMEOUT_MS);
     return true;
 }
 
@@ -3134,31 +5434,67 @@ static bool startPrecisionSquareDebug(float sideM) {
                   (double)g_arrivalRadiusM, (double)g_finalArrivalRadiusM,
                   (double)g_forwardSpeedMps, (double)DEBUG_TURN_TOLERANCE_DEG);
 
-    g_precision = PrecisionDebugMotion{};
-    g_precision.active = true;
-    g_precision.square = true;
-    g_precision.segmentCount = 4;
-    g_precision.tag = "SQTEST";
+    float minX = g_sqtest.pX[0], maxX = g_sqtest.pX[0];
+    float minY = g_sqtest.pY[0], maxY = g_sqtest.pY[0];
+    for (int i = 1; i < 5; ++i) {
+        minX = fminf(minX, g_sqtest.pX[i]);
+        maxX = fmaxf(maxX, g_sqtest.pX[i]);
+        minY = fminf(minY, g_sqtest.pY[i]);
+        maxY = fmaxf(maxY, g_sqtest.pY[i]);
+    }
+    const float margin = 0.75f;
+    if (!g_route.beginUpload(5, e0.originLat, e0.originLon)) return false;
     for (int i = 0; i < 5; ++i) {
-        g_precision.px[i] = g_sqtest.pX[i];
-        g_precision.py[i] = g_sqtest.pY[i];
+        if (!g_route.addWaypoint(i, g_sqtest.pX[i], g_sqtest.pY[i]))
+            return false;
     }
-    for (int i = 0; i < 4; ++i) {
-        g_precision.heading[i] = NavMath::normalizeDeg360(h0 + 90.0f * i);
-    }
-    g_precision.finalHeading = h0;
-    serialMotionBegin(SerialMotionSource::GO_SQUARE, SERIAL_SQUARE_TIMEOUT_MS);
-    if (!uploadPrecisionSegment(0)) {
-        g_precision.active = false;
-        serialMotionEnd("route_begin_failed");
+    if (!g_route.beginBoundary(4) ||
+        !g_route.addBoundaryPoint(0, minX - margin, minY - margin) ||
+        !g_route.addBoundaryPoint(1, maxX + margin, minY - margin) ||
+        !g_route.addBoundaryPoint(2, maxX + margin, maxY + margin) ||
+        !g_route.addBoundaryPoint(3, minX - margin, maxY + margin) ||
+        !g_route.endBoundary() ||
+        !g_route.beginForbidden(0, nullptr) || !g_route.endForbidden()) {
+        g_route.stop();
         return false;
     }
+    g_route.endUpload();
+    if (!g_route.isReady()) return false;
+
+    routeexec::RoutePlan& plan = g_routeExecutor.planBufferForBuild();
+    plan.clear();
+    plan.setRouteId(g_nextRouteId++);
+    for (int i = 0; i < 5; ++i) {
+        routeexec::RoutePoint point;
+        point.position = routeexec::LocalPoint(g_sqtest.pX[i],
+                                               g_sqtest.pY[i]);
+        point.type = i == 4 ? routeexec::WaypointType::FINAL_POSITION
+                            : (i == 0 ? routeexec::WaypointType::PASS_THROUGH
+                                      : routeexec::WaypointType::CORNER);
+        point.positionToleranceM = i == 4
+            ? DEBUG_PRECISION_FINAL_RADIUS_M
+            : DEBUG_PRECISION_RADIUS_M;
+        point.headingToleranceDeg = DEBUG_TURN_TOLERANCE_DEG;
+        if (!plan.appendPoint(point, routeexec::SegmentType::LINE,
+                              0.12f, DEBUG_PRECISION_SPEED_MPS)) {
+            g_route.stop();
+            return false;
+        }
+    }
+    if (!plan.finalize() || !activateRoutePlan(plan, "SQTEST")) {
+        g_route.stop();
+        return false;
+    }
+    g_precision = PrecisionDebugMotion{};  // legacy executor stays disabled
+    g_ws.requestDebugNavigation();
+    serialMotionBegin(SerialMotionSource::GO_SQUARE,
+                      SERIAL_SQUARE_TIMEOUT_MS);
     return true;
 }
 
 String handleGoSquareDebugLine(float sideM) {
     // Busy-guard: нельзя стартовать новый debug motion поверх активного.
-    if (g_serialMotion.active) {
+    if (g_serialMotion.active || g_routeExecutor.active()) {
         Serial.printf("[BUSY] GO_SQUARE_DEBUG rejected: serialMotionSource=%s active\n",
                       serialMotionSourceName(g_serialMotion.source));
         return String("ERR,GO_SQUARE_DEBUG,busy_serial_motion");
@@ -3261,6 +5597,9 @@ String handleGoLShapeDebugLine(float firstM, float turnDeg, float secondM) {
                       (double)firstM, (double)turnDeg, (double)secondM);
         return String("ERR,GO_L_SHAPE_DEBUG,bad_args");
     }
+    if (!goPrecheck() || !g_est.get().originSet) {
+        return String("ERR,GO_L_SHAPE_DEBUG,precheck_failed");
+    }
 
     // Reset stats, then delegate to handleGoLShape after capturing
     // the planner's plan output.
@@ -3329,53 +5668,110 @@ void lShapeFinish(const char* reason) {
     g_ltest.finishedMs = millis();
 
     const bool hasWp1 = !isnan(g_ltest.wp1X) && !isnan(g_ltest.wp1Y);
+    const bool hasDriveEnd = !isnan(g_ltest.segment1DriveEndX) &&
+                             !isnan(g_ltest.segment1DriveEndY);
+    const bool hasSegment1PhysicalStop =
+        !isnan(g_ltest.segment1PhysicalStopX) &&
+        !isnan(g_ltest.segment1PhysicalStopY);
+    const bool hasCornerAfterTurn = !isnan(g_ltest.cornerAfterTurnX) &&
+                                    !isnan(g_ltest.cornerAfterTurnY);
     const float ax = g_ltest.startX;
     const float ay = g_ltest.startY;
-    const float wx = hasWp1 ? g_ltest.wp1X : g_ltest.p1x;
-    const float wy = hasWp1 ? g_ltest.wp1Y : g_ltest.p1y;
+    const float driveEndX = hasDriveEnd ? g_ltest.segment1DriveEndX
+                                        : (hasWp1 ? g_ltest.wp1X : g_ltest.p1x);
+    const float driveEndY = hasDriveEnd ? g_ltest.segment1DriveEndY
+                                        : (hasWp1 ? g_ltest.wp1Y : g_ltest.p1y);
+    const float segment1PhysicalStopX = hasSegment1PhysicalStop
+        ? g_ltest.segment1PhysicalStopX : driveEndX;
+    const float segment1PhysicalStopY = hasSegment1PhysicalStop
+        ? g_ltest.segment1PhysicalStopY : driveEndY;
+    const float cornerX = hasCornerAfterTurn ? g_ltest.cornerAfterTurnX
+                                             : (hasWp1 ? g_ltest.wp1X : driveEndX);
+    const float cornerY = hasCornerAfterTurn ? g_ltest.cornerAfterTurnY
+                                             : (hasWp1 ? g_ltest.wp1Y : driveEndY);
     const float fx = g_ltest.finishX;
     const float fy = g_ltest.finishY;
     const float p2x = g_ltest.p2x;
     const float p2y = g_ltest.p2y;
 
-    const float seg1Chord = lshapeDist2d(ax, ay, wx, wy);
-    const float seg2Chord = lshapeDist2d(wx, wy, fx, fy);
+    const float seg1DriveEndChord = lshapeDist2d(ax, ay,
+                                                 driveEndX, driveEndY);
+    const float seg1ActualStopChord = lshapeDist2d(
+        ax, ay, segment1PhysicalStopX, segment1PhysicalStopY);
     const float finalError = lshapeDist2d(fx, fy, p2x, p2y);
-    const float seg1Err = seg1Chord - g_ltest.firstPlan;
-    const float seg2Err = seg2Chord - g_ltest.secondPlan;
-    const float turnActual = NavMath::wrapDeg180(g_ltest.headingFinish - g_ltest.headingStart);
-    const float turnError  = NavMath::wrapDeg180(turnActual - g_ltest.turnPlan);
-    const float totalPath  = g_ltest.pathLen;
+    const float seg1Err = seg1ActualStopChord - g_ltest.firstPlan;
+    const bool turnSnapshotsValid =
+        g_ltest.cornerSnapshots.turnStart.valid &&
+        g_ltest.cornerSnapshots.turnPhysicalStop.valid;
+    const float headingBeforeCorner = turnSnapshotsValid
+        ? g_ltest.cornerSnapshots.turnStart.headingDeg : NAN;
+    const float headingAfterCorner = turnSnapshotsValid
+        ? g_ltest.cornerSnapshots.turnPhysicalStop.headingDeg : NAN;
+    const float turnActual = turnSnapshotsValid
+        ? g_ltest.cornerSnapshots.turnActualDeg() : NAN;
+    const float turnError = turnSnapshotsValid
+        ? NavMath::wrapDeg180(turnActual - g_ltest.turnPlan) : NAN;
+    const float cornerShift = turnSnapshotsValid
+        ? g_ltest.cornerSnapshots.turnPositionChordM()
+        : NAN;
+    const routediag::SegmentPathMetrics& segment1Metrics =
+        g_ltest.segmentMetrics[0];
+    const routediag::SegmentPathMetrics& segment2Metrics =
+        g_ltest.segmentMetrics[1];
+    g_ltest.pathLen1 = segment1Metrics.totalTranslationalPathM();
+    g_ltest.pathLen2 = segment2Metrics.totalTranslationalPathM();
+    g_ltest.pathLen = g_ltest.pathLen1 + g_ltest.pathLen2;
+    const float totalPath = g_ltest.pathLen;
     const float maxCrossAll = (g_ltest.maxCross1 > g_ltest.maxCross2)
                                 ? g_ltest.maxCross1 : g_ltest.maxCross2;
     const uint32_t durationMs = g_ltest.finishedMs - g_ltest.startedMs;
 
-    // Verdict (tightened thresholds: this is a precision test, not a
-    // casual drive). The follower still uses the global arrival radius,
-    // so the chord values carry the underlying early-stop imprecision.
-    // We acknowledge that with the relaxed chord window 0.85..1.15.
+    const char* routeResult = reason ? reason : "unknown";
+    const bool routeArrived = strcmp(routeResult, "arrived") == 0;
     const bool wp1OK = hasWp1;
-    const bool chord1OK = seg1Chord >= 0.85f && seg1Chord <= 1.15f;
-    const bool chord2OK = seg2Chord >= 0.85f && seg2Chord <= 1.15f;
-    const bool finalOK = finalError <= 0.20f;
-    const bool turnOK  = fabsf(turnError) <= 12.0f;
-    const bool crossOK = maxCrossAll <= 0.25f;
-    const bool okAll = wp1OK && chord1OK && chord2OK && finalOK && turnOK && crossOK &&
-                     String(reason) != "timeout";
-    const bool warnAll = wp1OK &&
-        (finalError <= 0.35f) && (fabsf(turnError) <= 20.0f) &&
-        (maxCrossAll <= 0.40f) &&
-        String(reason) != "timeout";
-    const char* verdict = "BAD";
+    const bool qualityEligible = routeArrived && wp1OK && turnSnapshotsValid;
+    const bool okAll = qualityEligible && maxCrossAll <= 0.07f &&
+                       finalError <= 0.12f && fabsf(turnError) <= 5.0f;
+    const bool warnAll = qualityEligible && maxCrossAll <= 0.12f &&
+                         finalError <= 0.20f &&
+                         fabsf(turnError) <= DEBUG_TURN_TOLERANCE_DEG;
+    const char* verdict = "FAIL";
     const char* vReason = "thresholds";
-    if (okAll)            { verdict = "OK";  vReason = "-"; }
-    else if (warnAll)     { verdict = "WARN"; vReason = reason; }
-    else if (!wp1OK)      { vReason = "waypoint_missed"; }
-    else if (String(reason) == "timeout") { vReason = "timeout"; }
-    else { vReason = reason; }
+    if (okAll) { verdict = "OK"; vReason = "-"; }
+    else if (warnAll) { verdict = "WARN"; vReason = "precision_thresholds"; }
+    else if (!routeArrived) { vReason = "route_not_arrived"; }
+    else if (!wp1OK) { vReason = "waypoint_missed"; }
+    else if (!turnSnapshotsValid) { vReason = "turn_snapshot_incomplete"; }
+    else if (maxCrossAll > 0.12f) { vReason = "max_cross"; }
+    else if (finalError > 0.20f) { vReason = "final_error"; }
+    else if (fabsf(turnError) > 5.0f) { vReason = "turn_error"; }
 
-    Serial.printf("[LTEST] SUMMARY result=%s durationMs=%u\n",
-                  reason ? reason : "unknown", (unsigned)durationMs);
+    const float seg1BrakingDistance =
+        segment1Metrics.brakeStart.valid && segment1Metrics.physicalStop.valid
+            ? routediag::distance(segment1Metrics.brakeStart.x,
+                                  segment1Metrics.brakeStart.y,
+                                  segment1Metrics.physicalStop.x,
+                                  segment1Metrics.physicalStop.y)
+            : NAN;
+    const float seg2DriveEndChord =
+        segment2Metrics.segmentStart.valid && segment2Metrics.brakeStart.valid
+            ? routediag::distance(segment2Metrics.segmentStart.x,
+                                  segment2Metrics.segmentStart.y,
+                                  segment2Metrics.brakeStart.x,
+                                  segment2Metrics.brakeStart.y)
+            : NAN;
+    const float seg2ActualStopChord =
+        segment2Metrics.plannedStartToActualStopChordM();
+    const float seg2BrakingDistance =
+        segment2Metrics.brakeStart.valid && segment2Metrics.physicalStop.valid
+            ? routediag::distance(segment2Metrics.brakeStart.x,
+                                  segment2Metrics.brakeStart.y,
+                                  segment2Metrics.physicalStop.x,
+                                  segment2Metrics.physicalStop.y)
+            : NAN;
+
+    Serial.printf("[LTEST] ROUTE_RESULT=%s durationMs=%u finalErr=%.3f\n",
+                  routeResult, (unsigned)durationMs, (double)finalError);
     Serial.printf("[LTEST] SUMMARY_CONFIG arrivalRadius=%.2f finalRadius=%.2f speed=%.2f\n",
                   (double)g_arrivalRadiusM, (double)g_finalArrivalRadiusM,
                   (double)g_forwardSpeedMps);
@@ -3388,31 +5784,108 @@ void lShapeFinish(const char* reason) {
                   (double)g_ltest.p0x, (double)g_ltest.p0y,
                   (double)g_ltest.p1x, (double)g_ltest.p1y,
                   (double)g_ltest.p2x, (double)g_ltest.p2y);
-    Serial.printf("[LTEST] SUMMARY_ACTUAL start=(%.3f,%.3f) wp1=(%.3f,%.3f) finish=(%.3f,%.3f)\n",
+    Serial.printf("[LTEST] SUMMARY_ACTUAL start=(%.3f,%.3f) "
+                  "segment1DriveEnd=(%.3f,%.3f) "
+                  "segment1PhysicalStop=(%.3f,%.3f) "
+                  "cornerAfterTurn=(%.3f,%.3f) cornerShift=%.3f "
+                  "finish=(%.3f,%.3f)\n",
                   (double)ax, (double)ay,
-                  (double)wx, (double)wy,
+                  (double)driveEndX, (double)driveEndY,
+                  (double)segment1PhysicalStopX,
+                  (double)segment1PhysicalStopY,
+                  (double)cornerX, (double)cornerY,
+                  (double)cornerShift,
                   (double)fx, (double)fy);
-    Serial.printf("[LTEST] SUMMARY_SEG1 planned=%.3f chord=%.3f path=%.3f errChord=%+.3f maxCross=%.3f\n",
+    Serial.printf("[LTEST] SUMMARY_SEG1 plannedChord=%.3f "
+                  "driveEnd=(%.3f,%.3f) physicalStop=(%.3f,%.3f) "
+                  "driveEndChord=%.3f actualStopChord=%.3f "
+                  "poweredDrivePath=%.3f brakeCoastPath=%.3f "
+                  "totalTranslationalPath=%.3f brakingDistance=%.3f "
+                  "alongAtBrake=%.3f alongAtPhysicalStop=%.3f "
+                  "crossAtBrake=%+.3f crossAtPhysicalStop=%+.3f "
+                  "errStopChord=%+.3f maxCross=%.3f\n",
                   (double)g_ltest.firstPlan,
-                  (double)seg1Chord,
-                  (double)g_ltest.pathLen1,
+                  (double)segment1Metrics.brakeStart.x,
+                  (double)segment1Metrics.brakeStart.y,
+                  (double)segment1Metrics.physicalStop.x,
+                  (double)segment1Metrics.physicalStop.y,
+                  (double)seg1DriveEndChord,
+                  (double)seg1ActualStopChord,
+                  (double)segment1Metrics.poweredDrivePathM,
+                  (double)segment1Metrics.brakeCoastPathM,
+                  (double)segment1Metrics.totalTranslationalPathM(),
+                  (double)seg1BrakingDistance,
+                  (double)segment1Metrics.alongAtBrakeM,
+                  (double)segment1Metrics.alongAtPhysicalStopM,
+                  (double)segment1Metrics.crossAtBrakeM,
+                  (double)segment1Metrics.crossAtPhysicalStopM,
                   (double)seg1Err,
                   (double)g_ltest.maxCross1);
-    Serial.printf("[LTEST] SUMMARY_SEG2 planned=%.3f chord=%.3f path=%.3f errChord=%+.3f maxCross=%.3f finalErr=%.3f\n",
+    Serial.printf("[LTEST] SUMMARY_SEG2 plannedChord=%.3f "
+                  "driveEnd=(%.3f,%.3f) physicalStop=(%.3f,%.3f) "
+                  "driveEndChord=%.3f actualStopChord=%.3f "
+                  "poweredDrivePath=%.3f brakeCoastPath=%.3f "
+                  "totalTranslationalPath=%.3f brakingDistance=%.3f "
+                  "alongAtBrake=%.3f alongAtPhysicalStop=%.3f "
+                  "crossAtBrake=%+.3f crossAtPhysicalStop=%+.3f "
+                  "errStopChord=%+.3f maxCross=%.3f finalErr=%.3f\n",
                   (double)g_ltest.secondPlan,
-                  (double)seg2Chord,
-                  (double)g_ltest.pathLen2,
-                  (double)seg2Err,
+                  (double)segment2Metrics.brakeStart.x,
+                  (double)segment2Metrics.brakeStart.y,
+                  (double)segment2Metrics.physicalStop.x,
+                  (double)segment2Metrics.physicalStop.y,
+                  (double)seg2DriveEndChord,
+                  (double)seg2ActualStopChord,
+                  (double)segment2Metrics.poweredDrivePathM,
+                  (double)segment2Metrics.brakeCoastPathM,
+                  (double)segment2Metrics.totalTranslationalPathM(),
+                  (double)seg2BrakingDistance,
+                  (double)segment2Metrics.alongAtBrakeM,
+                  (double)segment2Metrics.alongAtPhysicalStopM,
+                  (double)segment2Metrics.crossAtBrakeM,
+                  (double)segment2Metrics.crossAtPhysicalStopM,
+                  (double)(seg2ActualStopChord - g_ltest.secondPlan),
                   (double)g_ltest.maxCross2,
                   (double)finalError);
     Serial.printf("[LTEST] SUMMARY_TURN planned=%.1f actual=%+.1f err=%+.1f "
-                  "headingStart=%.1f headingWp1=%.1f headingFinish=%.1f maxHeadingErr=%.1f\n",
+                  "headingBeforeCorner=%.1f headingAfterCorner=%.1f "
+                  "finalHeading=%.1f maxHeadingErr=%.1f\n",
                   (double)g_ltest.turnPlan,
                   (double)turnActual, (double)turnError,
-                  (double)g_ltest.headingStart,
-                  (double)hasWp1 ? (double)g_ltest.headingWp1 : 0.0,
+                  (double)headingBeforeCorner,
+                  (double)headingAfterCorner,
                   (double)g_ltest.headingFinish,
                   (double)g_ltest.maxHeadingErr);
+    Serial.printf("[LTEST] SUMMARY_TURN_EVENTS "
+                  "cornerApproachBrakeStart=(%.3f,%.3f,%.1f) "
+                  "cornerPhysicalStopBeforeTurn=(%.3f,%.3f,%.1f) "
+                  "turnStart=(%.3f,%.3f,%.1f) "
+                  "turnPhysicalStop=(%.3f,%.3f,%.1f) "
+                  "nextSegmentInterceptStart=(%.3f,%.3f,%.1f)\n",
+                  (double)g_ltest.cornerSnapshots
+                      .cornerApproachBrakeStart.x,
+                  (double)g_ltest.cornerSnapshots
+                      .cornerApproachBrakeStart.y,
+                  (double)g_ltest.cornerSnapshots
+                      .cornerApproachBrakeStart.headingDeg,
+                  (double)g_ltest.cornerSnapshots
+                      .cornerPhysicalStopBeforeTurn.x,
+                  (double)g_ltest.cornerSnapshots
+                      .cornerPhysicalStopBeforeTurn.y,
+                  (double)g_ltest.cornerSnapshots
+                      .cornerPhysicalStopBeforeTurn.headingDeg,
+                  (double)g_ltest.cornerSnapshots.turnStart.x,
+                  (double)g_ltest.cornerSnapshots.turnStart.y,
+                  (double)g_ltest.cornerSnapshots.turnStart.headingDeg,
+                  (double)g_ltest.cornerSnapshots.turnPhysicalStop.x,
+                  (double)g_ltest.cornerSnapshots.turnPhysicalStop.y,
+                  (double)g_ltest.cornerSnapshots.turnPhysicalStop.headingDeg,
+                  (double)g_ltest.cornerSnapshots
+                      .nextSegmentInterceptStart.x,
+                  (double)g_ltest.cornerSnapshots
+                      .nextSegmentInterceptStart.y,
+                  (double)g_ltest.cornerSnapshots
+                      .nextSegmentInterceptStart.headingDeg);
     Serial.printf("[LTEST] SUMMARY_QUALITY totalPath=%.3f maxCross=%.3f maxHeadingErr=%.1f "
                   "maxHAcc=%.3f maxPvtAge=%u maxRtcmAge=%u maxHeadingAge=%u "
                   "maxRelYawAge=%u maxGyroAge=%u\n",
@@ -3424,38 +5897,51 @@ void lShapeFinish(const char* reason) {
                   (unsigned)g_ltest.maxHeadingAge,
                   (unsigned)g_ltest.maxRelYawAge,
                   (unsigned)g_ltest.maxGyroAge);
-    Serial.printf("[LTEST_CSV] result=%s,arrivalRadius=%.2f,finalRadius=%.2f,followSpeed=%.2f,"
-                  "firstPlan=%.3f,firstChord=%.3f,firstPath=%.3f,"
-                  "firstErr=%+.3f,secondPlan=%.3f,secondChord=%.3f,secondPath=%.3f,"
-                  "secondErr=%+.3f,turnPlan=%.1f,turnActual=%+.1f,turnErr=%+.1f,"
-                  "finalErr=%.3f,totalPath=%.3f,maxCross1=%.3f,maxCross2=%.3f,"
-                  "maxCross=%.3f,maxHeadingErr=%.1f,durationMs=%u,"
-                  "maxHAcc=%.3f,maxPvtAge=%u,maxRtcmAge=%u,maxHeadingAge=%u,"
-                  "maxRelYawAge=%u,maxGyroAge=%u\n",
-                  reason ? reason : "unknown",
+    Serial.printf("[LTEST_CSV] routeResult=%s,qualityVerdict=%s,qualityReason=%s,"
+                  "arrivalRadius=%.2f,finalRadius=%.2f,followSpeed=%.2f,"
+                  "firstPlan=%.3f,firstDriveEndChord=%.3f,"
+                  "firstActualStopChord=%.3f,firstPoweredPath=%.3f,"
+                  "firstBrakeCoastPath=%.3f,firstTotalPath=%.3f,"
+                  "secondPlan=%.3f,secondDriveEndChord=%.3f,"
+                  "secondActualStopChord=%.3f,secondPoweredPath=%.3f,"
+                  "secondBrakeCoastPath=%.3f,secondTotalPath=%.3f,"
+                  "turnPlan=%.1f,turnActual=%+.1f,turnErr=%+.1f,"
+                  "headingBeforeCorner=%.1f,headingAfterCorner=%.1f,"
+                  "finalHeading=%.1f,cornerShift=%.3f,finalErr=%.3f,"
+                  "totalPath=%.3f,maxCross1=%.3f,maxCross2=%.3f,"
+                  "maxCross=%.3f,maxHeadingErr=%.1f,durationMs=%u\n",
+                  routeResult, verdict, vReason,
                   (double)g_arrivalRadiusM, (double)g_finalArrivalRadiusM,
                   (double)g_forwardSpeedMps,
-                  (double)g_ltest.firstPlan, (double)seg1Chord, (double)g_ltest.pathLen1, (double)seg1Err,
-                  (double)g_ltest.secondPlan, (double)seg2Chord, (double)g_ltest.pathLen2, (double)seg2Err,
+                  (double)g_ltest.firstPlan,
+                  (double)seg1DriveEndChord,
+                  (double)seg1ActualStopChord,
+                  (double)segment1Metrics.poweredDrivePathM,
+                  (double)segment1Metrics.brakeCoastPathM,
+                  (double)segment1Metrics.totalTranslationalPathM(),
+                  (double)g_ltest.secondPlan,
+                  (double)seg2DriveEndChord,
+                  (double)seg2ActualStopChord,
+                  (double)segment2Metrics.poweredDrivePathM,
+                  (double)segment2Metrics.brakeCoastPathM,
+                  (double)segment2Metrics.totalTranslationalPathM(),
                   (double)g_ltest.turnPlan, (double)turnActual, (double)turnError,
+                  (double)headingBeforeCorner, (double)headingAfterCorner,
+                  (double)g_ltest.headingFinish, (double)cornerShift,
                   (double)finalError,
                   (double)totalPath,
                   (double)g_ltest.maxCross1, (double)g_ltest.maxCross2,
                   (double)maxCrossAll,
                   (double)g_ltest.maxHeadingErr,
-                  (unsigned)durationMs,
-                  (double)g_ltest.maxHAcc,
-                  (unsigned)g_ltest.maxPvtAge,
-                  (unsigned)g_ltest.maxRtcmAge,
-                  (unsigned)g_ltest.maxHeadingAge,
-                  (unsigned)g_ltest.maxRelYawAge,
-                  (unsigned)g_ltest.maxGyroAge);
-    Serial.printf("[LTEST] VERDICT %s reason=%s finalError=%.3f turnError=%+.1f maxCross=%.3f wp1=%d reason=%s\n",
+                  (unsigned)durationMs);
+    Serial.printf("[LTEST] QUALITY_VERDICT=%s QUALITY_REASON=%s "
+                  "finalError=%.3f turnError=%+.1f maxCross=%.3f "
+                  "turnSnapshotsValid=%d wp1=%d\n",
                   verdict, vReason,
                   (double)finalError, (double)turnError,
                   (double)maxCrossAll,
-                  hasWp1 ? 1 : 0,
-                  reason ? reason : "unknown");
+                  turnSnapshotsValid ? 1 : 0,
+                  hasWp1 ? 1 : 0);
 }
 
 // Per-tick update — call from loop() while g_ltest.active.
@@ -3478,7 +5964,17 @@ void lShapeOnTick() {
     // скакать. Логируем только пока реально DRIVE.
     int segLogical = 0;          // 0 или 1 — logical precision segment
     bool drivingNow = false;
-    if (g_precision.active && !g_precision.square) {
+    if (g_routeExecutor.active() || g_routeExecutor.routeFinished()) {
+        const routeexec::RouteExecutorOutput& out =
+            g_routeExecutor.lastOutput();
+        segLogical = out.segmentIndex >= 1u ? 1 : 0;
+        drivingNow =
+            out.state == routeexec::ExecutorState::FOLLOW_SEGMENT ||
+            out.state == routeexec::ExecutorState::APPROACH_TRANSITION ||
+            out.state == routeexec::ExecutorState::INTERCEPT_NEXT_LINE ||
+            out.state == routeexec::ExecutorState::TERMINAL_APPROACH ||
+            out.state == routeexec::ExecutorState::RECOVERY_APPROACH;
+    } else if (g_precision.active && !g_precision.square) {
         segLogical = (g_precision.segment >= 1) ? 1 : 0;
         drivingNow = (g_precision.phase == PrecisionPhase::DRIVE);
     } else {
@@ -3487,19 +5983,6 @@ void lShapeOnTick() {
         segLogical = (g_follow.wpIdx <= 0) ? 0 : 1;
         drivingNow = true;
     }
-
-    // Path length accumulation. Reject > 0.5 m single-step jumps as
-    // RTK jitter rather than real motion.
-    if (drivingNow && !isnan(g_ltest.lastX) && !isnan(g_ltest.lastY)) {
-        const float step = lshapeDist2d(g_ltest.lastX, g_ltest.lastY, x, y);
-        if (step < 0.5f) {
-            g_ltest.pathLen += step;
-            if (segLogical == 0) g_ltest.pathLen1 += step;
-            else                  g_ltest.pathLen2 += step;
-        }
-    }
-    g_ltest.lastX = x;
-    g_ltest.lastY = y;
 
     // Cross-track maxima per logical segment.
     if (drivingNow) {
@@ -3560,8 +6043,8 @@ void lShapeOnTick() {
             : lshapeSignedCross(g_ltest.p1x, g_ltest.p1y,
                                 g_ltest.p2x, g_ltest.p2y, x, y);
         Serial.printf("[LTEST] T t=%u logicalSeg=%d driving=%d pos=(%.3f,%.3f) "
-                      "target=(%.3f,%.3f) dist=%.3f cross=%.3f heading=%.1f "
-                      "hErr=%+.1f speed=%.2f cmdL=%d cmdR=%d safety=%d reason=%s "
+                      "target=(%.3f,%.3f) dist=%.3f crossPlan=%.3f heading=%.1f "
+                      "bearingErrToFinal=%+.1f speed=%.2f cmdL=%d cmdR=%d safety=%d reason=%s "
                       "hAcc=%.3f pvtAge=%u rtcmAge=%u headingAge=%u "
                       "relAge=%u gyroAge=%u\n",
                       (unsigned)(now - g_ltest.startedMs),
@@ -3600,15 +6083,22 @@ static void lShapeRecordWp1() {
     const float wx = g_ltest.wp1X, wy = g_ltest.wp1Y;
     const float p1x = g_ltest.p1x, p1y = g_ltest.p1y;
     const float wp1Err = lshapeDist2d(wx, wy, p1x, p1y);
-    const float firstChord = lshapeDist2d(g_ltest.startX, g_ltest.startY, wx, wy);
+    const float chordEndX = isfinite(g_ltest.segment1DriveEndX)
+        ? g_ltest.segment1DriveEndX : wx;
+    const float chordEndY = isfinite(g_ltest.segment1DriveEndY)
+        ? g_ltest.segment1DriveEndY : wy;
+    const float firstChord = lshapeDist2d(g_ltest.startX, g_ltest.startY,
+                                          chordEndX, chordEndY);
+    const float cornerShift = lshapeDist2d(chordEndX, chordEndY, wx, wy);
     const float crossAt = lshapeSignedCross(
         g_ltest.p0x, g_ltest.p0y, g_ltest.p1x, g_ltest.p1y, wx, wy);
     Serial.printf("[LTEST] WP1_REACHED actual=(%.3f,%.3f) planned=(%.3f,%.3f) "
                   "wp1Err=%.3f firstChord=%.3f firstPath=%.3f cross=%+.3f "
-                  "heading=%.1f\n",
+                  "cornerShift=%.3f heading=%.1f\n",
                   (double)wx, (double)wy, (double)p1x, (double)p1y,
                   (double)wp1Err, (double)firstChord,
                   (double)g_ltest.pathLen1, (double)crossAt,
+                  (double)cornerShift,
                   (double)g_ltest.headingWp1);
 }
 
@@ -4101,8 +6591,8 @@ String navStartAutoAlignLine() {
 // WebSocket-issued variant of NAV_START_AUTO_ALIGN.
 String navStartAutoAlignLineWs() {
     if (g_heading.trusted) {
-        Serial.println("[NAV-AUTO-ALIGN] heading already trusted (ws); sending NAV_START");
-        return roverdbg::handleNavStartLine();
+        Serial.println("[NAV-AUTO-ALIGN] heading already trusted (ws); queuing NAV_START");
+        return roverdbg::queueNavStartLineWs();
     }
     if (g_heading.alignState == AlignState::RUNNING) {
         return String("NAV_START_AUTO_ALIGN,ERR,already_aligning");
@@ -4122,39 +6612,250 @@ String navStartAutoAlignLineWs() {
 // Helper used by NAV_START_AUTO_ALIGN when heading is already trusted.
 // Mirrors the WS NAV_START acceptance check, but goes through the Serial
 // path so the same gates apply.
-String handleNavStartLine() {
-    // We delegate to the same logic WS uses: try to call _route->start
-    // and _navRequested=true. The simplest path is to ask the WS layer.
-    // Since we are on rover.cpp and have direct access to g_route/g_ws,
-    // we run the same gate locally.
+static bool buildLegacyAppRoutePlan(routeexec::RoutePlan& plan) {
     const auto& e = g_est.get();
-    uint32_t now = millis();
-    if (!g_route.isReady()) {
-        return String("ERR,NO_ROUTE");
+    if (g_route.count() < 1) return false;
+
+    plan.clear();
+    plan.setRouteId(g_nextRouteId++);
+    routeexec::RoutePoint start;
+    start.position = routeexec::LocalPoint(e.x, e.y);
+    start.type = routeexec::WaypointType::PASS_THROUGH;
+    start.positionToleranceM = g_arrivalRadiusM;
+
+    int firstUploaded = 0;
+    const Waypoint& first = g_route.waypoint(0);
+    if (lshapeDist2d(e.x, e.y, first.p.x, first.p.y) <= 0.05f) {
+        // Flutter currently uploads the actual route start as WP0. Freeze that
+        // point once; it is never replaced by a later measured pose.
+        start.position = routeexec::LocalPoint(first.p.x, first.p.y);
+        firstUploaded = 1;
+    }
+    if (!plan.appendPoint(start)) return false;
+
+    for (int i = firstUploaded; i < g_route.count(); ++i) {
+        const Waypoint& uploaded = g_route.waypoint(i);
+        routeexec::RoutePoint point;
+        point.position = routeexec::LocalPoint(uploaded.p.x, uploaded.p.y);
+        const bool final = i == g_route.count() - 1;
+        routeexec::SegmentType incomingType = routeexec::SegmentType::LINE;
+        float corridorHalfWidthM = 0.20f;
+        float speedLimitMps = g_forwardSpeedMps;
+        if (g_route.hasWaypointMetadata(i)) {
+            const RouteWaypointMetadata& metadata =
+                g_route.waypointMetadata(i);
+            point.type = metadata.type;
+            point.finalHeadingRequired = metadata.finalHeadingRequired;
+            point.finalHeadingDeg = metadata.finalHeadingDeg;
+            point.positionToleranceM = metadata.positionToleranceM;
+            point.headingToleranceDeg = metadata.headingToleranceDeg;
+            incomingType = metadata.incomingSegmentType;
+            corridorHalfWidthM = metadata.corridorHalfWidthM;
+            speedLimitMps = metadata.speedLimitMps;
+        } else if (final) {
+            point.type = routeexec::WaypointType::FINAL_POSITION;
+            point.finalHeadingRequired = false;
+            point.positionToleranceM = g_finalArrivalRadiusM;
+        } else {
+            // Legacy x/y protocol has no transition metadata. Preserve smooth
+            // polyline points as PASS_THROUGH and conservatively stop at
+            // material direction changes. New metadata can override this in
+            // a future additive protocol command without breaking the app.
+            float incomingHeading = 0.0f;
+            float outgoingHeading = 0.0f;
+            const routeexec::LocalPoint prev =
+                plan.point(plan.pointCount() - 1u).position;
+            incomingHeading = routeexec::bearingDeg(prev, point.position);
+            if (i + 1 < g_route.count()) {
+                const Waypoint& next = g_route.waypoint(i + 1);
+                outgoingHeading = routeexec::bearingDeg(
+                    point.position,
+                    routeexec::LocalPoint(next.p.x, next.p.y));
+            } else {
+                outgoingHeading = incomingHeading;
+            }
+            point.type = fabsf(routeexec::wrapHeadingErrorDeg(
+                outgoingHeading - incomingHeading)) >= 20.0f
+                ? routeexec::WaypointType::CORNER
+                : routeexec::WaypointType::PASS_THROUGH;
+            point.positionToleranceM = g_arrivalRadiusM;
+        }
+        if (!plan.appendPoint(point, incomingType,
+                              corridorHalfWidthM, speedLimitMps)) return false;
+    }
+    return plan.finalize();
+}
+
+static const char* navStartGateError() {
+    const auto& e = g_est.get();
+    if (g_routeStopLatch.load(std::memory_order_acquire)) {
+        return "ERR,STOP_LATCHED";
+    } else if (!g_route.isReady()) {
+        return "ERR,NO_ROUTE";
     } else if (!e.originSet) {
-        return String("ERR,NO_ORIGIN");
+        return "ERR,NO_ORIGIN";
     } else if (e.sol != SOL_FIXED) {
-        return String("ERR,RTK_NOT_FIXED");
+        return "ERR,RTK_NOT_FIXED";
     } else if (e.hAcc > SAFE_HACC_FIXED_M) {
-        return String("ERR,HACC");
+        return "ERR,HACC";
     } else if (e.pvtAgeMs > SAFE_PVT_AGE_MS ||
                e.acceptedPositionAgeMs > SAFE_ACCEPTED_POS_AGE_MS) {
-        return String("ERR,POSITION_STALE");
+        return "ERR,POSITION_STALE";
     } else if (e.rejectedPositionFixes > SAFE_REJECTED_POSITION_FIXES_MAX) {
-        return String("ERR,GPS_JUMP");
+        return "ERR,GPS_JUMP";
     } else if (!e.headingValid || e.headingAgeMs > SAFE_HEADING_AGE_MS) {
-        return String("ERR,HEADING_STALE");
-    } else {
-        g_route.start();
-        g_ws.setNavRequested(true);
-        return String("OK,NAV_START");
+        return "ERR,HEADING_STALE";
     }
+    return nullptr;
+}
+
+String handleNavStartLine() {
+    const char* gateError = navStartGateError();
+    if (gateError != nullptr) return String(gateError);
+    if (g_routeExecutor.active()) return String("ERR,NAV_ACTIVE");
+    routeexec::RoutePlan& plan = g_routeExecutor.planBufferForBuild();
+    plan.clear();
+    if (!buildLegacyAppRoutePlan(plan) ||
+        !activateRoutePlan(plan, "APP_ROUTE")) {
+        return String("ERR,ROUTE_EXECUTOR");
+    }
+    g_ws.setNavRequested(true);
+    return String("OK,NAV_START");
+}
+
+String handleNavPauseLine() {
+    if (!g_routeExecutor.active()) return String("ERR,NO_ACTIVE_ROUTE");
+    const uint32_t now = millis();
+    g_routeExecutor.pause(now);
+    if (g_serialMotion.active && g_serialMotion.pausedAtMs == 0u)
+        g_serialMotion.pausedAtMs = now;
+    g_route.pause();  // compatibility telemetry mirror
+    g_motor.stopImmediately();
+    return String("OK,NAV_PAUSE");
+}
+
+String handleNavResumeLine() {
+    if (!g_routeExecutor.active()) return String("ERR,NO_ACTIVE_ROUTE");
+    const uint32_t now = millis();
+    g_routeExecutor.resume(now);
+    if (g_serialMotion.active && g_serialMotion.pausedAtMs != 0u) {
+        const uint32_t pausedMs = now - g_serialMotion.pausedAtMs;
+        g_serialMotion.startedAtMs += pausedMs;
+        g_serialMotion.safetyArmedAtMs += pausedMs;
+        g_serialMotion.pausedAtMs = 0u;
+    }
+    g_route.resume();
+    return String("OK,NAV_RESUME");
+}
+
+bool routeExecutorActive() {
+    return g_routeExecutorActiveMirror.load(std::memory_order_acquire);
+}
+
+String queueNavStartLineWs() {
+    const char* gateError = navStartGateError();
+    if (gateError != nullptr) return String(gateError);
+    if (routeExecutorActive()) return String("ERR,NAV_ACTIVE");
+    if (!enqueueRouteCommand(PendingRouteCommand::START))
+        return String("ERR,NAV_COMMAND_BUSY");
+    // Reserve navigation immediately so a second client cannot begin a new
+    // upload before the loop consumes START.
+    g_ws.setNavRequested(true);
+    return String("OK,NAV_START");
+}
+
+String queueNavPauseLineWs() {
+    if (!routeExecutorActive()) return String("ERR,NO_ACTIVE_ROUTE");
+    return enqueueRouteCommand(PendingRouteCommand::PAUSE)
+        ? String("OK,NAV_PAUSE") : String("ERR,NAV_COMMAND_BUSY");
+}
+
+String queueNavResumeLineWs() {
+    if (!routeExecutorActive()) return String("ERR,NO_ACTIVE_ROUTE");
+    return enqueueRouteCommand(PendingRouteCommand::RESUME)
+        ? String("OK,NAV_RESUME") : String("ERR,NAV_COMMAND_BUSY");
+}
+
+String queueNavStopLineWs() {
+    g_ws.setNavRequested(false);
+    g_motor.stopImmediately();
+    enqueueRouteCommand(PendingRouteCommand::STOP);
+    return String("OK,NAV_STOP");
+}
+
+String queueStopLineWs() {
+    g_ws.setNavRequested(false);
+    g_motor.stopImmediately();
+    enqueueRouteCommand(PendingRouteCommand::STOP);
+    return String("OK STOP");
+}
+
+void queueWsDisconnectStop() {
+    g_ws.setNavRequested(false);
+    g_motor.stopImmediately();
+    enqueueRouteCommand(PendingRouteCommand::STOP);
+}
+
+static String queueMotionCommandWs(PendingRouteCommand command,
+                                   float arg1, float arg2, float arg3,
+                                   const char* okReply) {
+    if (routeExecutorActive() || g_ws.navRequested())
+        return String("ERR,NAV_ACTIVE");
+    if (!enqueueRouteCommand(command, arg1, arg2, arg3))
+        return String("ERR,NAV_COMMAND_BUSY");
+    g_ws.setNavRequested(true);
+    return String(okReply);
+}
+
+String queueGoForwardWs(float distanceM) {
+    if (!isfinite(distanceM) || distanceM <= 0.0f || distanceM > 2.0f)
+        return String("ERR,GO_FORWARD,bad_args");
+    return queueMotionCommandWs(PendingRouteCommand::GO_FORWARD,
+                                distanceM, 0.0f, 0.0f,
+                                "OK,GO_FORWARD,QUEUED");
+}
+
+String queueGoNorthWs(float distanceM) {
+    if (!isfinite(distanceM) || distanceM <= 0.0f || distanceM > 2.0f)
+        return String("ERR,GO_NORTH,bad_args");
+    return queueMotionCommandWs(PendingRouteCommand::GO_NORTH,
+                                distanceM, 0.0f, 0.0f,
+                                "OK,GO_NORTH,QUEUED");
+}
+
+String queueGoLShapeWs(float firstM, float turnDeg, float secondM,
+                       bool debug) {
+    if (!isfinite(firstM) || firstM <= 0.05f || firstM > 5.0f ||
+        !isfinite(secondM) || secondM <= 0.05f || secondM > 5.0f ||
+        !isfinite(turnDeg) || fabsf(turnDeg) < 5.0f ||
+        fabsf(turnDeg) > 180.0f) {
+        return String(debug ? "ERR,GO_L_SHAPE_DEBUG,bad_args"
+                            : "ERR,GO_L_SHAPE,bad_args");
+    }
+    return queueMotionCommandWs(
+        debug ? PendingRouteCommand::GO_L_SHAPE_DEBUG
+              : PendingRouteCommand::GO_L_SHAPE,
+        firstM, turnDeg, secondM,
+        debug ? "OK,GO_L_SHAPE_DEBUG,QUEUED"
+              : "OK,GO_L_SHAPE,QUEUED");
+}
+
+String queueGoSquareDebugWs(float sideM) {
+    if (!isfinite(sideM) || sideM <= 0.05f || sideM > 5.0f)
+        return String("ERR,GO_SQUARE_DEBUG,bad_args");
+    return queueMotionCommandWs(PendingRouteCommand::GO_SQUARE_DEBUG,
+                                sideM, 0.0f, 0.0f,
+                                "OK,GO_SQUARE_DEBUG,QUEUED");
 }
 
 // STOP: drop the route, abort any running alignment, stop motors. Single
 // source of truth for both Serial `STOP` and WebSocket `STOP` so the two
 // surfaces cannot drift.
 String handleStopLine() {
+    g_routeStopLatch.store(true, std::memory_order_release);
+    clearPendingRouteCommand();
+    g_ws.setNavRequested(false);
+    g_motor.stopImmediately();
     if (g_heading.alignState == AlignState::RUNNING) {
         g_align.active = false;
         g_heading.alignState = AlignState::ERR;
@@ -4164,13 +6865,11 @@ String handleStopLine() {
         g_heading.lastAlignDy = 0;
         Serial.println("[ALIGN-RTK] abort: stopped");
     }
-    g_route.stop();
-    g_motor.stopImmediately();
-    // Clear the serialDebugMotion override so ws_disconnected can
-    // once again become ESTOP for any following session.
-    if (g_serialMotion.active) {
+    if (g_serialMotion.active || g_routeExecutor.active()) {
         serialMotionEnd("stopped");
     }
+    cancelRouteExecutor("stopped", true);
+    g_routeStopLatch.store(false, std::memory_order_release);
     Serial.println("[STOP] motors stopped");
     return String("OK STOP");
 }

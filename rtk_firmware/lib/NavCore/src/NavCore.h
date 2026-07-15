@@ -57,6 +57,9 @@ public:
     static const int MAX_WAYPOINTS = 254;
     static const int MAX_OBSTACLES = 16;
     static const int MAX_OBSTACLE_POINTS = MAX_WAYPOINTS;
+    // A polygon may still contain 254 points, but all forbidden polygons use
+    // one compact pool instead of reserving 16 worst-case arrays in DRAM.
+    static const int MAX_OBSTACLE_TOTAL_POINTS = 512;
 
     NavCore();
 
@@ -71,7 +74,9 @@ public:
     bool addObstacle(const NavPoint* p, int n);
     int  obstacleCount() const { return _obsCount; }
     int  obstacleSize(int i) const { return _obsSize[i]; }
-    const NavPoint* obstacle(int i) const { return _obst[i]; }
+    const NavPoint* obstacle(int i) const {
+        return &_obstPool[_obsOffset[i]];
+    }
 
     // проверить, что путь (a->b) не пересекает ни одно исключение
     bool pathIsClear(const NavPoint& a, const NavPoint& b) const;
@@ -89,9 +94,11 @@ private:
     Waypoint _wps[MAX_WAYPOINTS];
     int _wpCount = 0;
 
-    NavPoint _obst[MAX_OBSTACLES][MAX_OBSTACLE_POINTS];
+    NavPoint _obstPool[MAX_OBSTACLE_TOTAL_POINTS];
+    uint16_t _obsOffset[MAX_OBSTACLES] = {0};
     int _obsSize[MAX_OBSTACLES] = {0};
     int _obsCount = 0;
+    int _obsPointCount = 0;
 
     NavPoint _robot{0, 0};
     float _obstacleMargin = 0.10f;

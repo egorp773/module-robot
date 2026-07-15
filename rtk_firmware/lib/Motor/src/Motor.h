@@ -35,6 +35,9 @@ public:
                uint8_t rxPin = PIN_MOTOR_RX, uint8_t txPin = PIN_MOTOR_TX);
 
     // Главный вход навигации: линейная (м/с) + угловая (рад/с) скорость.
+    // Positive linear means physical forward translation. Positive angular
+    // means clockwise heading increase in DRIVE and TURN_IN_PLACE; the
+    // field-proven mode-aware hoverboard adapter is in MotorCommandMath.h.
     void setLinearAngularSpeed(float linearMps, float angularRadps, bool useRamp = true);
 
     // Ручной режим из app: left/right в процентах (-100..100).
@@ -61,9 +64,19 @@ public:
 
     // ---- телеметрия (реальная, из фидбэка) ----
     bool  haveFeedback() const { return _haveFeedback; }
+    uint32_t feedbackAgeMs(uint32_t nowMs) const;
+    bool feedbackAlive(uint32_t nowMs) const {
+        return feedbackAgeMs(nowMs) <= MOTOR_FEEDBACK_TIMEOUT_MS;
+    }
+    bool hardwareFault() const { return _hardwareFault; }
+    bool commandFault() const { return _commandFault; }
+    void clearSafetyFaults();
     float batteryVolts() const { return _batVoltsFilt; }
     int   batteryPercent() const;                 // по 10S Li-ion кривой
     float boardTempC() const { return _fb.boardTemp * 0.1f; }
+    // Raw side-labelled hoverboard protocol feedback.  No sign normalization
+    // is performed here; a per-side inversion must not be invented without a
+    // forward/backward hardware observation for both tracks.
     int   speedLeftMeas()  const { return _fb.speedL_meas; }
     int   speedRightMeas() const { return _fb.speedR_meas; }
 
@@ -71,7 +84,9 @@ public:
     int   lastSpeedCmd() const { return _cmdSpeed; }
     int   lastSteerCmd() const { return _cmdSteer; }
     uint32_t sendCount() const { return _sendCount; }
-    // совместимость со старой телеметрией WsServer (left/right "pwm"-эквивалент)
+    // Legacy hoverboard virtual-channel targets used by telemetry.  These are
+    // not normalized physical track velocities in every motion mode; see the
+    // mode-aware sign contract in MotorCommandMath.h.
     int   currentLeftPwm()  const { return _curLeftPct; }
     int   currentRightPwm() const { return _curRightPct; }
 
@@ -99,6 +114,7 @@ private:
     int   _curLeftPct = 0, _curRightPct = 0;
 
     uint32_t _lastSendMs = 0;
+    uint32_t _lastDeadbandLogMs = 0;
     uint32_t _lastSetMs  = 0;                        // когда последний раз задавали команду
     uint32_t _startupHoldUntilMs = 0;                // первые N мс не слать (плата FOC стартует)
     uint32_t _sendCount = 0;                         // счётчик отправленных пакетов (диагностика 50Гц)
@@ -112,5 +128,9 @@ private:
     uint8_t  _fbPrev = 0;
     uint8_t* _fbP = nullptr;
     bool     _haveFeedback = false;
+    volatile uint32_t _lastFeedbackMs = 0;
+    volatile bool _feedbackFault = false;
+    volatile bool _hardwareFault = false;
+    volatile bool _commandFault = false;
     float    _batVoltsFilt = 0.0f;
 };

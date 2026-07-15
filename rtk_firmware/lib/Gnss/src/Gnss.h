@@ -14,6 +14,15 @@ struct RtcmStatus {
     uint32_t lastRxMs = 0;
 };
 
+struct GnssPvtData {
+    int32_t latE7 = 0, lonE7 = 0, heightMm = 0;
+    int32_t hAccMm = 0, vAccMm = 0, gSpeedMmps = 0;
+    int32_t headMotDegE5 = 0, headAccDegE5 = 0;
+    int fixType = 0, carrierSol = 0, numSv = 0;
+    bool diffSoln = false;
+    float pDop = 99.0f;
+};
+
 class Gnss {
 public:
     bool begin(HardwareSerial& serial, GnssRole role);
@@ -39,7 +48,14 @@ public:
         _hasFreshPvt = false;
         return fresh;
     }
+    bool consumeFreshPvt(GnssPvtData& out);
     uint32_t pvtAgeMs(uint32_t nowMs) const;
+    uint32_t pvtCount() const { return _pvtCount; }
+    uint32_t lastPvtIntervalMs() const { return _lastPvtIntervalMs; }
+    uint32_t lastPvtITowDeltaMs() const { return _lastPvtITowDeltaMs; }
+    uint32_t uartRxBytes() const { return _uartRxBytes; }
+    uint32_t ubxChecksumFailures() const { return _ubxChecksumFailures; }
+    uint32_t ubxOversizePackets() const { return _ubxOversizePackets; }
 
     // доступ к внутреннему объекту
     SFE_UBLOX_GNSS& ubx() { return _gnss; }
@@ -75,6 +91,9 @@ private:
     void captureRxmRtcmPayload(const uint8_t *p, uint16_t len);
     void sendUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len);
     void enableRoverRtcmStatus();
+    void configureRoverPvtRate();
+    void startRoverRxTask();
+    static void roverRxTaskTrampoline(void* arg);
 
     SFE_UBLOX_GNSS _gnss;
     HardwareSerial* _serial = nullptr;
@@ -83,11 +102,21 @@ private:
     uint32_t _lastPvtMs = 0;
     uint32_t _lastPvtITow = 0xFFFFFFFFu;
 
-    enum UbxParseState : uint8_t { UBX_SYNC1, UBX_SYNC2, UBX_CLASS, UBX_ID, UBX_LEN1, UBX_LEN2, UBX_PAYLOAD, UBX_CKA, UBX_CKB };
+    enum UbxParseState : uint8_t { UBX_SYNC1, UBX_SYNC2, UBX_CLASS, UBX_ID, UBX_LEN1, UBX_LEN2, UBX_PAYLOAD, UBX_CKA, UBX_CKB, UBX_SKIP };
     UbxParseState _ubxState = UBX_SYNC1;
     uint8_t _ubxClass = 0, _ubxId = 0, _ubxCkA = 0, _ubxCkB = 0;
     uint16_t _ubxLen = 0, _ubxIdx = 0;
-    uint8_t _ubxPayload[100]{};
+    uint16_t _ubxSkipRemaining = 0;
+    uint8_t _ubxPayload[128]{};
+    TaskHandle_t _rxTask = nullptr;
+    volatile bool _rxTaskRunning = false;
+    portMUX_TYPE _pvtMux = portMUX_INITIALIZER_UNLOCKED;
+    volatile uint32_t _pvtCount = 0;
+    volatile uint32_t _lastPvtIntervalMs = 0;
+    volatile uint32_t _lastPvtITowDeltaMs = 0;
+    volatile uint32_t _uartRxBytes = 0;
+    volatile uint32_t _ubxChecksumFailures = 0;
+    volatile uint32_t _ubxOversizePackets = 0;
 
     // raw PVT cache
     int32_t _latE7 = 0, _lonE7 = 0;

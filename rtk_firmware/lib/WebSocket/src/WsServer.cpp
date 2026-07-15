@@ -4,6 +4,42 @@
 #include "RtkConfig.h"
 #include "RoverDebug.h"
 
+namespace {
+
+bool parseWaypointType(const char* text, routeexec::WaypointType& type) {
+    if (strcmp(text, "PASS_THROUGH") == 0) {
+        type = routeexec::WaypointType::PASS_THROUGH;
+    } else if (strcmp(text, "CORNER") == 0) {
+        type = routeexec::WaypointType::CORNER;
+    } else if (strcmp(text, "FINAL_POSITION") == 0) {
+        type = routeexec::WaypointType::FINAL_POSITION;
+    } else if (strcmp(text, "FINAL_POSE") == 0) {
+        type = routeexec::WaypointType::FINAL_POSE;
+    } else if (strcmp(text, "WORK_ACTION") == 0) {
+        type = routeexec::WaypointType::WORK_ACTION;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool parseSegmentType(const char* text, routeexec::SegmentType& type) {
+    if (strcmp(text, "LINE") == 0) {
+        type = routeexec::SegmentType::LINE;
+    } else if (strcmp(text, "COVERAGE_LANE") == 0) {
+        type = routeexec::SegmentType::COVERAGE_LANE;
+    } else if (strcmp(text, "COVERAGE_SHIFT") == 0) {
+        type = routeexec::SegmentType::COVERAGE_SHIFT;
+    } else if (strcmp(text, "TERMINAL_APPROACH") == 0) {
+        type = routeexec::SegmentType::TERMINAL_APPROACH;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 void WsServer::begin(StateEstimator& est, Imu& imu, Gnss& gnss, RtcmLink& rtcm,
                      Route& route, Motor& motor, Safety& safety, uint16_t port) {
     _est = &est; _imu = &imu; _gnss = &gnss; _rtcm = &rtcm;
@@ -37,15 +73,14 @@ void WsServer::onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     } else if (type == WS_EVT_DISCONNECT) {
         if (_client == client) _client = nullptr;
         stopActuators();
-        _motor->stopImmediately();
-        _route->stop();
-        _navRequested = false;
-        // узнаем, остались ли ещё клиенты
-        if (server->count() == 0) {
+        const bool noClients = server->count() == 0;
+        if (noClients) {
             _connected = false;
-            _motor->stopImmediately();
-            _route->stop();
-            _navRequested = false;
+            if (!_serialMotionActive) {
+                _motor->stopImmediately();
+                _navRequested = false;
+                roverdbg::queueWsDisconnectStop();
+            }
         }
     } else if (type == WS_EVT_DATA) {
         AwsFrameInfo* info = (AwsFrameInfo*)arg;
@@ -188,6 +223,9 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         if (line.startsWith("GO_FORWARD,")) {
             distance = atof(line.c_str() + 11);
         }
+        sendText(client, roverdbg::queueGoForwardWs(distance));
+        return;
+#if 0  // Route lifecycle commands are consumed only by the main loop.
         if (roverdbg::handleGoForward(distance)) {
             // handleGo() только готовит маршрут, но stepFollower() в loop() крутится
             // только если navRequested==true. Без этого — маршрут запущен, моторы стоят.
@@ -196,6 +234,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         } else {
             sendText(client, "ERR,GO_FORWARD: " + roverdbg::diagLine());
         }
+#endif
         return;
     }
     if (line == "GO_NORTH" || line.startsWith("GO_NORTH,")) {
@@ -203,30 +242,39 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         if (line.startsWith("GO_NORTH,")) {
             distance = atof(line.c_str() + 9);
         }
+        sendText(client, roverdbg::queueGoNorthWs(distance));
+        return;
+#if 0
         if (roverdbg::handleGoNorth(distance)) {
             _navRequested = true;
             sendText(client, "OK,GO_NORTH: " + roverdbg::diagLine());
         } else {
             sendText(client, "ERR,GO_NORTH: " + roverdbg::diagLine());
         }
+#endif
         return;
     }
     if (line.startsWith("GO_L_SHAPE_DEBUG")) {
         float firstM = 1.0f, turnDeg = 90.0f, secondM = 1.0f;
         int parsed = 0;
-        if (line.length() > 16 && line.c_str()[15] == ',') {
-            parsed = sscanf(line.c_str() + 16, "%f,%f,%f",
+        if (line.length() > 17 && line.c_str()[16] == ',') {
+            parsed = sscanf(line.c_str() + 17, "%f,%f,%f",
                             &firstM, &turnDeg, &secondM);
         }
         if (parsed < 3) {
             sendText(client, "ERR,GO_L_SHAPE_DEBUG_FORMAT");
             return;
         }
+        sendText(client, roverdbg::queueGoLShapeWs(
+            firstM, turnDeg, secondM, true));
+        return;
+#if 0
         const String reply = roverdbg::handleGoLShapeDebugLine(firstM, turnDeg, secondM);
         sendText(client, reply);
         if (reply.startsWith("OK")) {
             _navRequested = true;
         }
+#endif
         return;
     }
     if (line.startsWith("GO_SQUARE_DEBUG")) {
@@ -239,11 +287,15 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
             sendText(client, "ERR,GO_SQUARE_DEBUG_FORMAT");
             return;
         }
+        sendText(client, roverdbg::queueGoSquareDebugWs(sideM));
+        return;
+#if 0
         const String reply = roverdbg::handleGoSquareDebugLine(sideM);
         sendText(client, reply);
         if (reply.startsWith("OK")) {
             _navRequested = true;
         }
+#endif
         return;
     }
     if (line.startsWith("GO_L_SHAPE")) {
@@ -256,12 +308,17 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
                 return;
             }
         }
+        sendText(client, roverdbg::queueGoLShapeWs(
+            firstM, turnDeg, secondM, false));
+        return;
+#if 0
         if (roverdbg::handleGoLShape(firstM, turnDeg, secondM)) {
             _navRequested = true;
             sendText(client, "OK,GO_L_SHAPE");
         } else {
             sendText(client, "ERR,GO_L_SHAPE: " + roverdbg::diagLine());
         }
+#endif
         return;
     }
     if (line == "DIAG") {
@@ -294,7 +351,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
     if (line == "STOP") {
         // Single source of truth: roverdbg::handleStopLine() also aborts
         // any running AUTO_ALIGN_HEADING_BY_RTK and logs the abort.
-        sendText(client, roverdbg::handleStopLine());
+        sendText(client, roverdbg::queueStopLineWs());
         _navRequested = false;
         return;
     }
@@ -336,8 +393,11 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
             left  /= ROVER_INPUT_DIV;
             right /= ROVER_INPUT_DIV;
             // в навигации — игнорим ручной ввод
-            if (!_navRequested) {
+            if (!_navRequested && !roverdbg::routeExecutorActive()) {
                 _motor->setManualPercent(left, right);
+            } else {
+                sendText(client, "ERR,NAV_ACTIVE");
+                return;
             }
             sendText(client, "OK M");
         } else {
@@ -351,7 +411,7 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         int count = 0;
         double lat = 0, lon = 0;
         if (sscanf(line.c_str(), "ROUTE_BEGIN,%d,%lf,%lf", &count, &lat, &lon) == 3) {
-            if (_navRequested || _route->isRunning()) {
+            if (_navRequested || roverdbg::routeExecutorActive()) {
                 sendText(client, "ERR,NAV_ACTIVE");
                 return;
             }
@@ -386,6 +446,34 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
             }
         } else {
             sendText(client, "ERR,ROUTE_WP_FORMAT");
+        }
+        return;
+    }
+    // Optional additive waypoint semantics. Legacy apps can continue sending
+    // only ROUTE_WP. Format:
+    // ROUTE_WP_META,index,type,posTol,headingRequired,heading,headingTol,
+    //               incomingSegmentType,corridorHalfWidth,speedLimit
+    if (line.startsWith("ROUTE_WP_META,")) {
+        int idx = 0;
+        int headingRequired = 0;
+        char waypointType[24] = {0};
+        char segmentType[24] = {0};
+        RouteWaypointMetadata metadata;
+        const int parsed = sscanf(
+            line.c_str(),
+            "ROUTE_WP_META,%d,%23[^,],%f,%d,%f,%f,%23[^,],%f,%f",
+            &idx, waypointType, &metadata.positionToleranceM,
+            &headingRequired, &metadata.finalHeadingDeg,
+            &metadata.headingToleranceDeg, segmentType,
+            &metadata.corridorHalfWidthM, &metadata.speedLimitMps);
+        metadata.finalHeadingRequired = headingRequired == 1;
+        if (parsed == 9 && (headingRequired == 0 || headingRequired == 1) &&
+            parseWaypointType(waypointType, metadata.type) &&
+            parseSegmentType(segmentType, metadata.incomingSegmentType) &&
+            _route->setWaypointMetadata(idx, metadata)) {
+            sendText(client, "OK,ROUTE_WP_META," + String(idx));
+        } else {
+            sendText(client, "ERR,ROUTE_WP_META");
         }
         return;
     }
@@ -468,21 +556,18 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
         // It honours RTK + estimator heading trust, and the resulting
         // navigation works whether heading is sourced from IMU absolute
         // OK, manual trust, or RTK-motion alignment.
-        const String reply = roverdbg::handleNavStartLine();
+        const String reply = roverdbg::queueNavStartLineWs();
         sendText(client, reply);
         if (reply.startsWith("OK,NAV_START")) {
             _navRequested = true;
         }
         return;
     }
-    if (line == "NAV_PAUSE")  { _route->pause();  sendText(client, "OK,NAV_PAUSE"); return; }
-    if (line == "NAV_RESUME") { _route->resume(); sendText(client, "OK,NAV_RESUME"); return; }
+    if (line == "NAV_PAUSE")  { sendText(client, roverdbg::queueNavPauseLineWs()); return; }
+    if (line == "NAV_RESUME") { sendText(client, roverdbg::queueNavResumeLineWs()); return; }
     if (line == "NAV_STOP") {
-        stopActuators();
-        _route->stop();
+        sendText(client, roverdbg::queueNavStopLineWs());
         _navRequested = false;
-        _motor->stopImmediately();
-        sendText(client, "OK,NAV_STOP");
         return;
     }
 

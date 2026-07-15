@@ -142,13 +142,18 @@ void NavCore::clearObstacles() {
         _obsSize[i] = 0;
     }
     _obsCount = 0;
+    _obsPointCount = 0;
 }
 
 bool NavCore::addObstacle(const NavPoint* p, int n) {
     if (_obsCount >= MAX_OBSTACLES) return false;
     if (n < 3 || n > MAX_OBSTACLE_POINTS) return false;
-    for (int i = 0; i < n; ++i) _obst[_obsCount][i] = p[i];
+    if (p == nullptr || _obsPointCount + n > MAX_OBSTACLE_TOTAL_POINTS)
+        return false;
+    _obsOffset[_obsCount] = static_cast<uint16_t>(_obsPointCount);
+    for (int i = 0; i < n; ++i) _obstPool[_obsPointCount + i] = p[i];
     _obsSize[_obsCount] = n;
+    _obsPointCount += n;
     _obsCount++;
     return true;
 }
@@ -158,7 +163,8 @@ bool NavCore::pathIsClear(const NavPoint& a, const NavPoint& b) const {
     for (int i = 0; i < _obsCount; ++i) {
         NavPoint inflated[MAX_OBSTACLE_POINTS];
         int inflatedN = 0;
-        navPolygonOffset(_obst[i], _obsSize[i], _obstacleMargin, inflated, &inflatedN);
+        navPolygonOffset(obstacle(i), _obsSize[i], _obstacleMargin,
+                         inflated, &inflatedN);
         if (navLineHitsPolygon(a, b, inflated, inflatedN)) return false;
     }
     return true;
