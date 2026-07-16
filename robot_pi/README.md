@@ -56,6 +56,27 @@ new STOP case; select the new firmware explicitly with `pio run -e pi_bridge`.
 | `module_robot_bringup` | Manual-safe default launch and separate autonomous preflight |
 | `module_robot_tools` | Commissioning and diagnostic helpers |
 
+## Staged Pi installation and build
+
+Both scripts default to `--stage manual`; commissioning records should pass the
+stage explicitly. Before apt changes, `install_pi.sh` prints `df -h /` and
+requires 3 GiB free for manual or 8 GiB for full. It never deletes user data.
+
+Manual apt installation contains ROS base/development tools, colcon, rosdep,
+vcstool, Python serial/YAML/WebSocket support, the C/C++ build toolchain and USB
+diagnostic utilities. It does not install Navigation2, nav2 bringup,
+robot_localization, robot-state-publisher/xacro/TF tools, twist mux, RViz,
+teleop keyboard or diagnostic updater/aggregator packages.
+
+The full stage adds exactly those deferred ROS packages. Manual `rosdep` and
+colcon processing is restricted to `module_robot_msgs`,
+`module_robot_esp32_bridge`, `module_robot_safety`, `module_robot_gateway`,
+`module_robot_bringup` and `module_robot_tools`; optional description and
+autonomous workspace dependencies referenced by bringup are explicitly skipped
+for this stage. Full processes all nine workspace packages. Both build stages
+run `colcon test` followed by `colcon test-result --verbose` and fail on any
+reported test failure. No `COLCON_IGNORE` files are written into the checkout.
+
 ## ROS interfaces
 
 Command flow:
@@ -89,13 +110,19 @@ The compatibility WebSocket is not an Internet security boundary. Use it only
 on a controlled robot LAN, block inbound WAN access, and disarm when no operator
 is actively driving. Once manual ARM has been granted, an untrusted client able
 to reach the legacy endpoint must be treated as a motion-command risk.
+Commissioning systemd explicitly starts manual bringup with
+`start_gateway:=false`; the first manual tests use ROS services/topics from the
+laptop over SSH. Gateway startup is a later manual action. Before phone control
+is used in the field, authentication and single-session command authority need
+a separate reviewed task. This patch intentionally adds no authentication
+framework and makes no Flutter changes.
 
 ## First use
 
 Follow [FIRST_BOOT.md](FIRST_BOOT.md), then execute the gates in
-[ACCEPTANCE_TESTS.md](ACCEPTANCE_TESTS.md) in order. Gates 1 and 2 are
-non-motion checks. The first lifted, low-speed manual pulse is then used to
-prove the command path before the Gate 3 watchdog/fault injections. The robot
+[ACCEPTANCE_TESTS.md](ACCEPTANCE_TESTS.md) in order. Power, the real Pi ROS
+build/tests, binary loopback, pre-ARM probe and zero-only STOP all precede the
+first lifted pulse. USB/process/reboot fault injection remains lifted. The robot
 must not be placed on the ground, and autonomy must remain inhibited, until
 manual control and every required STOP case have both been proved.
 
@@ -103,12 +130,19 @@ Useful entrypoints on the Pi:
 
 ```bash
 chmod +x robot_pi/scripts/*.sh robot_pi/scripts/*.py
-./robot_pi/scripts/install_pi.sh
-sudo ./robot_pi/scripts/setup_udev.sh --device /dev/ttyACM0
-./robot_pi/scripts/build_workspace.sh
+./robot_pi/scripts/install_pi.sh --stage manual
+./robot_pi/scripts/setup_udev.sh --device /dev/ttyUSB0
+# Run exactly the --install-by-serial or --install-by-path command it prints.
 ./robot_pi/scripts/first_boot_check.sh
+./robot_pi/scripts/build_workspace.sh --stage manual
+./robot_pi/scripts/pre_arm_hardware_probe.sh
 ./robot_pi/scripts/diagnostics.sh
 ```
+
+The manual stage builds/tests only messages, bridge, safety, gateway package,
+manual bringup and tools. `--stage full` is an explicit later operation that
+adds description, localization, Navigation2 and RViz dependencies; neither
+stage enables or starts systemd units.
 
 Systemd templates are rendered by `configure_pi.sh`, but are deliberately not
 enabled or started. No Docker, micro-ROS or `ros2_control` is used in stage 1.
@@ -135,5 +169,5 @@ autonomous preflight pass.
 automatic `SET_LIMITS` command. The bridge deliberately does not push it at
 startup or reconnect. First lifted movement remains inside the conservative
 compiled ESP32 hard clamps; track signs, width, scale and deadband still require
-Gate 4 measurement. Applying calibrated limits later must be an explicit,
+lifted Gate 6 evidence and Gate 8 ground validation. Applying calibrated limits later must be an explicit,
 reviewed operation (or reviewed firmware update), never reconnect behavior.

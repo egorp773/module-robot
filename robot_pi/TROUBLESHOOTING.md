@@ -9,14 +9,18 @@ old motion command could move the machine.
 ```bash
 lsusb
 dmesg --ctime | tail -n 100
-./robot_pi/scripts/setup_udev.sh
-./robot_pi/scripts/setup_udev.sh --device /dev/ttyACM0
+./robot_pi/scripts/setup_udev.sh --device /dev/ttyUSB0
 ```
 
-If VID/PID/serial differ from the installed rule, determine why; do not weaken
-the rule to match every USB serial adapter. Re-render it with real values and
-replug the device. A board without a stable USB serial needs a deliberate
-hardware/udev strategy before field use.
+Select the actual tty explicitly; the script never guesses among candidates.
+If `ID_SERIAL_SHORT` is present, use its recommended `--install-by-serial`
+command. Only when it is absent may `--install-by-path` use the reported
+`ID_PATH`; that fallback binds the name to one physical Pi USB port (or the full
+hub-port topology). If any
+VID/PID/serial/path value differs from an installed rule, determine why rather
+than weakening the match. The installer refuses VID/PID-only rules and refuses
+to overwrite an existing rule. Replug the device after a deliberate rule
+change.
 
 ## Permission denied opening serial
 
@@ -117,11 +121,11 @@ without deleting configs or logs.
 ## Gateway cannot bind WebSocket port 81
 
 Port 81 is retained for legacy Flutter compatibility and is privileged on the
-default Ubuntu configuration. Do not run the ROS stack as root. The rendered
-`module-robot-bringup.service` grants only `CAP_NET_BIND_SERVICE` to the
-non-root robot user. For a manual developer launch, either keep the gateway
-disabled (the default) or temporarily select an unprivileged port above 1024
-and configure the client to match.
+default Ubuntu configuration. Do not run the ROS stack as root. The
+commissioning `module-robot-bringup.service` keeps the gateway disabled and is
+not granted `CAP_NET_BIND_SERVICE`. For a later manual developer launch on a
+controlled bench network, select an unprivileged port above 1024 and configure
+the client to match.
 
 Do not expose port 81 through the router or to an untrusted Wi-Fi network. The
 legacy compatibility protocol is not a replacement for authentication or a

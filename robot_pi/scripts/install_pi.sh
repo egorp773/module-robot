@@ -8,6 +8,53 @@ readonly EXPECTED_ARCH="arm64"
 
 log() { printf '[install_pi] %s\n' "$*"; }
 die() { printf '[install_pi] ERROR: %s\n' "$*" >&2; exit 1; }
+usage() {
+  cat <<'EOF'
+Usage: ./install_pi.sh [--stage manual|full]
+
+Stages:
+  manual  Install only commissioning/manual-control dependencies (default).
+  full    Also install Navigation2, localization, description/TF and RViz tools.
+EOF
+}
+
+stage=manual
+while (($#)); do
+  case "$1" in
+    --stage)
+      (($# >= 2)) || die '--stage requires manual or full'
+      stage="$2"
+      shift 2
+      ;;
+    --stage=*)
+      stage="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "Unknown argument: $1"
+      ;;
+  esac
+done
+
+case "$stage" in
+  manual) minimum_free_gib=3 ;;
+  full) minimum_free_gib=8 ;;
+  *) die "Invalid stage '${stage}'; expected manual or full" ;;
+esac
+
+log "Selected installation stage: ${stage}"
+df -h /
+available_kib="$(df -Pk / | awk 'NR == 2 { print $4 }')"
+[[ "$available_kib" =~ ^[0-9]+$ ]] || die 'Could not determine free space on /'
+minimum_free_kib=$((minimum_free_gib * 1024 * 1024))
+if ((available_kib < minimum_free_kib)); then
+  die "Stage ${stage} requires at least ${minimum_free_gib} GiB free on /; no data was removed"
+fi
+log "Free-space gate passed: stage ${stage} requires at least ${minimum_free_gib} GiB"
 
 [[ -r /etc/os-release ]] || die '/etc/os-release is missing'
 # shellcheck disable=SC1091
@@ -57,7 +104,7 @@ fi
 
 "${SUDO[@]}" apt-get update
 
-packages=(
+base_apt_packages=(
   ros2-apt-source
   ros-jazzy-ros-base
   ros-dev-tools
@@ -76,6 +123,9 @@ packages=(
   ninja-build
   usbutils
   lsof
+)
+
+full_only_apt_packages=(
   ros-jazzy-navigation2
   ros-jazzy-nav2-bringup
   ros-jazzy-robot-localization
@@ -89,6 +139,11 @@ packages=(
   ros-jazzy-rviz2
 )
 
+packages=("${base_apt_packages[@]}")
+if [[ "$stage" == full ]]; then
+  packages+=("${full_only_apt_packages[@]}")
+fi
+
 missing=()
 for package in "${packages[@]}"; do
   apt-cache show "$package" >/dev/null 2>&1 || missing+=("$package")
@@ -99,7 +154,7 @@ if ((${#missing[@]})); then
   die 'Check network access and the ros2-apt-source installation; no package error was hidden'
 fi
 
-log 'Installing ROS 2 Jazzy and robot dependencies'
+log "Installing ROS 2 Jazzy dependencies for stage ${stage}"
 "${SUDO[@]}" apt-get install -y "${packages[@]}"
 
 if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then
@@ -116,6 +171,49 @@ else
   sudo -H -u "$target_user" rosdep update
 fi
 
+# Manual commissioning intentionally builds an exact package selection. The
+# bringup manifest also names description/localization/navigation for its
+# guarded autonomous launch, so those three source keys are skipped when
+# resolving only the manual package directories. No COLCON_IGNORE files are
+# written into the checkout.
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+workspace_src="$(cd -- "${script_dir}/../ros2_ws/src" && pwd -P)"
+manual_workspace_packages=(
+  module_robot_msgs
+  module_robot_esp32_bridge
+  module_robot_safety
+  module_robot_gateway
+  module_robot_bringup
+  module_robot_tools
+)
+manual_rosdep_skip_keys=(
+  module_robot_description
+  module_robot_localization
+  module_robot_navigation
+)
+
+log "Resolving workspace dependencies for stage ${stage}"
+if [[ "$stage" == manual ]]; then
+  manual_package_paths=()
+  for package in "${manual_workspace_packages[@]}"; do
+    package_path="${workspace_src}/${package}"
+    [[ -f "${package_path}/package.xml" ]] || die "Manual package is missing: ${package_path}"
+    manual_package_paths+=("$package_path")
+  done
+  rosdep install \
+    --from-paths "${manual_package_paths[@]}" \
+    --ignore-src \
+    --rosdistro jazzy \
+    --skip-keys="${manual_rosdep_skip_keys[*]}" \
+    -y
+else
+  rosdep install \
+    --from-paths "$workspace_src" \
+    --ignore-src \
+    --rosdistro jazzy \
+    -y
+fi
+
 target_home="$(getent passwd "$target_user" | cut -d: -f6)"
 [[ -n "$target_home" ]] || die "Cannot determine home directory for ${target_user}"
 bashrc="${target_home}/.bashrc"
@@ -126,5 +224,5 @@ if ! "${SUDO[@]}" grep -Fqx "$setup_line" "$bashrc"; then
 fi
 "${SUDO[@]}" chown "$target_user":"$(id -gn "$target_user")" "$bashrc"
 
-log 'Installation complete. This script did not enable or start robot services.'
-log 'Reboot, connect ESP32 over USB, then run setup_udev.sh and build_workspace.sh.'
+log "Stage ${stage} installation complete. This script did not enable or start robot services."
+log "Reboot, connect ESP32 over USB, then run setup_udev.sh and build_workspace.sh --stage ${stage}."

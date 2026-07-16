@@ -37,7 +37,7 @@ Protocol v1 reports `RXM-RTCM` age but does not define a Pi-to-ESP `RTCM_DATA`
 message. Therefore RTK FLOAT/FIXED requires that the F9P already receive
 corrections through a separate proven hardware/radio port. If corrections are
 supposed to originate on the Pi, design a bounded, CRC-protected protocol-v2
-transport before Gate 5; the removed legacy Wi-Fi RTCM path is not active.
+transport before Gate 9 autonomy; the removed legacy Wi-Fi RTCM path is not active.
 
 ## UART crossing
 

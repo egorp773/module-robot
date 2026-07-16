@@ -14,7 +14,7 @@ limits:
 
 mixer:
   # Do not replace these strings with convenient zeros. Measure geometry and
-  # calibrate each sign/scale with Gate 4 while the tracks are lifted.
+  # calibrate each sign/scale from lifted Gate 6 evidence before Gate 8 ground use.
   track_width_m: TODO_MEASURE
   left_sign: TODO_CALIBRATE
   right_sign: TODO_CALIBRATE

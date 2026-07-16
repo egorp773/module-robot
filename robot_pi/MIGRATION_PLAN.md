@@ -6,64 +6,67 @@ not inherit the `pi_bridge` safety case. Flash it only as a deliberate,
 traction-disabled recovery operation, then re-run the safety case appropriate
 to that firmware; it is not an operational fallback for guaranteed STOP.
 
-## Stage 0 — preserve and inventory
+## Stage 0 -- preserve, power and inventory
 
 1. Record the current `rover` firmware build identifier and physical wiring.
 2. Build both `rover` and `pi_bridge` from the same repository revision.
-3. Capture ESP32 USB VID, PID and serial; render the udev rule.
+3. Capture ESP32 USB VID/PID plus serial, or ID_PATH only when serial is absent.
 4. Measure power rails with motors disabled.
 5. Leave the tracks lifted and attachment power disconnected.
 
-Exit criterion: Gate 1 (power) passes and neither image changes relay/motor
-state unexpectedly at boot.
+Exit criterion: acceptance Gate 1 (power) passes and neither image changes
+relay/motor state unexpectedly at boot.
 
-## Stage 1 — serial bridge and guaranteed STOP
+## Stage 1 -- manual commissioning and guaranteed STOP
 
-1. Flash `pi_bridge`; do not enable systemd.
-2. Start only `module_robot_esp32_bridge` and observe `HELLO_ACK`/status.
-3. Verify a clean boot/reconnect remains DISARMED, while an existing FAULT or
-   ESTOP latch survives reconnect; no path may reconnect into ARMED.
-4. Verify protocol corruption, stale/duplicate sequences and reconnect behavior.
-5. With Gates 1 and 2 recorded, stop the bridge-only launch and start the
-   manual-safe bringup (bridge plus safety, no autonomy). Run the one-second
-   manual drive script with the robot securely lifted; this is the first
-   intentional non-zero command.
-6. Keep the robot lifted and run all Gate 3 fault injections, including the
-   separate Pi reboot/power-loss check that cannot be automated safely.
+1. Clone the reviewed `raspberry-pi-migration` branch and record its commit.
+2. Install/build/test `--stage manual` on the Pi; this is Gate 2.
+3. Flash `pi_bridge`, keep systemd disabled, and run the binary loopback Gate 3.
+4. Start manual bringup with `start_gateway:=false`; run the no-motion pre-ARM
+   probe (Gate 4) and zero-only STOP/DISARM proof (Gate 5).
+5. With the robot securely lifted, run the one-second manual pulse as the first
+   intentional non-zero command (Gate 6).
+6. Keep it lifted for stale-command, USB, bridge-crash and separately supervised
+   Pi reboot/power-loss STOP tests (Gate 7).
 
 Exit criterion: Pi manual `TwistStamped` reaches the motor controller, every
 loss-of-command case produces hard zero, and recovery always requires explicit
 ARM. On-ground driving remains prohibited until this exit criterion passes.
 
-## Stage 2 — gateway compatibility and sensors
+## Stage 2 -- measured ground manual control and gateway preparation
 
-1. Start the safety node and gateway; keep autonomous start disabled.
-2. Compare legacy Flutter `M,left,right` semantics against calibrated low-speed
-   `linear/angular` conversion.
-3. Validate route upload without executing it.
-4. Measure IMU axes/mounting and GNSS antenna offsets.
-5. Validate IMU, GNSS, RTK and motor feedback rates/covariances.
-6. Replace drivetrain TODOs only from recorded Gate 4 measurements. Review and
-   apply `SET_LIMITS` explicitly; never auto-apply calibration on reconnect.
-7. Define and review the RTCM transport before expecting Pi-sourced RTK. Wire
-   protocol v1 intentionally contains no `RTCM_DATA`; use a proven external F9P
-   correction input meanwhile, or introduce a bounded protocol-v2 message as a
-   separate change. Never tunnel unbounded correction bytes through CMD frames.
+1. From lifted evidence, calibrate one drivetrain parameter at a time; do not
+   guess signs, scales, deadband, track width or maximum percent.
+2. Repeat STOP proof after every motor-path calibration change.
+3. Perform controlled ground direction/scale checks for Gate 8 with a spotter
+   and physical emergency disconnect.
+4. Validate route upload without executing it.
+5. Measure IMU axes/mounting and GNSS antenna offsets for the later Gate 9.
+6. Define and review RTCM transport before expecting Pi-sourced RTK. Protocol v1
+   intentionally contains no `RTCM_DATA`; do not tunnel unbounded correction
+   bytes through motion frames.
 
-Exit criterion: Gates 4 and 5 pass; signs and scales are documented rather than
-assumed.
+The WebSocket gateway stays out of systemd and is not used for the first manual
+test. A later bench launch must be manual and on a controlled network. Field
+phone control requires a separate authentication/session-authority safety task;
+this commissioning patch does not change Flutter or add an auth framework.
 
-## Stage 3 — localization
+Exit criterion: Gate 8 passes with recorded calibration evidence. This
+authorizes only the tested manual configuration.
+
+## Stage 3 -- localization
 
 1. Replace all relevant `TODO_MEASURE` values with physical measurements.
 2. Prove base_link/ENU axis conventions using manual motion.
 3. Enable local EKF without GPS; prove continuous `odom -> base_link`.
 4. Run the heading initializer manually through the safety interface.
 5. Only after yaw validation, enable navsat_transform and global EKF.
+6. Install and test the explicit full ROS stage on the Pi.
 
-Exit criterion: Gate 6 passes repeatedly after cold boot.
+Exit criterion: the localization portion of Gate 9 passes repeatedly after cold
+boot. It does not authorize autonomous movement by itself.
 
-## Stage 4 — path following
+## Stage 4 -- path following
 
 1. Keep `autonomous_enabled=false` until an operator reviews the complete
    preflight report.
@@ -73,8 +76,8 @@ Exit criterion: Gate 6 passes repeatedly after cold boot.
 4. Begin with 1 m straight and rotate-in-place tests, then L-shape and square.
 5. Inject sensor, serial and process faults during every progression.
 
-Exit criterion: Gate 7 passes. This still does not authorize obstacle-rich or
-unattended operation.
+Exit criterion: the autonomous portion of Gate 9 passes. This still does not
+authorize obstacle-rich or unattended operation.
 
 ## Explicitly deferred
 
