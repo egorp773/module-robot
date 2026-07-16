@@ -335,6 +335,8 @@ bool Gnss::consumeFreshPvt(GnssPvtData& out) {
     taskENTER_CRITICAL(&_pvtMux);
     fresh = _hasFreshPvt;
     if (fresh) {
+        out.captureTimestampMs = _lastPvtMs;
+        out.pvtId = _pvtCount;
         out.latE7 = _latE7; out.lonE7 = _lonE7; out.heightMm = _h;
         out.hAccMm = _hAcc; out.vAccMm = _vAcc; out.gSpeedMmps = _gSp;
         out.headMotDegE5 = _headMot; out.headAccDegE5 = _headAcc;

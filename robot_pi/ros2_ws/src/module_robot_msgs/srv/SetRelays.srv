@@ -1,0 +1,6 @@
+uint32 relay_mask
+uint32 relay_values
+---
+bool success
+uint32 active_mask
+string message

@@ -70,5 +70,6 @@ String queueGoLShapeWs(float firstM, float turnDeg, float secondM,
 String queueGoSquareDebugWs(float sideM);
 String handleStopLine();
 bool routeExecutorActive();
+bool manualMotorCommandAllowed();
 
 }  // namespace roverdbg

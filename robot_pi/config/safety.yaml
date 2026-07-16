@@ -1,0 +1,53 @@
+safety_node:
+  ros__parameters:
+    # Runtime names intentionally match module_robot_safety/config/safety.yaml.
+    publish_rate_hz: 50.0
+    status_timeout_ms: 500
+    motor_feedback_timeout_ms: 250
+    manual_cmd_timeout_ms: 200
+    auto_cmd_timeout_ms: 200
+    imu_timeout_ms: 250
+    gnss_timeout_ms: 500
+    rtk_timeout_ms: 500
+    rtk_horizontal_accuracy_limit_m: 0.05
+
+    # Conservative commissioning clamps; ESP32 has an independent final clamp.
+    max_manual_linear_mps: 0.15
+    max_manual_reverse_mps: 0.15
+    max_manual_angular_rad_s: 0.60
+    max_auto_linear_mps: 0.10
+    max_auto_angular_rad_s: 0.40
+    arm_motor_feedback_zero_threshold: 5  # TODO_CALIBRATE against stationary feedback
+    bridge_service_timeout_s: 0.75
+
+    # Audit-only master invariants: runtime rejects false. ESTOP can be cleared
+    # only by the separate explicit RESET_ESTOP service and returns DISARMED.
+    fault_latching: true
+    estop_latching: true
+    latch_motor_faults: true
+    latch_auto_precondition_loss: true
+    disarm_on_disconnect: true
+    disarm_on_motor_fault: true
+
+    # Manual never depends on GNSS, RTK, initialized heading or active Nav2.
+    # ESTOP clear, motor-fault clear and explicit operator ARM are unconditional
+    # safety-node invariants and are not configurable off.
+    manual_require_connected: true
+    manual_require_motor_feedback: true
+    manual_require_no_estop: true
+    manual_require_no_motor_fault: true
+    manual_require_operator_arm: true
+
+    # AUTO needs every condition below plus fresh IMU/GNSS and a separate,
+    # explicit AUTO ARM. autonomous_enabled remains the commissioning master
+    # inhibit even when all sensor conditions happen to be true.
+    auto_require_rtk_fixed: true
+    auto_require_rtk_accuracy: true
+    auto_require_imu_fresh: true
+    auto_require_gnss_fresh: true
+    auto_require_heading_initialized: true
+    auto_require_localization_valid: true
+    auto_require_route_valid: true
+    auto_require_nav2_active: true
+    auto_require_explicit_arm: true
+    autonomous_enabled: false

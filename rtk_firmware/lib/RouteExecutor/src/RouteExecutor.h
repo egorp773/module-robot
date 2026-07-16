@@ -110,6 +110,10 @@ struct RouteExecutorConfig {
     uint32_t turnBreakawayResponseStableMs;
     uint8_t turnMaxCorrectionAttempts;
     float turnCorrectionMinImprovementDeg;
+    int turnCorrectionPulsePercent;
+    uint32_t turnCorrectionPulseMs;
+    uint32_t turnCorrectionPulseMinMs;
+    uint32_t turnCorrectionPulseMaxMs;
 
     int physicalStopMotorThreshold;
     float physicalStopYawRateDps;
@@ -224,6 +228,9 @@ struct RouteExecutorOutput {
     uint8_t recoveryAttempt;
     uint32_t physicalStableMs;
     bool physicalStopReady;
+    bool physicalStopGatePassed;
+    LocalPoint physicalStopPosition;
+    float physicalStopHeadingDeg;
     bool finalArrivalPending;
     bool workActionPending;
     size_t workActionPointIndex;
@@ -232,6 +239,13 @@ struct RouteExecutorOutput {
     float steeringResponseHeadingDeltaDeg;
     uint8_t steeringResponseObservationCount;
     bool steeringResponseWrongDirection;
+    bool steeringFaultSnapshotValid;
+    float steeringFaultRequestedAngularRadps;
+    float steeringFaultHeadingDeltaDeg;
+    float steeringFaultYawRateDps;
+    int steeringFaultAppliedLeft;
+    int steeringFaultAppliedRight;
+    ExecutorState steeringFaultDetectionState;
     TurnPhase turnPhase;
     float turnTargetDeg;
     float turnErrorDeg;
@@ -386,6 +400,9 @@ private:
     LocalPoint physicalStopAnchor_;
     float physicalStopHeadingDeg_;
     uint32_t physicalStopPvtId_;
+    bool physicalStopGatePassed_;
+    LocalPoint completedPhysicalStopPosition_;
+    float completedPhysicalStopHeadingDeg_;
 
     float turnTargetDeg_;
     bool turnTargetLatched_;
@@ -443,6 +460,13 @@ private:
     float steeringResponseHeadingDeltaDeg_;
     uint8_t steeringResponseObservationCount_;
     bool steeringResponseWrongDirection_;
+    bool steeringFaultSnapshotValid_;
+    float steeringFaultRequestedAngularRadps_;
+    float steeringFaultHeadingDeltaDeg_;
+    float steeringFaultYawRateDps_;
+    int steeringFaultAppliedLeft_;
+    int steeringFaultAppliedRight_;
+    ExecutorState steeringFaultDetectionState_;
     RouteTransitionPurpose transitionPurpose_;
 
     RouteExecutorOutput output_;

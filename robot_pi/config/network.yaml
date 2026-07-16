@@ -1,0 +1,32 @@
+gateway_node:
+  ros__parameters:
+    config_schema_version: 1
+    bind_address: 0.0.0.0
+    # Legacy Flutter port. It is <1024, so the non-root systemd unit grants only
+    # CAP_NET_BIND_SERVICE. Manual bringup keeps the gateway disabled by default.
+    websocket_port: 81
+    websocket_path: /ws
+    max_clients: 2
+    max_message_bytes: 4096
+    telemetry_rate_hz: 5.0
+    per_client_queue_depth: 8
+
+    # Legacy M,left,right input conversion. These are conservative stage-1
+    # clamps, separate from the TODO_CALIBRATE drivetrain mixer parameters.
+    manual_input_max_percent: 100.0
+    manual_deadband_percent: 2.0
+    manual_max_linear_mps: 0.15
+    manual_max_angular_rad_s: 0.60
+    manual_command_timeout_s: 0.25
+
+    route_max_waypoints: 2048
+    route_min_waypoints: 1
+    route_max_segment_m: 100.0
+    route_min_segment_m: 0.01
+    route_max_abs_local_m: 10000.0
+    route_frame_id: map
+    autonomous_start_enabled: false
+    robot_hostname: module-robot
+    # Configure Wi-Fi using Ubuntu/NetworkManager; credentials never belong here.
+    wifi_credentials: NOT_STORED_IN_REPOSITORY
+    cloud_services_enabled: false

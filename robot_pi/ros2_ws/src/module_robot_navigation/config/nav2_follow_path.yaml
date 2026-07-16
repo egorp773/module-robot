@@ -1,0 +1,100 @@
+# ROS 2 Jazzy / Nav2 mapless FollowPath template.
+#
+# Every numeric limit below is an INITIAL_CONSERVATIVE_DEFAULT and must be
+# validated during the acceptance gates. There is intentionally no planner,
+# SLAM, AMCL, obstacle layer, voxel layer, lidar, or camera configuration.
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 20.0
+    costmap_update_timeout: 0.5
+    enable_stamped_cmd_vel: true
+    publish_zero_velocity: true
+    odom_topic: /odometry/filtered
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.0
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.10  # INITIAL_CONSERVATIVE_DEFAULT
+      movement_time_allowance: 15.0
+
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.10          # TODO_CALIBRATE
+      yaw_goal_tolerance: 0.20         # TODO_CALIBRATE
+      stateful: true
+
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.10         # INITIAL_CONSERVATIVE_DEFAULT
+      # Jazzy RPP has no linear-acceleration limiter; velocity_smoother's
+      # max_accel[0]=0.08 m/s^2 below is the authoritative conservative limit.
+      lookahead_dist: 0.40             # TODO_CALIBRATE
+      min_lookahead_dist: 0.20         # TODO_CALIBRATE
+      max_lookahead_dist: 0.60         # TODO_CALIBRATE
+      lookahead_time: 1.5              # TODO_CALIBRATE
+      use_velocity_scaled_lookahead_dist: true
+      min_approach_linear_velocity: 0.03
+      approach_velocity_scaling_dist: 0.50
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: false
+      regulated_linear_scaling_min_radius: 0.60  # TODO_CALIBRATE
+      regulated_linear_scaling_min_speed: 0.03
+      use_rotate_to_heading: true
+      rotate_to_heading_angular_vel: 0.25        # INITIAL_CONSERVATIVE_DEFAULT
+      rotate_to_heading_min_angle: 0.785
+      max_angular_accel: 0.25                    # INITIAL_CONSERVATIVE_DEFAULT
+      allow_reversing: false
+      stateful: true
+      # No measured footprint or obstacle source exists yet. Enabling this now
+      # would create a false safety claim. Autonomous preflight is independently
+      # fail-closed until dimensions are measured.
+      use_collision_detection: false
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      global_frame: odom
+      robot_base_frame: base_link
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      rolling_window: true
+      width: 6.0
+      height: 6.0
+      resolution: 0.10
+      footprint_padding: 0.0
+      robot_radius: 0.0  # Deliberately no collision-footprint assumption.
+      plugins: []
+      always_send_full_costmap: true
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    smoothing_frequency: 50.0
+    scale_velocities: true
+    feedback: "OPEN_LOOP"
+    enable_stamped_cmd_vel: true
+    stamp_smoothed_velocity_with_smoothing_time: false
+    max_velocity: [0.10, 0.0, 0.40]    # INITIAL_CONSERVATIVE_DEFAULT
+    min_velocity: [0.0, 0.0, -0.40]   # Auto reversing is disabled.
+    max_accel: [0.08, 0.0, 0.25]      # INITIAL_CONSERVATIVE_DEFAULT
+    max_decel: [-0.15, 0.0, -0.50]    # STOP still bypasses this in Safety/ESP32.
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 0.20
+    odom_topic: /odometry/filtered
+    odom_duration: 0.10
+
+lifecycle_manager_follow_path:
+  ros__parameters:
+    use_sim_time: false
+    autostart: false
+    bond_timeout: 4.0
+    attempt_respawn_reconnection: true
+    node_names: ["controller_server", "velocity_smoother"]

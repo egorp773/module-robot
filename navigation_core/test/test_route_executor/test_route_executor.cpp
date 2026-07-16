@@ -501,7 +501,9 @@ RouteExecutorOutput stopMainTurnWithFieldOvershoot(
     output = finishPhysicalStop(executor, input, config);
     EXPECT_EQ(output.state, ExecutorState::TURN_EVALUATE);
     output = tick(executor, input);
-    EXPECT_EQ(output.state, ExecutorState::TURN_CORRECTION_BREAKAWAY);
+    EXPECT_EQ(output.state, ExecutorState::TURN_CORRECTION);
+    EXPECT_EQ(output.motion, MotionKind::TURN_IN_PLACE);
+    EXPECT_EQ(output.turnCommandPercent, config.turnCorrectionPulsePercent);
     return output;
 }
 
@@ -556,7 +558,7 @@ TEST(RouteTurnFieldControl, BrakeCannotCompleteBeforePhysicalStop) {
     EXPECT_NE(output.state, ExecutorState::HEADING_STABLE);
 }
 
-TEST(RouteTurnFieldControl, OvershootStartsBoundedReverseBreakawayAfterStop) {
+TEST(RouteTurnFieldControl, OvershootStartsBoundedReversePulseAfterStop) {
     RouteExecutor executor;
     RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
     const RouteExecutorConfig config = fastConfig();
@@ -564,11 +566,50 @@ TEST(RouteTurnFieldControl, OvershootStartsBoundedReverseBreakawayAfterStop) {
     const RouteExecutorOutput output = stopMainTurnWithFieldOvershoot(
         executor, input, config);
     EXPECT_EQ(output.turnDirection, -1);
-    EXPECT_TRUE(output.turnBreakawayActive);
+    EXPECT_FALSE(output.turnBreakawayActive);
     EXPECT_EQ(output.turnCorrectionAttempt, 0u);
     EXPECT_EQ(output.motion, MotionKind::TURN_IN_PLACE);
     EXPECT_LT(output.angularRadps, 0.0f);
-    EXPECT_EQ(output.turnCommandPercent, config.turnBreakawayPercent);
+    EXPECT_EQ(output.turnCommandPercent, config.turnCorrectionPulsePercent);
+}
+
+TEST(RouteTurnFieldControl, CorrectionIsOneBoundedPulseThenBrake) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    RouteExecutorConfig config = fastConfig();
+    config.turnCorrectionPulseMs = 500u;
+    config.turnCorrectionPulseMinMs = 400u;
+    config.turnCorrectionPulseMaxMs = 600u;
+    enterHeadingReacquireTurn(executor, input, config);
+    RouteExecutorOutput output = stopMainTurnWithFieldOvershoot(
+        executor, input, config);
+    ASSERT_EQ(output.state, ExecutorState::TURN_CORRECTION);
+    EXPECT_EQ(output.turnCommandPercent, 6);
+    EXPECT_EQ(output.motion, MotionKind::TURN_IN_PLACE);
+
+    output = tick(executor, input, 499u);
+    EXPECT_EQ(output.state, ExecutorState::TURN_CORRECTION);
+    EXPECT_EQ(output.motion, MotionKind::TURN_IN_PLACE);
+    output = tick(executor, input, 1u);
+    EXPECT_EQ(output.state, ExecutorState::TURN_BRAKE);
+    EXPECT_EQ(output.motion, MotionKind::STOP);
+}
+
+TEST(RouteTurnFieldControl, CorrectionPulseDurationIsClampedToNamedBounds) {
+    RouteExecutor executor;
+    RouteExecutorInput input = goodInput(0.0f, 0.0f, 0.0f);
+    RouteExecutorConfig config = fastConfig();
+    config.turnCorrectionPulseMs = 5000u;
+    config.turnCorrectionPulseMinMs = 400u;
+    config.turnCorrectionPulseMaxMs = 600u;
+    enterHeadingReacquireTurn(executor, input, config);
+    RouteExecutorOutput output = stopMainTurnWithFieldOvershoot(
+        executor, input, config);
+    output = tick(executor, input, 599u);
+    EXPECT_EQ(output.state, ExecutorState::TURN_CORRECTION);
+    output = tick(executor, input, 1u);
+    EXPECT_EQ(output.state, ExecutorState::TURN_BRAKE);
+    EXPECT_EQ(output.motion, MotionKind::STOP);
 }
 
 TEST(RouteTurnFieldControl, FivePercentWithoutYawResponseIsNotSuccess) {
@@ -639,10 +680,9 @@ TEST(RouteTurnFieldControl, CorrectionCountChangesOnlyAfterEvaluate) {
     RouteExecutorOutput output = stopMainTurnWithFieldOvershoot(
         executor, input, config);
     EXPECT_EQ(output.turnCorrectionAttempt, 0u);
-    advanceBreakawayToRotate(executor, input, config);
     input.headingDeg = 91.0f;
     input.yawRateDps = -10.0f;
-    output = tick(executor, input);
+    output = tick(executor, input, config.turnCorrectionPulseMs);
     ASSERT_EQ(output.state, ExecutorState::TURN_BRAKE);
     input.yawRateDps = 0.0f;
     output = finishPhysicalStop(executor, input, config);
@@ -660,10 +700,9 @@ TEST(RouteTurnFieldControl, CorrectionsAreBoundedAndKeepFailureSnapshots) {
     enterHeadingReacquireTurn(executor, input, config);
     RouteExecutorOutput output = stopMainTurnWithFieldOvershoot(
         executor, input, config);
-    advanceBreakawayToRotate(executor, input, config);
     input.headingDeg = 97.5f;
     input.yawRateDps = -30.0f;
-    output = tick(executor, input);
+    output = tick(executor, input, config.turnCorrectionPulseMs);
     ASSERT_EQ(output.state, ExecutorState::TURN_BRAKE);
     input.yawRateDps = 0.0f;
     output = finishPhysicalStop(executor, input, config);
@@ -694,6 +733,8 @@ TEST(RouteTurnFieldControl, TurnErrorIsNotOldLineHeadingError) {
     const RouteExecutorOutput output = finishPhysicalStop(
         executor, input, config);
     ASSERT_EQ(output.state, ExecutorState::TURN_BREAKAWAY);
+    EXPECT_TRUE(output.physicalStopGatePassed);
+    EXPECT_TRUE(std::isfinite(output.physicalStopHeadingDeg));
     EXPECT_NEAR(output.turnTargetDeg, 0.0f, 1e-5f);
     EXPECT_NEAR(output.turnErrorDeg, -90.0f, 1e-5f);
     EXPECT_NEAR(output.steeringErrorDeg, 0.0f, 1e-5f);
@@ -745,6 +786,14 @@ TEST(RouteSteeringWatchdog,
     EXPECT_EQ(output.steeringResponseObservationCount, 3u);
     EXPECT_EQ(output.transitionPurpose,
               RouteTransitionPurpose::STEERING_RESPONSE_FAULT);
+    ASSERT_TRUE(output.steeringFaultSnapshotValid);
+    EXPECT_EQ(output.steeringFaultDetectionState,
+              ExecutorState::FOLLOW_SEGMENT);
+    EXPECT_FLOAT_EQ(output.steeringFaultYawRateDps, -3.0f);
+    EXPECT_FLOAT_EQ(output.steeringFaultHeadingDeltaDeg, -0.50f);
+    EXPECT_EQ(output.steeringFaultAppliedLeft, 5);
+    EXPECT_EQ(output.steeringFaultAppliedRight, 8);
+    EXPECT_NE(output.steeringFaultRequestedAngularRadps, 0.0f);
 
     // The dedicated fault is terminal only after a verified physical stop.
     input.commandLeft = input.commandRight = 0;

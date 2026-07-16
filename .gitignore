@@ -118,5 +118,10 @@ yarn-error.log*
 __pycache__/
 *.pyc
 
+# ROS 2 colcon generated files
+robot_pi/ros2_ws/build/
+robot_pi/ros2_ws/install/
+robot_pi/ros2_ws/log/
+
 # External reference repos (Sunray/OpenMower clones — not ours)
 .external/

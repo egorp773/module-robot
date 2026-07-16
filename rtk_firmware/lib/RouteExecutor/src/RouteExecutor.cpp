@@ -97,6 +97,10 @@ RouteExecutorConfig::RouteExecutorConfig()
       turnBreakawayResponseStableMs(120u),
       turnMaxCorrectionAttempts(4u),
       turnCorrectionMinImprovementDeg(1.0f),
+      turnCorrectionPulsePercent(6),
+      turnCorrectionPulseMs(500u),
+      turnCorrectionPulseMinMs(400u),
+      turnCorrectionPulseMaxMs(600u),
       physicalStopMotorThreshold(3),
       physicalStopYawRateDps(3.0f),
       physicalStopPvtDisplacementM(0.040f),
@@ -156,13 +160,21 @@ RouteExecutorOutput::RouteExecutorOutput()
       steeringErrorDeg(0.0f), computedRecoveryBearingDeg(0.0f),
       latchedTurnTargetDeg(0.0f), recoveryGoal(), recoveryAttempt(0u),
       physicalStableMs(0u),
-      physicalStopReady(false), finalArrivalPending(false),
+      physicalStopReady(false), physicalStopGatePassed(false),
+      physicalStopPosition(), physicalStopHeadingDeg(NAN),
+      finalArrivalPending(false),
       workActionPending(false), workActionPointIndex(static_cast<size_t>(-1)),
       transitionPurpose(RouteTransitionPurpose::NONE),
       steeringResponseRequestedAngularRadps(0.0f),
       steeringResponseHeadingDeltaDeg(0.0f),
       steeringResponseObservationCount(0u),
       steeringResponseWrongDirection(false),
+      steeringFaultSnapshotValid(false),
+      steeringFaultRequestedAngularRadps(0.0f),
+      steeringFaultHeadingDeltaDeg(0.0f),
+      steeringFaultYawRateDps(0.0f), steeringFaultAppliedLeft(0),
+      steeringFaultAppliedRight(0),
+      steeringFaultDetectionState(ExecutorState::IDLE),
       turnPhase(TurnPhase::NONE), turnTargetDeg(NAN), turnErrorDeg(NAN),
       turnDirection(0), turnPredictedStopAngleDeg(0.0f),
       turnCommandPercent(0), turnCorrectionAttempt(0u),
@@ -256,6 +268,8 @@ RouteExecutor::RouteExecutor()
       stableNext_(StableNext::NONE), stopStartedMs_(0u),
       physicalStableSinceMs_(0u), physicalStopAnchor_(),
       physicalStopHeadingDeg_(0.0f), physicalStopPvtId_(0u),
+      physicalStopGatePassed_(false), completedPhysicalStopPosition_(),
+      completedPhysicalStopHeadingDeg_(NAN),
       turnTargetDeg_(0.0f), turnTargetLatched_(false), turnDirection_(0),
       turnCorrections_(0u),
       turnStableReferenceDeg_(0.0f), turnStartedMs_(0u),
@@ -292,6 +306,12 @@ RouteExecutor::RouteExecutor()
       steeringResponseHeadingDeltaDeg_(0.0f),
       steeringResponseObservationCount_(0u),
       steeringResponseWrongDirection_(false),
+      steeringFaultSnapshotValid_(false),
+      steeringFaultRequestedAngularRadps_(0.0f),
+      steeringFaultHeadingDeltaDeg_(0.0f),
+      steeringFaultYawRateDps_(0.0f), steeringFaultAppliedLeft_(0),
+      steeringFaultAppliedRight_(0),
+      steeringFaultDetectionState_(ExecutorState::IDLE),
       transitionPurpose_(RouteTransitionPurpose::NONE), output_() {}
 
 bool RouteExecutor::start(const RoutePlan& plan,
@@ -316,6 +336,9 @@ bool RouteExecutor::start(const RoutePlan& plan,
     stopNext_ = StopNext::NONE;
     stableNext_ = StableNext::NONE;
     physicalStableSinceMs_ = 0u;
+    physicalStopGatePassed_ = false;
+    completedPhysicalStopPosition_ = LocalPoint();
+    completedPhysicalStopHeadingDeg_ = NAN;
     turnTargetLatched_ = false;
     turnDirection_ = 0;
     turnCorrections_ = 0u;
@@ -352,6 +375,7 @@ bool RouteExecutor::start(const RoutePlan& plan,
     recoveryMotionStartedMs_ = input.nowMs;
     recoveryGoalReached_ = false;
     transitionPurpose_ = RouteTransitionPurpose::NONE;
+    steeringFaultSnapshotValid_ = false;
     resetSteeringResponseWatchdog();
     steeringResponseLastHeadingDeg_ = input.headingDeg;
     steeringResponseLastPvtId_ = input.pvtId;
@@ -627,6 +651,15 @@ bool RouteExecutor::updateSteeringResponseWatchdog(
     if (config_.steeringResponseWrongDirectionCount > 0u &&
         steeringResponseObservationCount_ >=
             config_.steeringResponseWrongDirectionCount) {
+        // Preserve the detection-time values before enterBrake changes the
+        // visible state and the motor path applies zero.
+        steeringFaultSnapshotValid_ = true;
+        steeringFaultRequestedAngularRadps_ = requestedAngularRadps;
+        steeringFaultHeadingDeltaDeg_ = headingDelta;
+        steeringFaultYawRateDps_ = input.yawRateDps;
+        steeringFaultAppliedLeft_ = input.commandLeft;
+        steeringFaultAppliedRight_ = input.commandRight;
+        steeringFaultDetectionState_ = state_;
         transitionPurpose_ =
             RouteTransitionPurpose::STEERING_RESPONSE_FAULT;
         enterBrake(StopNext::STEERING_RESPONSE_FAULT, input);
@@ -779,6 +812,24 @@ void RouteExecutor::updateTurn(const RouteExecutorInput& input,
     }
     const float error = wrapHeadingErrorDeg(turnTargetDeg_ - input.headingDeg);
     const float absError = std::fabs(error);
+    if (turnState == ExecutorState::TURN_CORRECTION) {
+        const uint32_t boundedPulseMs = std::max(
+            config_.turnCorrectionPulseMinMs,
+            std::min(config_.turnCorrectionPulseMs,
+                     config_.turnCorrectionPulseMaxMs));
+        if (elapsedMillis(input.nowMs, turnPhaseStartedMs_) >=
+            boundedPulseMs) {
+            beginTurnBrake(input);
+            return;
+        }
+        turnPredictedStopAngleDeg_ = 0.0f;
+        turnCommandPercent_ = config_.turnCorrectionPulsePercent;
+        output_.motion = MotionKind::TURN_IN_PLACE;
+        output_.linearMps = 0.0f;
+        output_.angularRadps = static_cast<float>(turnDirection_) *
+                               turnAngularForPercent(turnCommandPercent_);
+        return;
+    }
     turnPredictedStopAngleDeg_ = predictedTurnStopAngleDeg(input, error);
     const int errorDirection = error >= 0.0f ? 1 : -1;
     const bool yawTowardTarget = input.yawRateDps *
@@ -810,7 +861,7 @@ void RouteExecutor::beginTurnCorrection(const RouteExecutorInput& input,
     turnBreakawayResponseSinceMs_ = 0u;
     turnPredictedStopAngleDeg_ = 0.0f;
     turnCommandPercent_ = 0;
-    setState(ExecutorState::TURN_CORRECTION_BREAKAWAY, input.nowMs);
+    setState(ExecutorState::TURN_CORRECTION, input.nowMs);
 }
 
 void RouteExecutor::updateTurnEvaluate(const RouteExecutorInput& input) {
@@ -843,7 +894,7 @@ void RouteExecutor::updateTurnEvaluate(const RouteExecutorInput& input) {
         return;
     }
     beginTurnCorrection(input, error);
-    updateTurnBreakaway(input);
+    updateTurn(input, ExecutorState::TURN_CORRECTION);
 }
 
 void RouteExecutor::updateHeadingStable(const RouteExecutorInput& input) {
@@ -858,6 +909,7 @@ void RouteExecutor::updateHeadingStable(const RouteExecutorInput& input) {
             return;
         }
         beginTurnCorrection(input, error);
+        updateTurn(input, ExecutorState::TURN_CORRECTION);
         return;
     }
     switch (stableNext_) {
@@ -1141,6 +1193,9 @@ void RouteExecutor::populateOutput(const RouteExecutorInput& input) {
         elapsedMillis(input.nowMs, physicalStableSinceMs_);
     output_.physicalStopReady = physicalStableSinceMs_ != 0u &&
         output_.physicalStableMs >= config_.physicalStopStableMs;
+    output_.physicalStopGatePassed = physicalStopGatePassed_;
+    output_.physicalStopPosition = completedPhysicalStopPosition_;
+    output_.physicalStopHeadingDeg = completedPhysicalStopHeadingDeg_;
     output_.transitionPurpose = transitionPurpose_;
     output_.steeringResponseRequestedAngularRadps =
         steeringResponseRequestedAngularRadps_;
@@ -1150,6 +1205,14 @@ void RouteExecutor::populateOutput(const RouteExecutorInput& input) {
         steeringResponseObservationCount_;
     output_.steeringResponseWrongDirection =
         steeringResponseWrongDirection_;
+    output_.steeringFaultSnapshotValid = steeringFaultSnapshotValid_;
+    output_.steeringFaultRequestedAngularRadps =
+        steeringFaultRequestedAngularRadps_;
+    output_.steeringFaultHeadingDeltaDeg = steeringFaultHeadingDeltaDeg_;
+    output_.steeringFaultYawRateDps = steeringFaultYawRateDps_;
+    output_.steeringFaultAppliedLeft = steeringFaultAppliedLeft_;
+    output_.steeringFaultAppliedRight = steeringFaultAppliedRight_;
+    output_.steeringFaultDetectionState = steeringFaultDetectionState_;
     switch (state_) {
         case ExecutorState::TURN_BREAKAWAY:
             output_.turnPhase = TurnPhase::BREAKAWAY;
@@ -1232,6 +1295,7 @@ void RouteExecutor::populateOutput(const RouteExecutorInput& input) {
 
 RouteExecutorOutput RouteExecutor::update(const RouteExecutorInput& input) {
     const size_t segmentAtUpdateStart = segmentIndex_;
+    physicalStopGatePassed_ = false;
     output_ = RouteExecutorOutput();
     output_.state = state_;
     output_.oldState = previousState_;
@@ -1446,6 +1510,9 @@ RouteExecutorOutput RouteExecutor::update(const RouteExecutorInput& input) {
                 break;
             }
             if (!updatePhysicalStop(input)) break;
+            physicalStopGatePassed_ = true;
+            completedPhysicalStopPosition_ = input.position;
+            completedPhysicalStopHeadingDeg_ = input.headingDeg;
             switch (stopNext_) {
                 case StopNext::START_TURN:
                     if (!input.turnPathAllowed)

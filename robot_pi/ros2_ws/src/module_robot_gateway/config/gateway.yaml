@@ -1,0 +1,35 @@
+gateway_node:
+  ros__parameters:
+    # These network values intentionally mirror robot_pi/config/network.yaml.
+    config_schema_version: 1
+    bind_address: 0.0.0.0
+    websocket_port: 81
+    websocket_path: /ws
+    max_clients: 2
+    max_message_bytes: 4096
+    telemetry_rate_hz: 5.0
+    per_client_queue_depth: 8
+
+    # Manual legacy M,left,right values are percentages in [-100, 100].
+    # These are conservative stage-1 limits, not calibrated drivetrain values.
+    manual_input_max_percent: 100.0
+    manual_deadband_percent: 2.0
+    manual_max_linear_mps: 0.15
+    manual_max_angular_rad_s: 0.60
+    # Deliberately below the ESP32 300 ms watchdog to preserve scheduling margin.
+    manual_command_timeout_s: 0.25
+
+    route_max_waypoints: 2048
+    route_min_waypoints: 1
+    route_max_segment_m: 100.0
+    route_min_segment_m: 0.01
+    route_max_abs_local_m: 10000.0
+    route_frame_id: map
+
+    # Stage 1 cannot be overridden by configuration. NAV_START always returns
+    # AUTO_NOT_READY and never sends an action goal or requests ARM.
+    autonomous_start_enabled: false
+
+    robot_hostname: module-robot
+    wifi_credentials: NOT_STORED_IN_REPOSITORY
+    cloud_services_enabled: false

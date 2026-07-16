@@ -393,8 +393,15 @@ void WsServer::handleLine(AsyncWebSocketClient* client, const String& line) {
             left  /= ROVER_INPUT_DIV;
             right /= ROVER_INPUT_DIV;
             // в навигации — игнорим ручной ввод
-            if (!_navRequested && !roverdbg::routeExecutorActive()) {
-                _motor->setManualPercent(left, right);
+            if (!_navRequested && roverdbg::manualMotorCommandAllowed()) {
+                // Acquire before applying. A concurrent STOP between these
+                // calls invalidates the token and rejects this stale write.
+                const uint32_t authorization =
+                    _motor->authorizeMotionCommand("WEBSOCKET_MANUAL");
+                if (!_motor->setManualPercent(left, right, authorization)) {
+                    sendText(client, "ERR,M_STOP_LATCHED");
+                    return;
+                }
             } else {
                 sendText(client, "ERR,NAV_ACTIVE");
                 return;

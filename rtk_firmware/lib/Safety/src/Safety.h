@@ -28,6 +28,8 @@ struct SafetyInput {
     float pDop = 99;
     float hAcc = 999;
     uint32_t pvtAgeMs = 0xFFFFFFFFu;
+    uint32_t publishedPvtTimestampMs = 0u;
+    uint32_t currentLoopGeneration = 0u;
     uint32_t rtcmAgeMs = 0xFFFFFFFFu;
     // PVT staleness threshold the caller wants enforced this tick.
     // Defaults to SAFE_PVT_AGE_MS for normal navigation. Auto-alignment
@@ -48,6 +50,9 @@ struct SafetyInput {
     // True only while AUTO_ALIGN_HEADING_BY_RTK is actively collecting the
     // displacement used to establish the first trusted heading.
     bool rtkAlignmentActive = false;
+    // Narrow START_SETTLE recovery: rover.cpp sets this only for a FIXED,
+    // hAcc-valid PVT published in this loop while motors are still zero.
+    bool alignStartupFreshPvtRecovery = false;
     // True if estimator heading is valid for navigation. Combines the
     // "trusted" sources: BNO085 absolute OK, manual trust flag, and
     // RTK-motion alignment. Set by rover.cpp each tick.
@@ -85,6 +90,18 @@ public:
     bool requireOrigin() const { return _level == SAFETY_OK; }
     const char* reason() const { return _reason; }
     const SafetyInput& lastInput() const { return _lastInput; }
+    SafetyLevel lastCandidateLevel() const { return _lastCandidateLevel; }
+    const char* lastCandidateReason() const { return _lastCandidateReason; }
+    uint32_t statusGeneration() const { return _statusGeneration; }
+    uint32_t evaluatedPvtTimestampMs() const {
+        return _evaluatedPvtTimestampMs;
+    }
+    uint32_t pvtAgeAtEvaluationMs() const {
+        return _pvtAgeAtEvaluationMs;
+    }
+    uint32_t evaluatedLoopGeneration() const {
+        return _evaluatedLoopGeneration;
+    }
 
 private:
     SafetyLevel _level = SAFETY_ESTOP;
@@ -95,6 +112,12 @@ private:
     uint32_t _recoverySinceMs = 0;
     uint32_t _skyBadSinceMs = 0;
     SafetyInput _lastInput{};
+    SafetyLevel _lastCandidateLevel = SAFETY_ESTOP;
+    const char* _lastCandidateReason = "boot";
+    uint32_t _statusGeneration = 0u;
+    uint32_t _evaluatedPvtTimestampMs = 0u;
+    uint32_t _pvtAgeAtEvaluationMs = 0xFFFFFFFFu;
+    uint32_t _evaluatedLoopGeneration = 0u;
 
     void applyCandidate(uint32_t nowMs, SafetyLevel level, const char* reason,
                         const SafetyInput& in);

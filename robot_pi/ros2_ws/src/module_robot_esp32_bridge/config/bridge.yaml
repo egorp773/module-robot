@@ -1,0 +1,30 @@
+esp32_bridge:
+  ros__parameters:
+    device: /dev/module-esp32
+    baud: 460800
+    command_rate_hz: 50.0
+    command_timeout_ms: 300
+    ros_cmd_stale_ms: 250
+    reconnect_delay_s: 2.0
+    serial_liveness_timeout_s: 2.0
+    command_ack_timeout_s: 0.5
+    protocol_version: 1
+    max_crc_errors: 20
+    heartbeat_rate_hz: 2.0
+    esp_heartbeat_timeout_ms: 1500
+    time_sync_period_s: 10.0
+    handshake_timeout_s: 3.0
+    client_name: module_robot_esp32_bridge
+    client_build_id: development
+    requested_capabilities: 31  # IMU|GNSS|motor feedback|relays|time sync
+    frame_id_imu: imu_link
+    frame_id_gps: gps_link
+    max_linear_mps: 0.15
+    max_reverse_mps: 0.15
+    max_angular_rad_s: 0.60
+    vertical_accuracy_fallback_m: 100.0
+    # Quaternion publication does not prove absolute ENU yaw. Verify mounting,
+    # BNO085 axes, magnetic reference and covariance before localization use.
+    imu_orientation_variance: 0.06853892  # (15 deg)^2, conservative initial value
+    imu_angular_velocity_variance: 0.00761544  # (5 deg/s)^2
+    imu_linear_acceleration_variance: 0.25

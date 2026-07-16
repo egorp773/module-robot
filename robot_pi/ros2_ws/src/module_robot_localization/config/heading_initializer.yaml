@@ -1,0 +1,34 @@
+heading_initializer:
+  ros__parameters:
+    # Both gates are false by design. An operator must change them explicitly,
+    # start the node, ARM MANUAL through Safety, then call ~/start.
+    enabled: false
+    motion_enabled: false
+    target_distance_m: 1.0
+    hard_max_distance_m: 2.0
+    minimum_displacement_m: 0.80
+    command_speed_mps: 0.05
+    hard_max_command_speed_mps: 0.10
+    max_horizontal_accuracy_m: 0.03
+    sensor_freshness_s: 0.30
+    validation_hold_s: 1.0
+    samples_per_endpoint: 20
+    max_endpoint_jitter_m: 0.04
+    max_cross_track_jitter_m: 0.08
+    max_initial_yaw_std_rad: 0.05
+    endpoint_timeout_s: 20.0
+    drive_timeout_s: 40.0
+    settle_time_s: 1.0
+    settle_timeout_s: 8.0
+    stopped_feedback_threshold: 5  # TODO_CALIBRATE against stationary feedback
+    command_rate_hz: 20.0
+    result_file: "~/.ros/module_robot_heading.yaml"
+    gps_topic: /gps/fix
+    # This initializer is the guarded experiment that validates raw orientation;
+    # navsat_transform still consumes the corrected /imu/data later.
+    imu_topic: /imu/data_raw
+    required_imu_frame_id: imu_link
+    rtk_topic: /rtk/status
+    motor_topic: /motor/status
+    safety_topic: /safety/state
+    command_topic: /cmd_vel_manual

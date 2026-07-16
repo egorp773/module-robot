@@ -1,0 +1,19 @@
+# These values deliberately are not numbers. Measure the assembled robot before
+# replacing them; autonomous preflight treats every TODO_MEASURE as a hard error.
+robot_dimensions:
+  ros__parameters:
+    measurement_status: TODO_MEASURE
+    footprint_status: TODO_MEASURE
+    TODO_TRACK_WIDTH_M: TODO_MEASURE
+    TODO_ROBOT_LENGTH_M: TODO_MEASURE
+    TODO_ROBOT_WIDTH_M: TODO_MEASURE
+    TODO_ROBOT_HEIGHT_M: TODO_MEASURE
+    TODO_GPS_X_M: TODO_MEASURE
+    TODO_GPS_Y_M: TODO_MEASURE
+    TODO_GPS_Z_M: TODO_MEASURE
+    TODO_IMU_X_M: TODO_MEASURE
+    TODO_IMU_Y_M: TODO_MEASURE
+    TODO_IMU_Z_M: TODO_MEASURE
+    TODO_IMU_ROLL: TODO_MEASURE
+    TODO_IMU_PITCH: TODO_MEASURE
+    TODO_IMU_YAW: TODO_MEASURE

@@ -1,0 +1,8 @@
+# Host-side development/test dependencies. ROS dependencies are installed by
+# apt/rosdep; do not use this file to replace the ROS 2 Jazzy installation.
+# Ubuntu 24.04 uses an externally managed system Python: use a virtualenv for
+# this file, never sudo pip. install_pi.sh installs Pi runtime modules via apt.
+pyserial>=3.5,<4
+PyYAML>=6.0,<7
+websockets>=12,<16
+pytest>=7,<9

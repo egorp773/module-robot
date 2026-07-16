@@ -15,6 +15,8 @@ struct RtcmStatus {
 };
 
 struct GnssPvtData {
+    uint32_t captureTimestampMs = 0u;
+    uint32_t pvtId = 0u;
     int32_t latE7 = 0, lonE7 = 0, heightMm = 0;
     int32_t hAccMm = 0, vAccMm = 0, gSpeedMmps = 0;
     int32_t headMotDegE5 = 0, headAccDegE5 = 0;

@@ -1,0 +1,9 @@
+uint8 MODE_MANUAL=1
+uint8 MODE_AUTO=2
+
+uint32 arm_nonce
+uint8 requested_mode
+---
+bool success
+uint8 resulting_state
+string message

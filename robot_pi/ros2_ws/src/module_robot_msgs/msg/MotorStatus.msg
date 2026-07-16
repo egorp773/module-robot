@@ -1,0 +1,10 @@
+std_msgs/Header header
+uint64 sensor_monotonic_us
+int16 left_feedback
+int16 right_feedback
+float32 battery_voltage
+float32 board_temperature_c
+bool board_temperature_available
+uint16 controller_fault
+uint32 uart_valid_frames
+uint32 uart_invalid_frames

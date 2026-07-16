@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="module_robot">
+  <!--
+    This is a TF skeleton, not a collision model. Defaults of zero keep Xacro
+    renderable without pretending that unmeasured dimensions are known. The
+    authoritative TODO_MEASURE sentinels live in config/robot_dimensions.yaml.
+
+    Required measurements:
+      TODO_TRACK_WIDTH_M, TODO_ROBOT_LENGTH_M, TODO_ROBOT_WIDTH_M,
+      TODO_ROBOT_HEIGHT_M, TODO_GPS_X_M, TODO_GPS_Y_M, TODO_GPS_Z_M,
+      TODO_IMU_X_M, TODO_IMU_Y_M, TODO_IMU_Z_M, TODO_IMU_ROLL,
+      TODO_IMU_PITCH, TODO_IMU_YAW.
+
+    REP-103 convention: +x forward, +y left, +z up. All transforms are from
+    base_link. Do not add collision geometry until the physical footprint and
+    track envelope have been measured.
+  -->
+
+  <xacro:arg name="track_width_m" default="0.0"/>
+  <xacro:arg name="robot_length_m" default="0.0"/>
+  <xacro:arg name="robot_width_m" default="0.0"/>
+  <xacro:arg name="robot_height_m" default="0.0"/>
+  <xacro:arg name="gps_x_m" default="0.0"/>
+  <xacro:arg name="gps_y_m" default="0.0"/>
+  <xacro:arg name="gps_z_m" default="0.0"/>
+  <xacro:arg name="imu_x_m" default="0.0"/>
+  <xacro:arg name="imu_y_m" default="0.0"/>
+  <xacro:arg name="imu_z_m" default="0.0"/>
+  <xacro:arg name="imu_roll" default="0.0"/>
+  <xacro:arg name="imu_pitch" default="0.0"/>
+  <xacro:arg name="imu_yaw" default="0.0"/>
+
+  <xacro:property name="TODO_TRACK_WIDTH_M" value="$(arg track_width_m)"/>
+  <xacro:property name="TODO_ROBOT_LENGTH_M" value="$(arg robot_length_m)"/>
+  <xacro:property name="TODO_ROBOT_WIDTH_M" value="$(arg robot_width_m)"/>
+  <xacro:property name="TODO_ROBOT_HEIGHT_M" value="$(arg robot_height_m)"/>
+  <xacro:property name="TODO_GPS_X_M" value="$(arg gps_x_m)"/>
+  <xacro:property name="TODO_GPS_Y_M" value="$(arg gps_y_m)"/>
+  <xacro:property name="TODO_GPS_Z_M" value="$(arg gps_z_m)"/>
+  <xacro:property name="TODO_IMU_X_M" value="$(arg imu_x_m)"/>
+  <xacro:property name="TODO_IMU_Y_M" value="$(arg imu_y_m)"/>
+  <xacro:property name="TODO_IMU_Z_M" value="$(arg imu_z_m)"/>
+  <xacro:property name="TODO_IMU_ROLL" value="$(arg imu_roll)"/>
+  <xacro:property name="TODO_IMU_PITCH" value="$(arg imu_pitch)"/>
+  <xacro:property name="TODO_IMU_YAW" value="$(arg imu_yaw)"/>
+
+  <link name="base_footprint"/>
+
+  <link name="base_link"/>
+  <joint name="base_footprint_to_base_link" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <!-- base_link placement needs its own measured datum; do not infer it from height. -->
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="imu_link"/>
+  <joint name="base_link_to_imu_link" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin
+      xyz="${TODO_IMU_X_M} ${TODO_IMU_Y_M} ${TODO_IMU_Z_M}"
+      rpy="${TODO_IMU_ROLL} ${TODO_IMU_PITCH} ${TODO_IMU_YAW}"/>
+  </joint>
+
+  <link name="gps_link"/>
+  <joint name="base_link_to_gps_link" type="fixed">
+    <parent link="base_link"/>
+    <child link="gps_link"/>
+    <origin xyz="${TODO_GPS_X_M} ${TODO_GPS_Y_M} ${TODO_GPS_Z_M}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="left_track_link"/>
+  <joint name="base_link_to_left_track_link" type="fixed">
+    <parent link="base_link"/>
+    <child link="left_track_link"/>
+    <origin xyz="0 ${TODO_TRACK_WIDTH_M / 2.0} 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="right_track_link"/>
+  <joint name="base_link_to_right_track_link" type="fixed">
+    <parent link="base_link"/>
+    <child link="right_track_link"/>
+    <origin xyz="0 ${-TODO_TRACK_WIDTH_M / 2.0} 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="attachment_link"/>
+  <joint name="base_link_to_attachment_link" type="fixed">
+    <parent link="base_link"/>
+    <child link="attachment_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+</robot>

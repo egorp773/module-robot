@@ -1,0 +1,3 @@
+# Raspberry Pi deployment files must remain POSIX text even when edited or
+# committed from the Windows development workstation.
+* text=auto eol=lf

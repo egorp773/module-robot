@@ -1,0 +1,25 @@
+schema_version: 1
+calibration_status: TODO_CALIBRATE
+
+# These are deliberately conservative commissioning limits, not measured
+# drivetrain constants. ESP32 applies an independent final clamp.
+limits:
+  max_linear_m_s: 0.15
+  max_reverse_m_s: 0.15
+  max_angular_rad_s: 0.60
+  linear_acceleration_m_s2: 0.10
+  linear_deceleration_m_s2: 0.20
+  angular_acceleration_rad_s2: 0.30
+  angular_deceleration_rad_s2: 0.60
+
+mixer:
+  # Do not replace these strings with convenient zeros. Measure geometry and
+  # calibrate each sign/scale with Gate 4 while the tracks are lifted.
+  track_width_m: TODO_MEASURE
+  left_sign: TODO_CALIBRATE
+  right_sign: TODO_CALIBRATE
+  swap_left_right: TODO_CALIBRATE
+  linear_scale: TODO_CALIBRATE
+  angular_scale: TODO_CALIBRATE
+  motor_deadband_percent: TODO_CALIBRATE
+  max_motor_percent: TODO_CALIBRATE

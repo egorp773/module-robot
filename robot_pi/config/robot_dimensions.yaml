@@ -1,0 +1,21 @@
+# Autonomous bringup must reject this file until every TODO_MEASURE value has
+# been replaced by a measured SI value and measurement_status is "measured".
+robot_dimensions:
+  ros__parameters:
+    measurement_status: TODO_MEASURE
+    # Footprint is intentionally absent. Do not enable collision assumptions
+    # until the chassis and attachment envelope have been physically measured.
+    footprint_status: TODO_MEASURE
+    TODO_TRACK_WIDTH_M: TODO_MEASURE
+    TODO_ROBOT_LENGTH_M: TODO_MEASURE
+    TODO_ROBOT_WIDTH_M: TODO_MEASURE
+    TODO_ROBOT_HEIGHT_M: TODO_MEASURE
+    TODO_GPS_X_M: TODO_MEASURE
+    TODO_GPS_Y_M: TODO_MEASURE
+    TODO_GPS_Z_M: TODO_MEASURE
+    TODO_IMU_X_M: TODO_MEASURE
+    TODO_IMU_Y_M: TODO_MEASURE
+    TODO_IMU_Z_M: TODO_MEASURE
+    TODO_IMU_ROLL: TODO_MEASURE
+    TODO_IMU_PITCH: TODO_MEASURE
+    TODO_IMU_YAW: TODO_MEASURE

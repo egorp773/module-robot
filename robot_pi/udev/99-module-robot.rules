@@ -1,0 +1,5 @@
+# Template only. Do not copy this file directly while TODO values remain.
+# Discover real values with robot_pi/scripts/setup_udev.sh, then let that script
+# render /etc/udev/rules.d/99-module-robot.rules.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="TODO_USB_VENDOR_ID", ATTRS{idProduct}=="TODO_USB_PRODUCT_ID", ATTRS{serial}=="TODO_USB_SERIAL", SYMLINK+="module-esp32", GROUP="dialout", MODE="0660", TAG+="systemd"
+

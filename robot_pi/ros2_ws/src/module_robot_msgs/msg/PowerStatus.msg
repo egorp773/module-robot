@@ -1,0 +1,8 @@
+std_msgs/Header header
+float32 battery_voltage
+float32 battery_current_a
+float32 state_of_charge_percent
+bool voltage_available
+bool current_available
+bool state_of_charge_available
+bool undervoltage

@@ -2,7 +2,9 @@
 
 #include "Safety.h"
 #include "RtkConfig.h"
+#include "PvtSafetyTimeline.h"
 #include <math.h>
+#include <string.h>
 
 const char* Safety::levelName(SafetyLevel level) {
     switch (level) {
@@ -36,6 +38,12 @@ void Safety::begin() {
     _recoverySinceMs = 0;
     _skyBadSinceMs = 0;
     _lastInput = SafetyInput{};
+    _lastCandidateLevel = SAFETY_ESTOP;
+    _lastCandidateReason = "boot";
+    _statusGeneration = 0u;
+    _evaluatedPvtTimestampMs = 0u;
+    _pvtAgeAtEvaluationMs = 0xFFFFFFFFu;
+    _evaluatedLoopGeneration = 0u;
 }
 
 void Safety::setMode(SafetyMode mode) {
@@ -63,6 +71,18 @@ void Safety::applyCandidate(uint32_t nowMs, SafetyLevel candidate,
                             const char* reason, const SafetyInput& in) {
     if (!_evaluated) {
         _evaluated = true;
+        _recoverySinceMs = 0;
+        changeLevel(candidate, reason, in);
+        return;
+    }
+
+    const bool retainedPvtStale =
+        (_level == SAFETY_HOLD || _level == SAFETY_ESTOP) &&
+        _reason != nullptr && strcmp(_reason, "pvt_stale") == 0;
+    if (pvtsafety::applyFreshPvtStatusImmediately(
+            in.alignStartupFreshPvtRecovery,
+            retainedPvtStale,
+            candidate <= SAFETY_DEGRADED)) {
         _recoverySinceMs = 0;
         changeLevel(candidate, reason, in);
         return;
@@ -102,6 +122,11 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in,
     (void)est;
     if (!_inited) return;
     _lastInput = in;
+    ++_statusGeneration;
+    if (_statusGeneration == 0u) ++_statusGeneration;
+    _evaluatedPvtTimestampMs = in.publishedPvtTimestampMs;
+    _pvtAgeAtEvaluationMs = in.pvtAgeMs;
+    _evaluatedLoopGeneration = in.currentLoopGeneration;
 
     SafetyLevel level = SAFETY_OK;
     const char* reason = "manual_ok";
@@ -229,5 +254,7 @@ void Safety::tick(uint32_t nowMs, const SafetyInput& in,
                                            : "manual_fixed";
     }
 
+    _lastCandidateLevel = level;
+    _lastCandidateReason = reason;
     applyCandidate(nowMs, level, reason, in);
 }

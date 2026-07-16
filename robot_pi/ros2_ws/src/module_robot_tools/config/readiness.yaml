@@ -1,0 +1,10 @@
+readiness_monitor:
+  ros__parameters:
+    publish_rate_hz: 1.0
+    status_freshness_s: 0.75
+    motor_freshness_s: 0.30
+    imu_freshness_s: 0.20
+    gnss_freshness_s: 0.50
+    rtk_freshness_s: 0.50
+    safety_freshness_s: 0.50
+    auto_max_horizontal_accuracy_m: 0.03

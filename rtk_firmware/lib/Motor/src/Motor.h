@@ -6,6 +6,7 @@
 #pragma once
 #include <Arduino.h>
 #include "RtkConfig.h"
+#include "MotorCommandGuard.h"
 
 // Команда ESP32 -> плата гироскутера
 typedef struct __attribute__((packed)) {
@@ -38,10 +39,20 @@ public:
     // Positive linear means physical forward translation. Positive angular
     // means clockwise heading increase in DRIVE and TURN_IN_PLACE; the
     // field-proven mode-aware hoverboard adapter is in MotorCommandMath.h.
-    void setLinearAngularSpeed(float linearMps, float angularRadps, bool useRamp = true);
+    bool setLinearAngularSpeed(float linearMps, float angularRadps,
+                               bool useRamp = true,
+                               uint32_t authorization = 0u);
 
     // Ручной режим из app: left/right в процентах (-100..100).
-    void setManualPercent(int leftPct, int rightPct);
+    bool setManualPercent(int leftPct, int rightPct,
+                          uint32_t authorization = 0u);
+
+    // Opens a new, explicit command epoch.  Callers retain the returned token
+    // for their motion session.  STOP/BRAKE/ESTOP invalidates it atomically.
+    uint32_t authorizeMotionCommand(
+        const char* source = "unspecified",
+        uint32_t sourceTimeoutMs = HOVER_CMD_TIMEOUT_MS);
+    bool refreshMotionAuthorization(uint32_t authorization);
 
     // Запустить фоновую TX-задачу на ядре 0: она сама крутит loop() ровным 50Гц,
     // не завися от блокировок главного цикла (GNSS/IMU/WiFi init и т.п.) — иначе
@@ -50,7 +61,7 @@ public:
     void startTxTask();
     bool txTaskRunning() const { return _taskRunning; }
 
-    void stopImmediately();
+    void stopImmediately(const char* reason = "explicit_stop");
     void enable(bool en);
     // Задать «тишину» на N мс после старта — плата hoverboard FOC не любит пакеты
     // пока не стабилизировалась. По умолчанию 1500мс (вызов не обязателен).
@@ -90,6 +101,21 @@ public:
     int   currentLeftPwm()  const { return _curLeftPct; }
     int   currentRightPwm() const { return _curRightPct; }
 
+    struct TxDiagnostics {
+        uint32_t motorCommandSequence = 0u;
+        int routeRequestedLeft = 0;
+        int routeRequestedRight = 0;
+        int motorAppliedLeft = 0;
+        int motorAppliedRight = 0;
+        int uartSpeed = 0;
+        int uartSteer = 0;
+        uint32_t lastCommandUpdateAgeMs = 0xFFFFFFFFu;
+        bool zeroLatchActive = true;
+        const char* motorSource = "none";
+    };
+    TxDiagnostics txDiagnostics(uint32_t nowMs);
+    bool zeroLatchActive() { return txDiagnostics(millis()).zeroLatchActive; }
+
 private:
     void sendHover(int16_t steer, int16_t speed);
     void receiveFeedback();
@@ -120,6 +146,19 @@ private:
     uint32_t _sendCount = 0;                         // счётчик отправленных пакетов (диагностика 50Гц)
 
     uint32_t _commandGeneration = 0;
+    motorcmd::MotorCommandGuard _commandGuard;
+    const char* _commandSource = "none";
+    uint32_t _commandTimeoutMs = HOVER_CMD_TIMEOUT_MS;
+    uint32_t _lastTxHeartbeatMs = 0;
+    int _lastTxDiagRequestedLeft = 0;
+    int _lastTxDiagRequestedRight = 0;
+    int _lastTxDiagAppliedLeft = 0;
+    int _lastTxDiagAppliedRight = 0;
+    int _lastTxDiagUartSpeed = 0;
+    int _lastTxDiagUartSteer = 0;
+    bool _lastTxDiagZeroLatch = true;
+    const char* _lastTxDiagSource = "none";
+    bool _lastTxDiagValid = false;
 
     // feedback parser
     HoverFeedback _fb{};

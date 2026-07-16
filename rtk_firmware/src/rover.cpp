@@ -13,10 +13,12 @@
 #include "Safety.h"
 #include "WsServer.h"
 #include "NavMath.h"
+#include "PvtSafetyTimeline.h"
 #include "RouteExecutor.h"
 #include "CoveragePlanner.h"
 #include "RouteRunDiagnostics.h"
 #include <WiFi.h>
+#include <esp_system.h>
 #include <atomic>
 
 // --- global objects ---
@@ -32,8 +34,13 @@ Motor           g_motor;
 Safety          g_safety;
 WsServer        g_ws;
 routeexec::RouteExecutor g_routeExecutor;
+// Main-loop motion sessions retain an epoch token. Any hard zero invalidates
+// it, so a command calculated before a concurrent WS STOP cannot be applied.
+static uint32_t g_motorAuthorization = 0u;
 
 static uint32_t g_nextRouteId = 1u;
+RTC_DATA_ATTR static uint32_t g_bootCounterMagic = 0u;
+RTC_DATA_ATTR static uint32_t g_bootCounter = 0u;
 static routeexec::FootprintConfig g_routeFootprint;
 static std::atomic<bool> g_routeExecutorActiveMirror(false);
 static std::atomic<bool> g_routeStopLatch(false);
@@ -110,6 +117,8 @@ static void clearPendingRouteCommand() {
 static bool g_logEnabled = true;   // LOG,0 / LOG,1 — гасит периодический лог
 static bool g_pathLogEnabled = false;
 static uint32_t g_estimatorPvtId = 0;
+static pvtsafety::PvtPublicationTimeline g_pvtTimeline;
+static uint32_t g_currentLoopGeneration = 0u;
 
 // --- Heading source / RTK-motion alignment state ---
 // IMU absolute heading has been demoted to optional. For navigation we now
@@ -211,6 +220,40 @@ struct SerialMotion {
     uint32_t timeoutMs = 0;
     uint32_t pausedAtMs = 0;
 } g_serialMotion;
+
+enum class SteeringSignTestPhase : uint8_t {
+    IDLE = 0,
+    WAIT_PHYSICAL_STOP,
+    PULSE,
+};
+
+struct SteeringSignTestState {
+    bool active = false;
+    SteeringSignTestPhase phase = SteeringSignTestPhase::IDLE;
+    int step = 0;
+    uint32_t phaseStartedMs = 0u;
+    uint32_t stableSinceMs = 0u;
+    float stopAnchorX = 0.0f;
+    float stopAnchorY = 0.0f;
+    float stopAnchorHeadingDeg = 0.0f;
+    float headingStartDeg = 0.0f;
+    float positionStartX = 0.0f;
+    float positionStartY = 0.0f;
+    double yawRateSum = 0.0;
+    uint32_t yawRateSamples = 0u;
+    int actualUartSpeed = 0;
+    int actualUartSteer = 0;
+} g_steeringSignTest;
+
+static constexpr uint32_t STEERING_SIGN_PULSE_MS = 500u;
+static constexpr uint32_t STEERING_SIGN_PULSE_MIN_MS = 400u;
+static constexpr uint32_t STEERING_SIGN_PULSE_MAX_MS = 600u;
+static constexpr uint32_t STEERING_SIGN_STOP_STABLE_MS = 650u;
+static constexpr uint32_t STEERING_SIGN_STOP_TIMEOUT_MS = 7000u;
+
+static String startSteeringSignTest();
+static void steeringSignTestTick();
+static void steeringSignTestAbort(const char* reason);
 
 struct PathLogState {
     uint32_t lastPvtId = 0;
@@ -723,7 +766,7 @@ static routeexec::RouteExecutorInput routeExecutorInput(uint32_t now) {
     in.measuredRight = g_motor.speedRightMeas();
     in.feedbackAgeMs = g_motor.feedbackAgeMs(now);
     in.imuAgeMs = g_imu.ageMs(now);
-    in.pvtAgeMs = e.pvtAgeMs;
+    in.pvtAgeMs = g_pvtTimeline.ageMs(now);
     in.motionAllowed = g_safety.allowMotion() && g_ws.navRequested() &&
         !g_routeStopLatch.load(std::memory_order_acquire);
     in.degraded = g_safety.level() == SAFETY_DEGRADED;
@@ -1192,6 +1235,21 @@ static void logSteerResponseWatchdog(
     // The field traces prove command-to-heading direction, but not each raw
     // feedback channel's physical-forward sign. Do not publish an identity
     // mapping as normalized physical track feedback.
+    const float loggedRequestedAngular = out.steeringFaultSnapshotValid
+        ? out.steeringFaultRequestedAngularRadps
+        : out.steeringResponseRequestedAngularRadps;
+    const float loggedHeadingDelta = out.steeringFaultSnapshotValid
+        ? out.steeringFaultHeadingDeltaDeg
+        : out.steeringResponseHeadingDeltaDeg;
+    const float loggedYawRate = out.steeringFaultSnapshotValid
+        ? out.steeringFaultYawRateDps : input.yawRateDps;
+    const int loggedAppliedLeft = out.steeringFaultSnapshotValid
+        ? out.steeringFaultAppliedLeft : input.commandLeft;
+    const int loggedAppliedRight = out.steeringFaultSnapshotValid
+        ? out.steeringFaultAppliedRight : input.commandRight;
+    const routeexec::ExecutorState detectionState =
+        out.steeringFaultSnapshotValid
+            ? out.steeringFaultDetectionState : out.state;
     Serial.printf(
         "[STEER_RESPONSE] requestedAngular=%+.3f headingError=%+.1f "
         "yawRate=%+.2f headingDelta=%+.2f cmdL=%d cmdR=%d "
@@ -1199,17 +1257,19 @@ static void logSteerResponseWatchdog(
         "normalizedMeasuredLeft=NA normalizedMeasuredRight=NA "
         "feedbackNormalizationValid=0 "
         "observationCount=%u responseCorrect=%d faultStop=%d "
-        "heading=%.1f\n",
-        (double)out.steeringResponseRequestedAngularRadps,
+        "heading=%.1f detectionState=%s detectionSnapshot=%d\n",
+        (double)loggedRequestedAngular,
         (double)out.steeringErrorDeg,
-        (double)g_imu.yawRateDps(),
-        (double)out.steeringResponseHeadingDeltaDeg,
-        input.commandLeft, input.commandRight,
+        (double)loggedYawRate,
+        (double)loggedHeadingDelta,
+        loggedAppliedLeft, loggedAppliedRight,
         rawMeasuredLeft, rawMeasuredRight,
         (unsigned)out.steeringResponseObservationCount,
         out.steeringResponseWrongDirection ? 0 : 1,
         faultThresholdReached ? 1 : 0,
-        (double)e.headingFiltDeg);
+        (double)e.headingFiltDeg,
+        routeexec::executorStateName(detectionState),
+        out.steeringFaultSnapshotValid ? 1 : 0);
     g_follow.lastSteerResponseLogMs = now;
 }
 
@@ -2361,6 +2421,35 @@ static void logRouteTransition(const routeexec::RouteExecutorOutput& out,
         }
     }
 
+    // Capture the stop-gate result itself, not a later turn state. This also
+    // survives a footprint fault immediately after a successfully confirmed
+    // stop, so segment1PhysicalStop can never remain NaN after the gate.
+    if (out.physicalStopGatePassed && plannedCornerLifecycle &&
+        out.segmentIndex == 0u) {
+        g_routeObserver.segmentMetrics.capturePhysicalStop(
+            out.physicalStopPosition.x, out.physicalStopPosition.y,
+            out.physicalStopHeadingDeg, out.alongTrackM, out.crossTrackM);
+        routediag::captureOnce(
+            g_routeObserver.cornerSnapshots.cornerPhysicalStopBeforeTurn,
+            out.physicalStopPosition.x, out.physicalStopPosition.y,
+            out.physicalStopHeadingDeg);
+        if (g_ltest.active) {
+            if (!g_ltest.segmentMetrics[0].segmentStart.valid) {
+                g_ltest.segmentMetrics[0].reset(
+                    g_ltest.startX, g_ltest.startY, g_ltest.headingStart);
+            }
+            g_ltest.segmentMetrics[0].capturePhysicalStop(
+                out.physicalStopPosition.x, out.physicalStopPosition.y,
+                out.physicalStopHeadingDeg, out.alongTrackM,
+                out.crossTrackM);
+            g_ltest.segment1PhysicalStopX = out.physicalStopPosition.x;
+            g_ltest.segment1PhysicalStopY = out.physicalStopPosition.y;
+            g_ltest.headingBeforeCorner = out.physicalStopHeadingDeg;
+            g_ltest.pathLen1 =
+                g_ltest.segmentMetrics[0].totalTranslationalPathM();
+        }
+    }
+
     if (out.stateChanged && plannedCornerLifecycle &&
         out.state == routeexec::ExecutorState::TURN_BREAKAWAY) {
         const bool firstTurnStart = routediag::captureOnce(
@@ -2681,16 +2770,27 @@ static void stepRouteExecutor() {
          out.state == routeexec::ExecutorState::HEADING_STABLE) &&
         (out.stateChanged ||
          now - g_routeObserver.lastPhysicalStopLogMs >= 300u)) {
+        const Motor::TxDiagnostics tx = g_motor.txDiagnostics(now);
         Serial.printf("[PHYSICAL_STOP] phase=%s cmdL=%d cmdR=%d "
                       "measL=%d measR=%d feedbackAge=%u yawRate=%+.2f "
-                      "stableMs=%u ready=%d\n",
+                      "stableMs=%u ready=%d motorCommandSequence=%u "
+                      "routeRequestedL=%d routeRequestedR=%d "
+                      "motorAppliedL=%d motorAppliedR=%d uartSpeed=%d "
+                      "uartSteer=%d lastCommandUpdateAge=%u "
+                      "zeroLatchActive=%d\n",
                       routeexec::executorStateName(out.state),
                       input.commandLeft, input.commandRight,
                       input.measuredLeft, input.measuredRight,
                       (unsigned)input.feedbackAgeMs,
                       (double)input.yawRateDps,
                       (unsigned)out.physicalStableMs,
-                      out.physicalStopReady ? 1 : 0);
+                      out.physicalStopReady ? 1 : 0,
+                      (unsigned)tx.motorCommandSequence,
+                      tx.routeRequestedLeft, tx.routeRequestedRight,
+                      tx.motorAppliedLeft, tx.motorAppliedRight,
+                      tx.uartSpeed, tx.uartSteer,
+                      (unsigned)tx.lastCommandUpdateAgeMs,
+                      tx.zeroLatchActive ? 1 : 0);
         g_routeObserver.lastPhysicalStopLogMs = now;
     }
 
@@ -2712,8 +2812,15 @@ static void stepRouteExecutor() {
         !g_routeStopLatch.load(std::memory_order_acquire) &&
         g_routeExecutor.active() && out.faultReason == nullptr;
     if (commandAllowed && out.motion != routeexec::MotionKind::STOP) {
+        if (g_motor.zeroLatchActive() && out.stateChanged) {
+            // RouteExecutor may reopen motion only on an explicit state
+            // transition after its physical-stop gate (or initial acquire).
+            g_motorAuthorization =
+                g_motor.authorizeMotionCommand("ROUTE");
+        }
         g_motor.setLinearAngularSpeed(out.linearMps,
-                                      out.angularRadps, true);
+                                      out.angularRadps, true,
+                                      g_motorAuthorization);
     } else {
         g_motor.stopImmediately();
     }
@@ -2746,6 +2853,9 @@ static constexpr float ALIGN_FORWARD_MPS       = 0.18f;
 static constexpr float ALIGN_MAX_DIST_M        = 1.5f;
 static constexpr float ALIGN_MIN_TRAVEL_M      = 1.0f;   // accept-OK travel
 static constexpr uint32_t ALIGN_TIMEOUT_MS     = 15000u;
+// AUTO_ALIGN is refreshed by the main control loop. This independent lease
+// allows normal loop jitter but still stops if that control task disappears.
+static constexpr uint32_t ALIGN_MOTOR_SOURCE_TIMEOUT_MS = 3000u;
 // Below this we still accept but tag as not_enough_motion in diagnostics.
 static constexpr float ALIGN_MIN_DIST_HARD     = 0.75f;
 // Soft tolerance: 0.10 m is the project's nominal FIXED gate; for alignment
@@ -2825,13 +2935,9 @@ struct AlignRun {
     int   endSampleHead  = 0;
     bool  endLogged = false;
 
-    // De-dup of PVT updates. We track pvtAgeMs every loop tick and push
-    // a new sample only when pvtAgeMs decreased since the previous tick,
-    // i.e. when the parser delivered a fresh PVT. We do NOT tie this to
-    // the last pushed sample: an earlier implementation updated
-    // lastSamplePvtAgeMs only on push, so a stuck age=0 (no new PVT
-    // arriving) kept the gate open and then locked it shut.
-    uint32_t lastSeenPvtAgeMs = 0xFFFFFFFFu;
+    // De-dup uses the same published PVT id as RouteExecutor and route
+    // diagnostics. An age decrease alone is not a publication event.
+    uint32_t lastSeenPvtId = 0u;
     // Monotonic counter of samples pushed this run. Used for the
     // per-sample debug log.
     uint32_t samplePushCount = 0;
@@ -2846,11 +2952,12 @@ struct AlignRun {
     bool originAutoSet = false;
 } g_align;
 
-static bool rtkAcceptableForAlign(const Estimate& e) {
+static bool rtkAcceptableForAlign(const Estimate& e, uint32_t nowMs) {
     const bool rtkOk =
         (e.sol == SOL_FIXED && e.hAcc <= ALIGN_START_MAX_HACC) ||
         (e.sol == SOL_FLOAT && e.hAcc <= 0.05f);
-    return rtkOk && e.lat != 0.0f && e.lon != 0.0f && e.pvtAgeMs <= ALIGN_MAX_PVT_AGE_MS;
+    return rtkOk && e.lat != 0.0f && e.lon != 0.0f &&
+           g_pvtTimeline.ageMs(nowMs) <= ALIGN_MAX_PVT_AGE_MS;
 }
 
 // Begin a new alignment run. Returns true if we transitioned to RUNNING and
@@ -2872,7 +2979,7 @@ static bool autoAlignHeadingBegin(bool fromWebSocket) {
         return false;
     }
     const auto& e0 = g_est.get();
-    if (!rtkAcceptableForAlign(e0)) {
+    if (!rtkAcceptableForAlign(e0, millis())) {
         g_heading.lastAlignError = "rtk_lost";
         g_heading.alignState = AlignState::ERR;
         return false;
@@ -2897,6 +3004,16 @@ static bool autoAlignHeadingBegin(bool fromWebSocket) {
     }
 
     const auto& e = g_est.get();
+    // Acquire one epoch for the complete alignment session. A preceding
+    // manual owner is stopped before AUTO_ALIGN claims the command source.
+    g_motor.stopImmediately("source_ownership_change");
+    g_motorAuthorization = g_motor.authorizeMotionCommand(
+        "AUTO_ALIGN", ALIGN_MOTOR_SOURCE_TIMEOUT_MS);
+    if (g_motorAuthorization == 0u) {
+        g_heading.lastAlignError = "motor_source_busy";
+        g_heading.alignState = AlignState::ERR;
+        return false;
+    }
     g_align.active = true;
     g_align.abortedByStop = false;
     g_align.abortedByRtk = false;
@@ -2919,7 +3036,7 @@ static bool autoAlignHeadingBegin(bool fromWebSocket) {
     g_align.endSampleCount = 0;
     g_align.endSampleHead = 0;
     g_align.endLogged = false;
-    g_align.lastSeenPvtAgeMs = 0xFFFFFFFFu;
+    g_align.lastSeenPvtId = 0u;
     g_align.samplePushCount = 0;
     g_align.lastSamplePushedMs = 0;
     g_heading.alignStartedAtMs = g_align.startedAtMs;
@@ -3070,7 +3187,7 @@ static float alignSegmentHeadingStdDeg() {
 // phase. START_SETTLE fills startSamples, DRIVE fills the moving debug
 // ring, END_SETTLE fills endSamples. Caller is responsible for ensuring
 // this is a NEW PVT, not a duplicate loop tick — see the
-// `lastSeenPvtAgeMs` de-dup in stepAlign().
+// published PVT id/loop de-dup in stepAlign().
 static void alignPushSample(float x, float y, float hAcc, uint32_t tMs) {
     switch (g_align.phase) {
         case AlignPhase::START_SETTLE: {
@@ -3112,15 +3229,14 @@ static void alignPushSample(float x, float y, float hAcc, uint32_t tMs) {
             break;
         }
     }
-    // Per-sample debug line — fires once per fresh PVT, not once per
-    // loop tick. Useful when diagnosing "samples = 1, timeout" without
-    // having to enable the [NAVV2] stream.
     g_align.samplePushCount++;
-    Serial.printf("[ALIGN-RTK] sample pushed phase=%d n=%u age=%u x=%.3f y=%.3f hAcc=%.3f\n",
-                  (int)g_align.phase,
-                  (unsigned)g_align.samplePushCount,
-                  (unsigned)g_align.lastSeenPvtAgeMs,
-                  (double)x, (double)y, (double)hAcc);
+    if ((g_align.samplePushCount % 10u) == 0u) {
+        Serial.printf("[ALIGN-RTK] sample pushed phase=%d n=%u age=%u x=%.3f y=%.3f hAcc=%.3f\n",
+                      (int)g_align.phase,
+                      (unsigned)g_align.samplePushCount,
+                      (unsigned)g_pvtTimeline.ageMs(millis()),
+                      (double)x, (double)y, (double)hAcc);
+    }
 }
 
 // Helper: derive mean+jitter of the start window without leaving phase
@@ -3141,7 +3257,9 @@ static void alignEndCheck(float& outX, float& outY, float& outHAcc,
 // check. Caller has already filled g_heading.lastAlignError with `err`.
 static void alignAbort(const char* err, const Estimate& e, uint32_t nowMs) {
     g_align.active = false;
-    g_motor.stopImmediately();
+    const bool safetyAbort = strcmp(err, "safety") == 0 ||
+                             strcmp(err, "pvt_stale") == 0;
+    g_motor.stopImmediately(safetyAbort ? "safety" : "auto_align_abort");
     g_heading.alignState = AlignState::ERR;
     g_heading.lastAlignError = err;
     g_heading.lastAlignHAcc = e.hAcc;
@@ -3150,7 +3268,7 @@ static void alignAbort(const char* err, const Estimate& e, uint32_t nowMs) {
                   err,
                   g_safety.reason(),
                   (int)g_safety.level(),
-                  (unsigned)e.pvtAgeMs,
+                  (unsigned)g_pvtTimeline.ageMs(nowMs),
                   (unsigned)ALIGN_MAX_PVT_AGE_MS,
                   (double)e.hAcc,
                   (int)e.sol,
@@ -3254,7 +3372,7 @@ static void stepAlign(bool& stopMotorsOut, const char*& errOut) {
     const uint32_t now = millis();
 
     // RTK lost/stale → abort, from any phase.
-    if (!rtkAcceptableForAlign(e)) {
+    if (!rtkAcceptableForAlign(e, now)) {
         g_align.abortedByRtk = true;
         alignAbort("rtk_lost", e, now);
         stopMotorsOut = true;
@@ -3280,22 +3398,33 @@ static void stepAlign(bool& stopMotorsOut, const char*& errOut) {
         return;
     }
 
-    // De-dup: push only when a fresh PVT is observed.
-    //
-    // The Estimate's pvtAgeMs resets to ~0 each time the parser delivers
-    // a new PVT; on subsequent loop ticks it grows monotonically. We
-    // record `lastSeenPvtAgeMs` EVERY loop (regardless of whether we push)
-    // so that "fresh PVT" = "pvtAgeMs dropped since we last observed it"
-    // is detected even on the second and subsequent PVTs of the run.
-    const uint32_t age = e.pvtAgeMs;
-    bool newPvt = false;
-    if (g_align.lastSeenPvtAgeMs == 0xFFFFFFFFu) {
-        // Very first tick of the run: accept regardless of age.
-        newPvt = true;
-    } else if (age < g_align.lastSeenPvtAgeMs) {
-        newPvt = true;
+    // Motor ownership follows the main control loop, never the 5 Hz GNSS
+    // publication cadence. START_SETTLE keeps the one session epoch alive;
+    // DRIVE reapplies the authorized forward command on every control tick.
+    bool motorCommandAccepted = true;
+    if (g_align.phase == AlignPhase::DRIVE) {
+        const float alignSpeed = g_safety.level() == SAFETY_DEGRADED
+            ? min(ALIGN_FORWARD_MPS, ROVER_DEGRADED_SPEED)
+            : ALIGN_FORWARD_MPS;
+        motorCommandAccepted = g_motor.setLinearAngularSpeed(
+            alignSpeed, 0.0f, true, g_motorAuthorization);
+    } else if (g_align.phase == AlignPhase::START_SETTLE) {
+        motorCommandAccepted =
+            g_motor.refreshMotionAuthorization(g_motorAuthorization);
     }
-    g_align.lastSeenPvtAgeMs = age;
+    if (!motorCommandAccepted) {
+        alignAbort("motor_authorization_lost", e, now);
+        stopMotorsOut = true;
+        errOut = "motor_authorization_lost";
+        return;
+    }
+
+    // De-dup uses the publication event itself. A cached/reset age is not
+    // evidence that a new PVT belongs to the current loop.
+    const bool newPvt =
+        g_pvtTimeline.publishedInLoop(g_currentLoopGeneration) &&
+        g_pvtTimeline.pvtId() != g_align.lastSeenPvtId;
+    if (newPvt) g_align.lastSeenPvtId = g_pvtTimeline.pvtId();
 
     if (!newPvt) {
         // No new PVT this tick. Раньше код продолжал setLinearAngularSpeed(...)
@@ -3313,10 +3442,6 @@ static void stepAlign(bool& stopMotorsOut, const char*& errOut) {
                 errOut = "pvt_dropped_in_drive";
                 return;
             }
-            const float alignSpeed = g_safety.level() == SAFETY_DEGRADED
-                ? min(ALIGN_FORWARD_MPS, ROVER_DEGRADED_SPEED)
-                : ALIGN_FORWARD_MPS;
-            g_motor.setLinearAngularSpeed(alignSpeed, 0.0f, true);
         }
         return;
     }
@@ -3368,14 +3493,10 @@ static void stepAlign(bool& stopMotorsOut, const char*& errOut) {
                 Serial.println("[ALIGN-RTK] phase=END_SETTLE");
                 // Stop the motors immediately; the END_SETTLE window is
                 // stationary.
-                g_motor.stopImmediately();
+                g_motor.stopImmediately("auto_align_brake");
                 stopMotorsOut = true;
                 return;
             }
-            const float alignSpeed = g_safety.level() == SAFETY_DEGRADED
-                ? min(ALIGN_FORWARD_MPS, ROVER_DEGRADED_SPEED)
-                : ALIGN_FORWARD_MPS;
-            g_motor.setLinearAngularSpeed(alignSpeed, 0.0f, true);
             return;
         }
         case AlignPhase::END_SETTLE: {
@@ -3410,10 +3531,239 @@ static void clearHeadingTrust() {
     // Leave alignState / lastAlignHeading intact for diagnostics.
 }
 
+static const char* steeringSignStepName(int step) {
+    static const char* names[] = {
+        "equal_forward", "differential_A", "differential_B",
+        "turn_positive", "turn_negative",
+    };
+    return step >= 0 && step < 5 ? names[step] : "complete";
+}
+
+static void steeringSignRequested(int step, int& left, int& right) {
+    static const int requested[5][2] = {
+        {5, 5}, {6, 5}, {5, 6}, {-6, 6}, {6, -6},
+    };
+    left = requested[step][0];
+    right = requested[step][1];
+}
+
+static void steeringSignResetStopWindow(uint32_t now) {
+    const auto& e = g_est.get();
+    g_steeringSignTest.phaseStartedMs = now;
+    g_steeringSignTest.stableSinceMs = 0u;
+    g_steeringSignTest.stopAnchorX = e.x;
+    g_steeringSignTest.stopAnchorY = e.y;
+    g_steeringSignTest.stopAnchorHeadingDeg = e.headingFiltDeg;
+}
+
+static bool steeringSignPhysicalStopReady(uint32_t now) {
+    const auto& e = g_est.get();
+    const Motor::TxDiagnostics tx = g_motor.txDiagnostics(now);
+    const float dx = e.x - g_steeringSignTest.stopAnchorX;
+    const float dy = e.y - g_steeringSignTest.stopAnchorY;
+    const float displacement = sqrtf(dx * dx + dy * dy);
+    const float headingDrift = fabsf(NavMath::wrapDeg180(
+        e.headingFiltDeg - g_steeringSignTest.stopAnchorHeadingDeg));
+    const bool instant =
+        tx.zeroLatchActive && tx.motorAppliedLeft == 0 &&
+        tx.motorAppliedRight == 0 && tx.uartSpeed == 0 &&
+        tx.uartSteer == 0 && g_motor.feedbackAgeMs(now) <= 200u &&
+        abs(g_motor.speedLeftMeas()) <= 3 &&
+        abs(g_motor.speedRightMeas()) <= 3 && g_imu.fresh() &&
+        g_imu.ageMs(now) <= 200u && e.pvtAgeMs <= 500u &&
+        fabsf(g_imu.yawRateDps()) <= 3.0f;
+    if (!instant || displacement > 0.040f || headingDrift > 2.0f) {
+        g_steeringSignTest.stableSinceMs = 0u;
+        g_steeringSignTest.stopAnchorX = e.x;
+        g_steeringSignTest.stopAnchorY = e.y;
+        g_steeringSignTest.stopAnchorHeadingDeg = e.headingFiltDeg;
+        return false;
+    }
+    if (g_steeringSignTest.stableSinceMs == 0u) {
+        g_steeringSignTest.stableSinceMs = now;
+        return false;
+    }
+    return now - g_steeringSignTest.stableSinceMs >=
+           STEERING_SIGN_STOP_STABLE_MS;
+}
+
+static void steeringSignTestFinish(const char* result) {
+    g_motor.stopImmediately();
+    g_steeringSignTest.active = false;
+    g_steeringSignTest.phase = SteeringSignTestPhase::IDLE;
+    g_ws.setSerialMotionActive(false);
+    Serial.printf("[STEERING_SIGN_TEST] result=%s stepsCompleted=%d\n",
+                  result, g_steeringSignTest.step);
+}
+
+static void steeringSignTestAbort(const char* reason) {
+    if (!g_steeringSignTest.active) return;
+    steeringSignTestFinish(reason ? reason : "aborted");
+}
+
+static bool steeringSignBeginPulse(uint32_t now) {
+    int requestedLeft = 0;
+    int requestedRight = 0;
+    steeringSignRequested(g_steeringSignTest.step,
+                          requestedLeft, requestedRight);
+    const auto& e = g_est.get();
+    g_steeringSignTest.headingStartDeg = e.headingFiltDeg;
+    g_steeringSignTest.positionStartX = e.x;
+    g_steeringSignTest.positionStartY = e.y;
+    g_steeringSignTest.yawRateSum = 0.0;
+    g_steeringSignTest.yawRateSamples = 0u;
+    g_steeringSignTest.actualUartSpeed = 0;
+    g_steeringSignTest.actualUartSteer = 0;
+    g_motorAuthorization =
+        g_motor.authorizeMotionCommand("STEERING_SIGN_TEST");
+    if (!g_motor.setManualPercent(requestedLeft, requestedRight,
+                                  g_motorAuthorization)) {
+        steeringSignTestAbort("command_rejected");
+        return false;
+    }
+    g_steeringSignTest.phase = SteeringSignTestPhase::PULSE;
+    g_steeringSignTest.phaseStartedMs = now;
+    Serial.printf("[STEERING_SIGN_TEST] testStep=%d name=%s "
+                  "requestedL=%d requestedR=%d phase=PULSE durationMs=%u\n",
+                  g_steeringSignTest.step,
+                  steeringSignStepName(g_steeringSignTest.step),
+                  requestedLeft, requestedRight,
+                  (unsigned)STEERING_SIGN_PULSE_MS);
+    return true;
+}
+
+static String startSteeringSignTest() {
+    static_assert(STEERING_SIGN_PULSE_MS >= STEERING_SIGN_PULSE_MIN_MS &&
+                  STEERING_SIGN_PULSE_MS <= STEERING_SIGN_PULSE_MAX_MS,
+                  "steering sign pulse must remain bounded");
+    if (g_steeringSignTest.active)
+        return String("STEERING_SIGN_TEST,ERR,already_running");
+    if (g_routeExecutor.active() ||
+        g_routeExecutorActiveMirror.load(std::memory_order_acquire) ||
+        g_serialMotion.active || g_heading.alignState == AlignState::RUNNING ||
+        g_ws.navRequested()) {
+        return String("STEERING_SIGN_TEST,ERR,active_route_or_motion");
+    }
+    g_steeringSignTest = SteeringSignTestState{};
+    g_steeringSignTest.active = true;
+    g_steeringSignTest.phase =
+        SteeringSignTestPhase::WAIT_PHYSICAL_STOP;
+    g_ws.setSerialMotionActive(true);
+    g_motor.stopImmediately();
+    steeringSignResetStopWindow(millis());
+    Serial.println("[STEERING_SIGN_TEST] phase=STOP_AND_WAIT_PHYSICAL_STOP");
+    return String("STEERING_SIGN_TEST,OK,started");
+}
+
+static void steeringSignTestTick() {
+    if (!g_steeringSignTest.active) return;
+    const uint32_t now = millis();
+    if (!g_safety.allowMotion()) {
+        steeringSignTestAbort("safety_disallows_motion");
+        return;
+    }
+    if (g_routeExecutor.active() || g_ws.navRequested()) {
+        steeringSignTestAbort("route_became_active");
+        return;
+    }
+
+    if (g_steeringSignTest.phase == SteeringSignTestPhase::PULSE) {
+        const Motor::TxDiagnostics tx = g_motor.txDiagnostics(now);
+        if (tx.uartSpeed != 0 || tx.uartSteer != 0) {
+            g_steeringSignTest.actualUartSpeed = tx.uartSpeed;
+            g_steeringSignTest.actualUartSteer = tx.uartSteer;
+        }
+        g_steeringSignTest.yawRateSum += g_imu.yawRateDps();
+        ++g_steeringSignTest.yawRateSamples;
+        if (now - g_steeringSignTest.phaseStartedMs <
+            STEERING_SIGN_PULSE_MS) return;
+        g_motor.stopImmediately();
+        g_steeringSignTest.phase =
+            SteeringSignTestPhase::WAIT_PHYSICAL_STOP;
+        steeringSignResetStopWindow(now);
+        return;
+    }
+
+    if (now - g_steeringSignTest.phaseStartedMs >
+        STEERING_SIGN_STOP_TIMEOUT_MS) {
+        steeringSignTestAbort("physical_stop_timeout");
+        return;
+    }
+    if (!steeringSignPhysicalStopReady(now)) return;
+
+    if (g_steeringSignTest.step > 0 ||
+        g_steeringSignTest.yawRateSamples > 0u) {
+        int requestedLeft = 0;
+        int requestedRight = 0;
+        steeringSignRequested(g_steeringSignTest.step,
+                              requestedLeft, requestedRight);
+        const auto& e = g_est.get();
+        const float headingDelta = NavMath::wrapDeg180(
+            e.headingFiltDeg - g_steeringSignTest.headingStartDeg);
+        const float dx = e.x - g_steeringSignTest.positionStartX;
+        const float dy = e.y - g_steeringSignTest.positionStartY;
+        const float positionDelta = sqrtf(dx * dx + dy * dy);
+        const double meanYawRate =
+            g_steeringSignTest.yawRateSamples == 0u ? 0.0 :
+            g_steeringSignTest.yawRateSum /
+                (double)g_steeringSignTest.yawRateSamples;
+        Serial.printf(
+            "[STEERING_SIGN_RESULT] testStep=%d name=%s "
+            "requestedL=%d requestedR=%d actualUartSpeed=%d "
+            "actualUartSteer=%d headingStart=%.1f headingEnd=%.1f "
+            "headingDelta=%+.1f meanYawRate=%+.2f positionDelta=%.3f "
+            "motorFeedback=%d/%d\n",
+            g_steeringSignTest.step,
+            steeringSignStepName(g_steeringSignTest.step),
+            requestedLeft, requestedRight,
+            g_steeringSignTest.actualUartSpeed,
+            g_steeringSignTest.actualUartSteer,
+            (double)g_steeringSignTest.headingStartDeg,
+            (double)e.headingFiltDeg, (double)headingDelta,
+            meanYawRate, (double)positionDelta,
+            g_motor.speedLeftMeas(), g_motor.speedRightMeas());
+        ++g_steeringSignTest.step;
+    }
+    if (g_steeringSignTest.step >= 5) {
+        steeringSignTestFinish("complete");
+        return;
+    }
+    steeringSignBeginPulse(now);
+}
+
+static const char* resetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXTERNAL";
+        case ESP_RST_SW: return "SOFTWARE";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        case ESP_RST_UNKNOWN:
+        default: return "UNKNOWN";
+    }
+}
+
 void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(200);
     Serial.println("\n[ROVER] boot");
+    constexpr uint32_t BOOT_COUNTER_MAGIC = 0x524F5645u;
+    if (g_bootCounterMagic != BOOT_COUNTER_MAGIC) {
+        g_bootCounterMagic = BOOT_COUNTER_MAGIC;
+        g_bootCounter = 0u;
+    }
+    ++g_bootCounter;
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    Serial.printf("[BOOT_TELEMETRY] bootCounter=%u resetReason=%s "
+                  "resetCode=%d brownout=%d\n",
+                  (unsigned)g_bootCounter, resetReasonName(resetReason),
+                  (int)resetReason,
+                  resetReason == ESP_RST_BROWNOUT ? 1 : 0);
 
     pinMode(PIN_RELAY_ATTACH, OUTPUT); digitalWrite(PIN_RELAY_ATTACH, LOW);
     pinMode(PIN_RELAY_MOUNT,  OUTPUT); digitalWrite(PIN_RELAY_MOUNT,  LOW);
@@ -3467,6 +3817,8 @@ void setup() {
 }
 
 void loop() {
+    ++g_currentLoopGeneration;
+    if (g_currentLoopGeneration == 0u) ++g_currentLoopGeneration;
     uint32_t now = millis();
     static uint32_t lastBat = 0;
 
@@ -3522,6 +3874,8 @@ void loop() {
                 Serial.println(roverdbg::clearHeadingTrustLine());
             } else if (strcmp(buf, "NAV_START_AUTO_ALIGN") == 0) {
                 Serial.println(roverdbg::navStartAutoAlignLine());
+            } else if (strcmp(buf, "STEERING_SIGN_TEST") == 0) {
+                Serial.println(startSteeringSignTest());
             } else if (strcmp(buf, "GO") == 0) {
                 roverdbg::handleGoForward(ROVER_GO_DEFAULT_DISTANCE_M);
             } else if (strncmp(buf, "GO_FORWARD", 10) == 0) {
@@ -3622,15 +3976,21 @@ void loop() {
                                     g_follow.linearMps);
 
     GnssPvtData pvt;
-    if (g_gnss.consumeFreshPvt(pvt)) {
-        g_est.onPvt(now,
+    const bool publishedNewPvt = g_gnss.consumeFreshPvt(pvt);
+    // Refresh loop time after the cross-core GNSS snapshot. This guarantees
+    // now >= the captured PVT timestamp used by estimator/Safety age math.
+    now = millis();
+    if (publishedNewPvt) {
+        g_pvtTimeline.publish(pvt.captureTimestampMs, pvt.pvtId,
+                              g_currentLoopGeneration);
+        g_est.onPvt(pvt.captureTimestampMs,
             pvt.latE7, pvt.lonE7, pvt.heightMm,
             pvt.hAccMm, pvt.vAccMm,
             pvt.gSpeedMmps, pvt.headMotDegE5,
             pvt.fixType, pvt.carrierSol, pvt.diffSoln,
             pvt.numSv, pvt.pDop, pvt.headAccDegE5,
             g_gnss.lastPvtITowDeltaMs());
-        g_estimatorPvtId = g_gnss.pvtCount();
+        g_estimatorPvtId = g_pvtTimeline.pvtId();
     }
     // RTCM транспорт → возраст в эстимейторе (раньше est.rtcmAgeMs зеркалил
     // возраст PVT и телеметрия врала). Отмечаем каждый принятый UDP-пакет.
@@ -3704,7 +4064,9 @@ void loop() {
     si.numSv        = g_est.get().numSv;
     si.pDop         = g_est.get().pDop;
     si.hAcc         = g_est.get().hAcc;
-    si.pvtAgeMs     = g_est.get().pvtAgeMs;
+    si.pvtAgeMs     = g_pvtTimeline.ageMs(now);
+    si.publishedPvtTimestampMs = g_pvtTimeline.timestampMs();
+    si.currentLoopGeneration = g_currentLoopGeneration;
     si.rtcmAgeMs    = g_rtcm.transportAgeMs(now);
     si.acceptedPositionAgeMs = g_est.get().acceptedPositionAgeMs;
     si.headingAgeMs = g_est.get().headingAgeMs;
@@ -3725,14 +4087,38 @@ void loop() {
         !g_align.fromWebSocket;
     const bool alignmentRunning =
         g_align.active && g_heading.alignState == AlignState::RUNNING;
-    si.serialDebugMotion = serialAlignActive || g_serialMotion.active;
+    si.serialDebugMotion = serialAlignActive || g_serialMotion.active ||
+                           g_steeringSignTest.active;
     si.rtkAlignmentActive = alignmentRunning;
     const auto& safetyEstimate = g_est.get();
     const bool routeActive = g_routeExecutor.active();
+    const Motor::TxDiagnostics safetyMotorTx =
+        g_motor.txDiagnostics(now);
     si.motorMotionCommanded = g_motor.currentLeftPwm() != 0 ||
                               g_motor.currentRightPwm() != 0 ||
                               g_motor.lastSpeedCmd() != 0 ||
                               g_motor.lastSteerCmd() != 0;
+    const bool alignmentMotorsZero =
+        !si.motorMotionCommanded &&
+        safetyMotorTx.motorAppliedLeft == 0 &&
+        safetyMotorTx.motorAppliedRight == 0 &&
+        safetyMotorTx.uartSpeed == 0 &&
+        safetyMotorTx.uartSteer == 0;
+    const bool pvtPublishedThisLoop =
+        g_pvtTimeline.publishedInLoop(g_currentLoopGeneration);
+    pvtsafety::AlignStartupRecoveryConditions startupRecovery;
+    startupRecovery.startSettle =
+        alignmentRunning && g_align.phase == AlignPhase::START_SETTLE;
+    startupRecovery.fixed = si.sol == SOL_FIXED;
+    startupRecovery.hAccAllowed =
+        isfinite(si.hAcc) && si.hAcc <= ALIGN_START_MAX_HACC;
+    startupRecovery.pvtPublishedThisLoop = pvtPublishedThisLoop;
+    startupRecovery.motorsZero = alignmentMotorsZero;
+    startupRecovery.safetyEvaluatedPublishedPvt =
+        pvtPublishedThisLoop &&
+        si.publishedPvtTimestampMs == g_pvtTimeline.timestampMs();
+    si.alignStartupFreshPvtRecovery =
+        pvtsafety::requestAlignStartupFreshPvtRecovery(startupRecovery);
     si.motorFeedbackAlive = g_motor.feedbackAlive(now);
     si.motorHardwareFault = g_motor.hardwareFault() || g_motor.commandFault();
     si.internalFinite = isfinite(safetyEstimate.lat) &&
@@ -3817,6 +4203,50 @@ void loop() {
     }
     g_safety.tick(now, si, g_est, g_imu);
 
+    if (alignmentRunning) {
+        static bool s_alignSafetyTraceInitialized = false;
+        static SafetyLevel s_lastAlignSafetyLevel = SAFETY_OK;
+        static const char* s_lastAlignSafetyReason = "";
+        const uint32_t alignUpdateNow = millis();
+        const bool timelineMismatch =
+            g_safety.evaluatedPvtTimestampMs() !=
+                g_pvtTimeline.timestampMs() ||
+            g_safety.statusGeneration() != g_currentLoopGeneration;
+        const bool safetyTransition = s_alignSafetyTraceInitialized &&
+            (s_lastAlignSafetyLevel != g_safety.level() ||
+             strcmp(s_lastAlignSafetyReason, g_safety.reason()) != 0);
+        const bool abortPending =
+            (!g_ws.navRequested() && g_align.fromWebSocket) ||
+            g_safety.level() == SAFETY_ESTOP ||
+            g_safety.level() == SAFETY_HOLD;
+        if (si.alignStartupFreshPvtRecovery || timelineMismatch ||
+            safetyTransition || abortPending) {
+            Serial.printf(
+                "[ALIGN_PVT_SAFETY] publishedPvtTimestamp=%u "
+                "safetyEvaluatedPvtTimestamp=%u "
+                "pvtAgeAtSafetyEvaluation=%u pvtAgeAtAlignUpdate=%u "
+                "safetyStatusGeneration=%u currentLoopGeneration=%u "
+                "publishedThisLoop=%d startupRecovery=%d "
+                "candidateLevel=%s candidateReason=%s retainedLevel=%s "
+                "retainedReason=%s\n",
+                (unsigned)g_pvtTimeline.timestampMs(),
+                (unsigned)g_safety.evaluatedPvtTimestampMs(),
+                (unsigned)g_safety.pvtAgeAtEvaluationMs(),
+                (unsigned)g_pvtTimeline.ageMs(alignUpdateNow),
+                (unsigned)g_safety.statusGeneration(),
+                (unsigned)g_currentLoopGeneration,
+                pvtPublishedThisLoop ? 1 : 0,
+                si.alignStartupFreshPvtRecovery ? 1 : 0,
+                Safety::levelName(g_safety.lastCandidateLevel()),
+                g_safety.lastCandidateReason(),
+                Safety::levelName(g_safety.level()),
+                g_safety.reason());
+        }
+        s_lastAlignSafetyLevel = g_safety.level();
+        s_lastAlignSafetyReason = g_safety.reason();
+        s_alignSafetyTraceInitialized = true;
+    }
+
     // RTK motion alignment state machine. Runs AFTER Safety::tick so
     // it sees the up-to-date level — in particular, serialDebugMotion
     // has already cleared the previous ws_disconnected ESTOP before this
@@ -3844,7 +4274,8 @@ void loop() {
             // Safety::tick() when serialDebugMotion=true, so this
             // branch will not trigger on a Serial alignment.
             stopMotors = true;
-            alignErr = "safety";
+            alignErr = strcmp(g_safety.reason(), "pvt_stale") == 0
+                ? "pvt_stale" : "safety";
         }
         if (stopMotors) {
             const uint32_t nowAbort = millis();
@@ -3860,8 +4291,10 @@ void loop() {
     if (!g_safety.allowMotion()) {
         digitalWrite(PIN_RELAY_ATTACH, LOW);
         digitalWrite(PIN_RELAY_MOUNT, LOW);
-        g_motor.stopImmediately();
+        g_motor.stopImmediately("safety");
     }
+
+    steeringSignTestTick();
 
     if (!g_ws.navRequested() && g_routeExecutor.active() &&
         !g_serialMotion.active) {
@@ -4834,6 +5267,14 @@ void pathDiagnosticsLegacyOnTick() {
                                                             by - e.y);
     const float lineHeadingErr = NavMath::wrapDeg180(lineHeading -
                                                      e.headingFiltDeg);
+    const bool legacyTurnPhase =
+        g_precision.phase == PrecisionPhase::TURN ||
+        g_precision.phase == PrecisionPhase::BRAKE ||
+        g_precision.phase == PrecisionPhase::WAIT_PHYSICAL_STOP ||
+        g_precision.phase == PrecisionPhase::HEADING_STABLE;
+    const float turnError = legacyTurnPhase
+        ? NavMath::wrapDeg180(g_follow.turnTargetDeg - e.headingFiltDeg)
+        : NAN;
 
     Serial.printf("[PATH_CSV] t=%u,test=%s,phase=%s,seg=%d,pvtId=%u,"
                   "x=%.3f,y=%.3f,planAx=%.3f,planAy=%.3f,"
@@ -4843,6 +5284,7 @@ void pathDiagnosticsLegacyOnTick() {
                   "lineHeading=%.1f,bearingToTarget=%.1f,"
                   "interceptHeading=%.1f,steeringTarget=%.1f,turnTarget=%.1f,"
                   "estHeading=%.1f,lineHeadingErr=%+.1f,steeringError=%+.1f,"
+                  "turnError=%+.1f,"
                   "controllerMode=%s,turnState=%s,recoveryAttempt=%u,"
                   "motionCourse=%.1f,motionCourseDist=%.3f,"
                   "yawRate=%.2f,linear=%.3f,angular=%.3f,"
@@ -4861,6 +5303,7 @@ void pathDiagnosticsLegacyOnTick() {
                   (double)g_follow.turnTargetDeg,
                   (double)e.headingFiltDeg, (double)lineHeadingErr,
                   (double)g_follow.steeringErrorDeg,
+                  (double)turnError,
                   followerControllerModeName(g_follow.controllerMode),
                   followerTurnStateName(g_follow.turnState),
                   (unsigned)g_follow.endpointRecoveryAttempt,
@@ -4964,7 +5407,7 @@ void pathDiagnosticsOnTick() {
         "controllerMode=%s,turnState=%s,motionCourse=%.1f,"
         "motionCourseDist=%.3f,cmdL=%d,cmdR=%d,measuredL=%d,"
         "measuredR=%d,heading=%.1f,yawRate=%+.2f,linear=%.3f,"
-        "angular=%+.3f,sol=%d,hAcc=%.3f,pvtAge=%u,rtcmAge=%u\n",
+        "angular=%+.3f,turnError=%+.1f,sol=%d,hAcc=%.3f,pvtAge=%u,rtcmAge=%u\n",
         (unsigned)now, (unsigned)out.routeId, test,
         (unsigned)out.segmentIndex, routeexec::executorStateName(out.state),
         (unsigned)pvtId, (double)e.x, (double)e.y,
@@ -4986,6 +5429,7 @@ void pathDiagnosticsOnTick() {
         g_motor.speedLeftMeas(), g_motor.speedRightMeas(),
         (double)e.headingFiltDeg, (double)g_imu.yawRateDps(),
         (double)out.linearMps, (double)out.angularRadps,
+        (double)out.turnErrorDeg,
         (int)e.sol, (double)e.hAcc, (unsigned)e.pvtAgeMs,
         (unsigned)g_rtcm.transportAgeMs(now));
 }
@@ -6875,6 +7319,14 @@ bool routeExecutorActive() {
     return g_routeExecutorActiveMirror.load(std::memory_order_acquire);
 }
 
+bool manualMotorCommandAllowed() {
+    return !routeExecutorActive() &&
+           !g_routeStopLatch.load(std::memory_order_acquire) &&
+           !g_steeringSignTest.active &&
+           !(g_align.active &&
+             g_heading.alignState == AlignState::RUNNING);
+}
+
 String queueNavStartLineWs() {
     const char* gateError = navStartGateError();
     if (gateError != nullptr) return String(gateError);
@@ -6979,6 +7431,7 @@ String handleStopLine() {
     clearPendingRouteCommand();
     g_ws.setNavRequested(false);
     g_motor.stopImmediately();
+    steeringSignTestAbort("stopped");
     if (g_heading.alignState == AlignState::RUNNING) {
         g_align.active = false;
         g_heading.alignState = AlignState::ERR;

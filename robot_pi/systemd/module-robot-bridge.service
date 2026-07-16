@@ -1,0 +1,32 @@
+[Unit]
+Description=Module Robot ESP32 serial bridge
+Documentation=file://@ROBOT_ROOT@/robot_pi/README.md
+Wants=network-online.target
+After=network-online.target
+Before=module-robot-bringup.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@ROBOT_USER@
+WorkingDirectory=@ROBOT_ROOT@/robot_pi/ros2_ws
+EnvironmentFile=/etc/module-robot/runtime.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source @ROBOT_ROOT@/robot_pi/ros2_ws/install/setup.bash && exec ros2 launch module_robot_esp32_bridge bridge.launch.py config:=@ROBOT_ROOT@/robot_pi/config/serial.yaml'
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=5
+SendSIGKILL=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=module-robot-bridge
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
