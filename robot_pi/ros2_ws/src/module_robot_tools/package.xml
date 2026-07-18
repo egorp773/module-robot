@@ -7,7 +7,6 @@
   <maintainer email="robot@localhost">Module Robot Maintainers</maintainer>
   <license>Apache-2.0</license>
 
-  <buildtool_depend>ament_python</buildtool_depend>
   <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>module_robot_msgs</exec_depend>

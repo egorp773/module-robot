@@ -6,12 +6,14 @@ log() { printf '[manual_drive_test] %s\n' "$*"; }
 
 [[ -r /opt/ros/jazzy/setup.bash ]] || die 'ROS 2 Jazzy is not installed'
 # shellcheck disable=SC1091
+set +u
 source /opt/ros/jazzy/setup.bash
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 workspace="$(cd -- "$script_dir/../ros2_ws" && pwd -P)"
 [[ -r "$workspace/install/setup.bash" ]] || die 'Workspace is not built'
 # shellcheck disable=SC1090
 source "$workspace/install/setup.bash"
+set -u
 
 armed=false
 pub_pid=''
@@ -50,6 +52,25 @@ call_expect_success() {
   grep -Eq 'success[=:][[:space:]]*(true|True)' <<<"$last_service_response" || \
     die "Service rejected the request: $service"
 }
+call_zero_expect_success() {
+  local service="$1" service_type="$2" request="$3" attempt
+  for attempt in 1 2 3; do
+    last_service_response="$(
+      timeout 8 ros2 service call "$service" "$service_type" "$request" 2>&1
+    )" || true
+    printf '%s\n' "$last_service_response"
+    if grep -Eq 'success[=:][[:space:]]*(true|True)' <<<"$last_service_response"; then
+      return 0
+    fi
+  done
+  die "Zero-only service failed after 3 attempts: $service"
+}
+read_status() {
+  timeout 8 python3 "$script_dir/read_telemetry_sample.py" status
+}
+read_motor() {
+  timeout 8 python3 "$script_dir/read_telemetry_sample.py" motor
+}
 hard_stop() {
   [[ -n "$pub_pid" ]] && kill -INT "$pub_pid" 2>/dev/null || true
   [[ -n "$pub_pid" ]] && wait "$pub_pid" 2>/dev/null || true
@@ -57,7 +78,7 @@ hard_stop() {
   timeout 2 ros2 topic pub --once /cmd_vel_manual geometry_msgs/msg/TwistStamped \
     "$(twist_message 0.0 0.0)" >/dev/null 2>&1 || \
     die 'Failed to publish the zero manual command'
-  call_expect_success /safety/stop std_srvs/srv/Trigger '{}'
+  call_zero_expect_success /safety/stop std_srvs/srv/Trigger '{}'
 }
 cleanup() {
   best_effort_stop
@@ -78,14 +99,14 @@ trap 'exit_on_signal 130' INT
 trap 'exit_on_signal 143' TERM
 
 timeout 5 ros2 service type /safety/arm >/dev/null || die '/safety/arm is unavailable; start manual bringup first'
-status="$(timeout 5 ros2 topic echo --once /esp32/status 2>/dev/null)" || die 'No /esp32/status sample; check serial connection'
+status="$(read_status)" || die 'No /esp32/status sample; check serial connection'
 printf '%s\n' "$status"
 grep -q 'connected: true' <<<"$status" || die 'ESP32 is not connected'
 
 log 'Forcing the known-safe DISARMED state before any prompt'
-call_expect_success /safety/disarm module_robot_msgs/srv/Disarm '{}'
+call_zero_expect_success /safety/disarm module_robot_msgs/srv/Disarm '{}'
 sleep 0.3
-status="$(timeout 5 ros2 topic echo --once /esp32/status 2>/dev/null)" || die 'Status disappeared after DISARM'
+status="$(read_status)" || die 'Status disappeared after DISARM'
 grep -Eq 'state:[[:space:]]*2([[:space:]]|$)' <<<"$status" || die 'ESP32 did not report DISARMED (state=2)'
 grep -Eq 'applied_left_command:[[:space:]]*0([[:space:]]|$)' <<<"$status" || die 'Left command is not zero while DISARMED'
 grep -Eq 'applied_right_command:[[:space:]]*0([[:space:]]|$)' <<<"$status" || die 'Right command is not zero while DISARMED'
@@ -115,7 +136,7 @@ call_expect_success /safety/arm module_robot_msgs/srv/Arm \
   "{arm_nonce: ${nonce}, requested_mode: 1}"
 armed_confirmed=false
 for _ in {1..15}; do
-  status="$(timeout 2 ros2 topic echo --once /esp32/status 2>/dev/null || true)"
+  status="$(read_status || true)"
   if grep -Eq 'state:[[:space:]]*3([[:space:]]|$)' <<<"$status" &&
      grep -q 'armed: true' <<<"$status"; then
     armed_confirmed=true
@@ -127,7 +148,7 @@ done
 
 log 'Sending zero commands for one second'
 publish_for 0.0 0.0 1.0
-status="$(timeout 5 ros2 topic echo --once /esp32/status 2>/dev/null)" || die 'No status after the ARMED zero command'
+status="$(read_status)" || die 'No status after the ARMED zero command'
 grep -Eq 'state:[[:space:]]*3([[:space:]]|$)' <<<"$status" || die 'ESP32 left ARMED during the zero-command check'
 grep -Eq 'applied_left_command:[[:space:]]*0([[:space:]]|$)' <<<"$status" || die 'Left output moved during the zero-command check'
 grep -Eq 'applied_right_command:[[:space:]]*0([[:space:]]|$)' <<<"$status" || die 'Right output moved during the zero-command check'
@@ -140,8 +161,8 @@ hard_stop
 sleep 0.4
 
 log 'Motor feedback after STOP:'
-timeout 5 ros2 topic echo --once /motor/status || die 'No motor feedback after STOP'
-status="$(timeout 5 ros2 topic echo --once /esp32/status 2>/dev/null)" || die 'No ESP32 status after STOP'
+read_motor || die 'No motor feedback after STOP'
+status="$(read_status)" || die 'No ESP32 status after STOP'
 printf '%s\n' "$status"
 grep -Eq 'state:[[:space:]]*3([[:space:]]|$)' <<<"$status" || die 'STOP did not preserve ESP32 ARMED state'
 grep -q 'armed: true' <<<"$status" || die 'ESP32 no longer reports ARMED after STOP'
@@ -154,9 +175,9 @@ motor_age_ms="$(awk '/^last_motor_feedback_age_ms:[[:space:]]*[0-9]+/{print $2; 
 ((motor_age_ms <= 500)) || die "Motor feedback is stale after STOP (${motor_age_ms} ms)"
 
 log 'DISARMING'
-call_expect_success /safety/disarm module_robot_msgs/srv/Disarm '{}'
+call_zero_expect_success /safety/disarm module_robot_msgs/srv/Disarm '{}'
 sleep 0.3
-status="$(timeout 5 ros2 topic echo --once /esp32/status 2>/dev/null)" || die 'No ESP32 status after final DISARM'
+status="$(read_status)" || die 'No ESP32 status after final DISARM'
 grep -Eq 'state:[[:space:]]*2([[:space:]]|$)' <<<"$status" || die 'Final state is not DISARMED'
 grep -Eq 'applied_left_command:[[:space:]]*0([[:space:]]|$)' <<<"$status" || die 'Left command is non-zero after final DISARM'
 grep -Eq 'applied_right_command:[[:space:]]*0([[:space:]]|$)' <<<"$status" || die 'Right command is non-zero after final DISARM'

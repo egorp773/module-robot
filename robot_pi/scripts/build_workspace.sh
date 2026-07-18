@@ -43,7 +43,9 @@ esac
 [[ "$(uname -s)" == Linux ]] || die 'Build this ROS workspace on the Raspberry Pi, not Windows'
 [[ -r /opt/ros/jazzy/setup.bash ]] || die 'ROS 2 Jazzy is not installed; run install_pi.sh first'
 # shellcheck disable=SC1091
+set +u
 source /opt/ros/jazzy/setup.bash
+set -u
 [[ "${ROS_DISTRO:-}" == jazzy ]] || die "Expected ROS_DISTRO=jazzy, got ${ROS_DISTRO:-unset}"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
