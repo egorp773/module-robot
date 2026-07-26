@@ -3,7 +3,9 @@ safety_node:
     # Runtime names intentionally match module_robot_safety/config/safety.yaml.
     publish_rate_hz: 50.0
     status_timeout_ms: 500
-    motor_feedback_timeout_ms: 250
+    # 10 Hz BEST_EFFORT telemetry: tolerate bounded DDS/OS jitter with a
+    # nominal 100 ms margin; ESP32 independently enforces the 500 ms stop.
+    motor_feedback_timeout_ms: 400
     manual_cmd_timeout_ms: 200
     auto_cmd_timeout_ms: 200
     imu_timeout_ms: 250

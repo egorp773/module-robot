@@ -1,4 +1,5 @@
 #include "PiBridgeMotor.h"
+#include "PiBridgeTime.h"
 
 #include <esp_timer.h>
 #include <string.h>
@@ -153,7 +154,7 @@ void PiBridgeMotor::pollFeedback() {
     }
 }
 
-MotorTelemetry PiBridgeMotor::telemetry(uint32_t now_ms) const {
+MotorTelemetry PiBridgeMotor::telemetry() const {
     MotorTelemetry out;
     taskENTER_CRITICAL(&_mux);
     out.timestamp_us = _last_feedback_us;
@@ -171,8 +172,14 @@ MotorTelemetry PiBridgeMotor::telemetry(uint32_t now_ms) const {
     out.available = _have_feedback;
     const uint32_t last_feedback_ms = _last_feedback_ms;
     taskEXIT_CRITICAL(&_mux);
+
+    // Snapshot time only after selecting the feedback timestamp. The motor
+    // owner can publish feedback concurrently from the other ESP32 core; the
+    // old API accepted a caller timestamp taken before that publication and
+    // could turn a fresh frame into an unsigned ~49-day age.
+    const uint32_t now_ms = millis();
     out.age_ms = out.available
-        ? now_ms - last_feedback_ms : 0xFFFFFFFFu;
+        ? elapsedAgeMs(now_ms, last_feedback_ms) : 0xFFFFFFFFu;
     out.fresh = out.available && out.age_ms <= kFeedbackTimeoutMs;
     out.at_zero = out.fresh &&
         absoluteFeedback(out.left_feedback) <= kFeedbackZeroThreshold &&

@@ -85,7 +85,14 @@ class SafetyNode(Node):
         self._lock = threading.RLock()
         self._status_condition = threading.Condition(self._lock)
         self._status_generation = 0
-        self._state_group = MutuallyExclusiveCallbackGroup()
+        # These streams have different safety deadlines.  Keeping them in one
+        # mutually-exclusive group lets the 50 Hz command/tick workload starve
+        # 10 Hz ESP32 or motor feedback until it is falsely declared stale.
+        # The shared RLock below remains the single state-consistency boundary.
+        self._critical_telemetry_group = MutuallyExclusiveCallbackGroup()
+        self._command_input_group = MutuallyExclusiveCallbackGroup()
+        self._auxiliary_state_group = MutuallyExclusiveCallbackGroup()
+        self._tick_callback_group = MutuallyExclusiveCallbackGroup()
         self._service_group = MutuallyExclusiveCallbackGroup()
         # STOP/DISARM/ESTOP must not wait behind ARM or a reset proxy call.
         self._zero_service_group = ReentrantCallbackGroup()
@@ -153,84 +160,84 @@ class SafetyNode(Node):
             FaultEvent, "/safety/fault_event", reliable
         )
 
-        self.create_subscription(
+        self._manual_command_sub = self.create_subscription(
             TwistStamped,
             "/cmd_vel_manual",
             self._on_manual_command,
             command_qos,
-            callback_group=self._state_group,
+            callback_group=self._command_input_group,
         )
-        self.create_subscription(
+        self._auto_command_sub = self.create_subscription(
             TwistStamped,
             "/cmd_vel_nav",
             self._on_auto_command,
             command_qos,
-            callback_group=self._state_group,
+            callback_group=self._command_input_group,
         )
-        self.create_subscription(
+        self._status_sub = self.create_subscription(
             RobotStatus,
             "/esp32/status",
             self._on_status,
             reliable,
-            callback_group=self._state_group,
+            callback_group=self._critical_telemetry_group,
         )
         # The bridge publishes these three streams BEST_EFFORT. A RELIABLE
         # subscription would be DDS-incompatible and permanently stale.
-        self.create_subscription(
+        self._motor_sub = self.create_subscription(
             MotorStatus,
             "/motor/status",
             self._on_motor,
             qos_profile_sensor_data,
-            callback_group=self._state_group,
+            callback_group=self._critical_telemetry_group,
         )
-        self.create_subscription(
+        self._imu_sub = self.create_subscription(
             Imu,
             "/imu/data_raw",
             self._on_imu,
             qos_profile_sensor_data,
-            callback_group=self._state_group,
+            callback_group=self._auxiliary_state_group,
         )
-        self.create_subscription(
+        self._gnss_sub = self.create_subscription(
             NavSatFix,
             "/gps/fix",
             self._on_gnss,
             qos_profile_sensor_data,
-            callback_group=self._state_group,
+            callback_group=self._auxiliary_state_group,
         )
-        self.create_subscription(
+        self._rtk_sub = self.create_subscription(
             RtkStatus,
             "/rtk/status",
             self._on_rtk,
             reliable,
-            callback_group=self._state_group,
+            callback_group=self._auxiliary_state_group,
         )
-        self.create_subscription(
+        self._heading_initialized_sub = self.create_subscription(
             Bool,
             "/heading_initialized",
             self._on_heading_initialized,
             latched,
-            callback_group=self._state_group,
+            callback_group=self._auxiliary_state_group,
         )
-        self.create_subscription(
+        self._route_valid_sub = self.create_subscription(
             Bool,
             "/route/valid",
             self._on_route_valid,
             latched,
-            callback_group=self._state_group,
+            callback_group=self._auxiliary_state_group,
         )
-        self.create_subscription(
+        self._localization_valid_sub = self.create_subscription(
             Bool,
             "/localization/valid",
             self._on_localization_valid,
             reliable,
-            callback_group=self._state_group,
+            callback_group=self._auxiliary_state_group,
         )
-        self.create_subscription(
+        self._nav2_active_sub = self.create_subscription(
             Bool,
             "/nav2/active",
             self._on_nav2_active,
             reliable,
-            callback_group=self._state_group,
+            callback_group=self._auxiliary_state_group,
         )
 
         self._bridge_arm = self.create_client(
@@ -304,10 +311,10 @@ class SafetyNode(Node):
             callback_group=self._service_group,
         )
 
-        self.create_timer(
+        self._tick_timer = self.create_timer(
             1.0 / self._publish_rate_hz,
             self._tick,
-            callback_group=self._state_group,
+            callback_group=self._tick_callback_group,
         )
         self._publish_zero_immediately()
         self.get_logger().info(
@@ -319,7 +326,11 @@ class SafetyNode(Node):
         defaults = {
             "publish_rate_hz": 50.0,
             "status_timeout_ms": 500,
-            "motor_feedback_timeout_ms": 250,
+            # /motor/status is a 10 Hz BEST_EFFORT stream. Keep one full
+            # scheduling/loss margin and a nominal 100 ms software margin.
+            # The ESP32's 500 ms hardware-feedback watchdog remains the
+            # authoritative independent stop under host scheduling stalls.
+            "motor_feedback_timeout_ms": 400,
             "manual_cmd_timeout_ms": 200,
             "auto_cmd_timeout_ms": 200,
             "imu_timeout_ms": 250,
@@ -435,6 +446,11 @@ class SafetyNode(Node):
                 raise ValueError(f"{name} must be finite and positive")
         if not 20.0 <= self._publish_rate_hz <= 100.0:
             raise ValueError("publish_rate_hz must be in [20, 100]")
+        if self._motor_timeout_s > 0.400001:
+            raise ValueError(
+                "motor_feedback_timeout_ms must not exceed the commissioned "
+                "400 ms bound"
+            )
         if self._arm_feedback_zero < 0:
             raise ValueError("arm_motor_feedback_zero_threshold must be non-negative")
         if self._max_manual_linear > 0.15 or self._max_manual_reverse > 0.15:
@@ -1125,15 +1141,19 @@ class SafetyNode(Node):
         with self._lock:
             self._clear_motion_authority_locked()
         self._publish_zero_immediately()
-        self._request_bridge_zero(disarm=False)
         bridge_response = self._call_bridge(self._bridge_disarm, Disarm.Request())
         response.success = bool(bridge_response is not None and bridge_response.success)
         response.resulting_state = SafetyState.STATE_DISARMED
         response.message = (
             "DISARM acknowledged"
             if response.success
-            else "local authority cleared and zero published; ESP32 DISARM ACK missing"
+            else (
+                "local authority cleared and zero published; ESP32 DISARM ACK missing; "
+                "fail-safe STOP/DISARM requested"
+            )
         )
+        if not response.success:
+            self._request_bridge_zero(disarm=True)
         return response
 
     def _on_stop(
@@ -1403,7 +1423,10 @@ class SafetyNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SafetyNode()
-    executor = MultiThreadedExecutor(num_threads=5)
+    # A service callback can wait for a bridge response. Keep enough workers
+    # for that response plus critical telemetry, command input, auxiliary
+    # state and the fail-closed 50 Hz tick.
+    executor = MultiThreadedExecutor(num_threads=6)
     executor.add_node(node)
     try:
         executor.spin()

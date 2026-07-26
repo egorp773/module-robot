@@ -39,7 +39,7 @@ public:
     void setSafeOutput(int16_t left_percent, int16_t right_percent,
                        uint32_t now_ms);
     void hardZero(uint32_t now_ms);
-    MotorTelemetry telemetry(uint32_t now_ms) const;
+    MotorTelemetry telemetry() const;
 
 private:
 #pragma pack(push, 1)

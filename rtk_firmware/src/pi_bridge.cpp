@@ -29,7 +29,7 @@ namespace {
 
 using namespace pibridge;
 
-constexpr char kFirmwareBuildId[] = "pi_bridge-v1";
+constexpr char kFirmwareBuildId[] = "pi_bridge-v1.1-timefix";
 constexpr uint32_t kStatusPeriodMs = 200u;
 constexpr uint32_t kMotorTelemetryPeriodMs = 100u;
 constexpr uint32_t kPowerPeriodMs = 500u;
@@ -309,7 +309,7 @@ void sendHelloAck(bool accepted) {
 void sendStatus() {
     const uint32_t now_ms = millis();
     const SafetySnapshot safety = safetySnapshot(now_ms);
-    const MotorTelemetry motor = g_motor.telemetry(now_ms);
+    const MotorTelemetry motor = g_motor.telemetry();
     StatusPayload payload{};
     payload.state = static_cast<uint8_t>(safety.state);
     payload.armed = safety.state == EspState::ARMED ? 1u : 0u;
@@ -332,7 +332,7 @@ void sendStatus() {
 }
 
 void sendMotorTelemetry() {
-    const MotorTelemetry motor = g_motor.telemetry(millis());
+    const MotorTelemetry motor = g_motor.telemetry();
     if (!motor.available) return;
     MotorFeedbackPayload payload{};
     payload.sensor_monotonic_us = motor.timestamp_us;
@@ -355,7 +355,7 @@ uint8_t batteryPercent(int16_t centivolts) {
 }
 
 void sendPowerStatus() {
-    const MotorTelemetry motor = g_motor.telemetry(millis());
+    const MotorTelemetry motor = g_motor.telemetry();
     PowerStatusPayload payload{};
     payload.sensor_monotonic_us = motor.timestamp_us;
     payload.battery_voltage = motor.battery_centivolts * 0.01f;
@@ -623,7 +623,7 @@ void handleFrame(const Frame& frame, uint64_t receive_us) {
             if (!acceptStateChangingSequence(frame)) {
                 return;
             }
-            const MotorTelemetry telemetry = g_motor.telemetry(now_ms);
+            const MotorTelemetry telemetry = g_motor.telemetry();
             SafetyReply reply;
             taskENTER_CRITICAL(&g_safety_mux);
             reply = g_safety.arm(command, motorHealth(telemetry), now_ms);
@@ -712,7 +712,7 @@ void handleFrame(const Frame& frame, uint64_t receive_us) {
                 return;
             }
             if (!acceptStateChangingSequence(frame)) return;
-            const MotorTelemetry telemetry = g_motor.telemetry(now_ms);
+            const MotorTelemetry telemetry = g_motor.telemetry();
             SafetyReply reply;
             taskENTER_CRITICAL(&g_safety_mux);
             reply = g_safety.resetEstop(motorHealth(telemetry));
@@ -729,7 +729,7 @@ void handleFrame(const Frame& frame, uint64_t receive_us) {
                 return;
             }
             if (!acceptStateChangingSequence(frame)) return;
-            const MotorTelemetry telemetry = g_motor.telemetry(now_ms);
+            const MotorTelemetry telemetry = g_motor.telemetry();
             SafetyReply reply;
             taskENTER_CRITICAL(&g_safety_mux);
             reply = g_safety.resetFault(motorHealth(telemetry));
@@ -829,9 +829,11 @@ void motorTaskEntry(void*) {
     }
     uint32_t observed_hard_zero_generation = 0u;
     for (;;) {
-        const uint32_t now_ms = millis();
+        // Consume feedback before advancing the safety clock. telemetry()
+        // snapshots its own age timestamp after copying the feedback state.
         g_motor.pollFeedback();
-        const MotorTelemetry telemetry = g_motor.telemetry(now_ms);
+        const uint32_t now_ms = millis();
+        const MotorTelemetry telemetry = g_motor.telemetry();
 
         SafetySnapshot safety;
         taskENTER_CRITICAL(&g_safety_mux);

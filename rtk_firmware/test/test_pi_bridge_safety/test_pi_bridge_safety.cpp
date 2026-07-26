@@ -1,6 +1,7 @@
 #include <cassert>
 
 #include "PiBridgeSafety.h"
+#include "PiBridgeTime.h"
 
 using namespace pibridge;
 
@@ -34,6 +35,15 @@ CmdVelPayload forwardCommand() {
 }  // namespace
 
 int main() {
+    assert(elapsedAgeMs(101u, 100u) == 1u);
+    // An ordering violation must fail closed as stale. PiBridgeMotor prevents
+    // it by taking `now` only after copying the feedback timestamp.
+    assert(elapsedAgeMs(100u, 101u) == 0xFFFFFFFFu);
+    // Natural uint32 millis() wrap still produces the small real duration.
+    assert(elapsedAgeMs(3u, 0xFFFFFFFEu) == 5u);
+    assert(elapsedAgeMs(0x80000000u, 0u) == 0x80000000u);
+    assert(elapsedAgeMs(0x80000001u, 0u) == 0x80000001u);
+
     const MotorHealth healthy = healthyStoppedMotor();
     SafetyMachine safety;
     SafetySnapshot snapshot = safety.snapshot(10u);

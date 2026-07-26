@@ -85,6 +85,15 @@ class Esp32Bridge(Node):
         self._read_parameters()
         self._io_callback_group = MutuallyExclusiveCallbackGroup()
         self._control_callback_group = MutuallyExclusiveCallbackGroup()
+        # CMD_VEL transmission has a 300 ms firmware deadline.  It must remain
+        # schedulable while the 50 Hz command and safety-state subscriptions
+        # update the shared motion gate.
+        self._command_timer_callback_group = MutuallyExclusiveCallbackGroup()
+        # Keep the ESP32 session heartbeat schedulable even while the 50 Hz
+        # command timer and command/state subscriptions are continuously
+        # ready.  Sharing their mutually-exclusive group can starve the 2 Hz
+        # heartbeat long enough for the ESP32 to revoke the handshake.
+        self._heartbeat_callback_group = MutuallyExclusiveCallbackGroup()
         self._service_callback_group = MutuallyExclusiveCallbackGroup()
         # STOP/DISARM/ESTOP must not queue behind an ARM, reset or relay ACK
         # timeout. Their handlers only remove motion authority and `_send` is
@@ -114,14 +123,14 @@ class Esp32Bridge(Node):
         self._estop_pub = self.create_publisher(Bool, "/esp32/estop_event", state_qos)
         self._diagnostics_pub = self.create_publisher(DiagnosticArray, "/diagnostics", state_qos)
 
-        self.create_subscription(
+        self._cmd_vel_subscription = self.create_subscription(
             TwistStamped,
             "/cmd_vel_safe",
             self._on_cmd_vel,
             command_qos,
             callback_group=self._control_callback_group,
         )
-        self.create_subscription(
+        self._safety_state_subscription = self.create_subscription(
             SafetyState,
             "/safety/state",
             self._on_safety_state,
@@ -209,12 +218,12 @@ class Esp32Bridge(Node):
         self._command_timer = self.create_timer(
             1.0 / self._command_rate_hz,
             self._command_tick,
-            callback_group=self._control_callback_group,
+            callback_group=self._command_timer_callback_group,
         )
         self._heartbeat_timer = self.create_timer(
             1.0 / self._heartbeat_rate_hz,
             self._heartbeat_tick,
-            callback_group=self._control_callback_group,
+            callback_group=self._heartbeat_callback_group,
         )
         self._diagnostic_timer = self.create_timer(1.0, self._publish_health)
         self.get_logger().info(f"ESP32 bridge ready for {self._device} at {self._baud} baud; automatic ARM is disabled")

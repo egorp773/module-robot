@@ -28,7 +28,9 @@ class PulseMonitor(Node):
         self.status: list[RobotStatus] = []
         self.motor: list[MotorStatus] = []
         self.relay: list[RelayStatus] = []
-        self._pulse_subscriptions = (
+        # Keep our references without replacing rclpy.Node's internal
+        # ``_subscriptions`` list (Node.destroy_node() relies on that list).
+        self._commissioning_subscriptions = (
             self.create_subscription(
                 RobotStatus, "/esp32/status", self.status.append, state_qos
             ),
